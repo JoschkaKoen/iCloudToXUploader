@@ -30,7 +30,7 @@ from ic2x.utils.ai_client import warmup_ollama, unload_ollama, provider_for_mode
 logger = logging.getLogger("ic2x.run")
 
 
-def _setup_logging(logs_dir: Path) -> None:
+def setup_logging(logs_dir: Path) -> None:
     from rich.logging import RichHandler
     logs_dir.mkdir(parents=True, exist_ok=True)
     log_file = logs_dir / f"{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.log"
@@ -77,12 +77,22 @@ def _log_decision(
         f.write(json.dumps(record) + "\n")
 
 
-def run() -> None:
+def run(
+    recent_override: int = 0,
+    auto_unstick: bool = False,
+    show_banner: bool = True,
+) -> tuple[int, int, int]:
+    """Run the full pull → filter → judge → prepare pipeline.
+
+    Returns (new_pulled, queued_count, approved_count).
+    show_banner=False suppresses the startup config table (used by daemon).
+    """
     cfg = load_config()
     ensure_dirs(cfg)
-    _setup_logging(cfg.logs_dir)
+    setup_logging(cfg.logs_dir)
 
-    ui.startup_banner(cfg)
+    if show_banner:
+        ui.startup_banner(cfg)
 
     # Inject proxy into os.environ before any network activity
     if cfg.proxy_http:
@@ -117,18 +127,26 @@ def run() -> None:
     # Startup guard — never silently retry a stuck posting
     stuck = db.get_stuck_posting()
     if stuck:
-        ui.err(
-            f"Found {len(stuck)} row(s) stuck in 'posting' status. "
-            "Manually verify whether the tweet was posted before retrying.\n"
-            + "\n".join(f"  sha256={r['sha256']}  file={r['source_filename']}" for r in stuck)
-        )
-        return
+        if auto_unstick:
+            logger.warning(
+                "run: auto-resetting %d stuck 'posting' row(s) (daemon mode)", len(stuck)
+            )
+            db.reset_stuck_posting()
+        else:
+            ui.err(
+                f"Found {len(stuck)} row(s) stuck in 'posting' status. "
+                "Manually verify whether the tweet was posted before retrying.\n"
+                + "\n".join(f"  sha256={r['sha256']}  file={r['source_filename']}" for r in stuck)
+            )
+            return 0, 0, 0
 
     ui.run_banner()
-    files = pull_mod.pull(cfg, db)
-    ui.info(f"Pulled {len(files)} file(s) from iCloud")
+    files = pull_mod.pull(cfg, db, recent_override=recent_override)
+    new_pulled = len(files)
+    ui.info(f"Pulled {new_pulled} file(s) from iCloud")
 
     queued_count = 0
+    approved_count = 0
     rejected_by: dict[str, int] = defaultdict(int)
 
     for idx, path in enumerate(files, start=1):
@@ -140,11 +158,16 @@ def run() -> None:
             # ── [1/6] SHA-256 dedup ────────────────────────────────────────
             ui.stage_banner(1, "DEDUP (SHA-256)")
             sha = dedup.sha256_of(path)
-            if db.seen_sha256(sha):
+            _existing = db.get_image_by_sha(sha)
+            if _existing is not None and _existing["status"] != "seen":
+                # Fully processed or rejected before — true duplicate
                 ui.rejected(path.name, "duplicate", "sha256 already seen")
                 _reject(path, cfg, db, sha, "", "duplicate", "sha256", logs_dir=cfg.logs_dir)
                 rejected_by["duplicate"] += 1
                 continue
+            # _existing is None (new image) or status=='seen' (crashed mid-pipeline → resume)
+            if _existing is not None:
+                logger.info("run: resuming crashed pipeline run for %s", path.name)
             ui.ok(f"new  ({sha[:12]}…)")
 
             # ── [2/6] Screenshot filter ────────────────────────────────────
@@ -167,7 +190,8 @@ def run() -> None:
                 continue
             ui.ok("unique")
 
-            db.insert_seen(sha, phash, path.name)
+            if _existing is None:
+                db.insert_seen(sha, phash, path.name)
 
             # ── [4/6] Safety check ─────────────────────────────────────────
             ui.stage_banner(4, "SAFETY CHECK")
@@ -253,31 +277,48 @@ def run() -> None:
                 else:
                     ui.ok(f"upright  ({rotation_ms}ms)")
 
-            # Write quality sidecar JSON
-            (cfg.queue_dir / f"{phash}.json").write_text(
+            # Write quality sidecar JSON to queue_dir first
+            sidecar_path = cfg.queue_dir / f"{phash}.json"
+            sidecar_path.write_text(
                 json.dumps(quality, ensure_ascii=False, indent=2), encoding="utf-8"
             )
 
-            db.set_status(sha, "queued", caption=quality["caption"])
-            _log_decision(
-                cfg.logs_dir, sha, phash, path.name,
-                "queue", "queued", detail=quality["caption"],
-            )
-            queued_count += 1
-            ui.queued(path.name, phash, quality["caption"])
+            if cfg.auto_approve:
+                # Move image + sidecar directly to approved/ — skip manual review
+                dest_img  = cfg.approved_dir / prepared.name
+                dest_json = cfg.approved_dir / f"{phash}.json"
+                shutil.move(str(prepared), dest_img)
+                shutil.move(str(sidecar_path), dest_json)
+                db.set_status(sha, "approved", caption=quality["caption"])
+                _log_decision(
+                    cfg.logs_dir, sha, phash, path.name,
+                    "queue", "auto-approved", detail=quality["caption"],
+                )
+                approved_count += 1
+                ui.info(f"[AUTO-APPROVE] → approved/{phash[:12]}…")
+            else:
+                db.set_status(sha, "queued", caption=quality["caption"])
+                _log_decision(
+                    cfg.logs_dir, sha, phash, path.name,
+                    "queue", "queued", detail=quality["caption"],
+                )
+                queued_count += 1
+                ui.queued(path.name, phash, quality["caption"])
 
         except Exception as exc:
             logger.error("Unhandled error for %s: %s", path, exc, exc_info=True)
             ui.err(f"Unhandled error for {path.name}: {exc}")
             continue
 
-    ui.run_summary(len(files), queued_count, dict(rejected_by))
+    ui.run_summary(new_pulled, queued_count + approved_count, dict(rejected_by))
     db.close()
 
     if _ollama_models:
         for _m in _ollama_models:
             ui.info(f"Unloading Ollama model '{_m}'…")
             unload_ollama(_ollama_base, _m)
+
+    return new_pulled, queued_count, approved_count
 
 
 def _reject(
@@ -302,7 +343,8 @@ def _reject(
     dest_dir = cfg.rejected_dir / reject_subdir
     dest_dir.mkdir(parents=True, exist_ok=True)
     try:
-        shutil.move(str(path), dest_dir / path.name)
+        shutil.copy2(str(path), dest_dir / path.name)
+        # Original stays in inbox/ — icloudpd will find it and skip re-downloading next run
     except Exception:
         pass  # file may not exist yet (e.g. sha256 hit before download)
 

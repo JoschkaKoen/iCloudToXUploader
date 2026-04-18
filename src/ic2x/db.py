@@ -71,6 +71,22 @@ class DB:
         ).fetchone()
         return row is not None
 
+    def filenames_processed(self, filenames: set[str]) -> set[str]:
+        """Return the subset of filenames that already have a completed DB record.
+
+        'Completed' means status beyond 'seen' (queued, approved, posted, rejected).
+        Used by pull.py to skip already-processed files before any pipeline step.
+        """
+        if not filenames:
+            return set()
+        placeholders = ",".join("?" * len(filenames))
+        rows = self._conn.execute(
+            f"SELECT source_filename FROM images "
+            f"WHERE source_filename IN ({placeholders}) AND status != 'seen'",
+            list(filenames),
+        ).fetchall()
+        return {row["source_filename"] for row in rows}
+
     def seen_phash_similar(self, phash: str, threshold: int) -> bool:
         import imagehash
         target = imagehash.hex_to_hash(phash)
@@ -200,3 +216,46 @@ class DB:
             (dt.isoformat(),),
         )
         self._conn.commit()
+
+    def get_last_posted_at(self) -> datetime | None:
+        row = self._conn.execute(
+            "SELECT value FROM run_state WHERE key = 'last_posted_at'"
+        ).fetchone()
+        if not row or not row["value"]:
+            return None
+        try:
+            return datetime.fromisoformat(row["value"])
+        except ValueError:
+            return None
+
+    def set_last_posted_at(self, dt: datetime) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO run_state (key, value) VALUES ('last_posted_at', ?)",
+            (dt.isoformat(),),
+        )
+        self._conn.commit()
+
+    def get_lookback_depth(self) -> int:
+        row = self._conn.execute(
+            "SELECT value FROM run_state WHERE key = 'icloud_lookback_depth'"
+        ).fetchone()
+        if not row or not row["value"]:
+            return 0
+        try:
+            return int(row["value"])
+        except (ValueError, TypeError):
+            return 0
+
+    def set_lookback_depth(self, n: int) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO run_state (key, value) VALUES ('icloud_lookback_depth', ?)",
+            (str(n),),
+        )
+        self._conn.commit()
+
+    # ── Image lookup by SHA ───────────────────────────────────────────────────
+
+    def get_image_by_sha(self, sha256: str) -> "sqlite3.Row | None":
+        return self._conn.execute(
+            "SELECT * FROM images WHERE sha256 = ?", (sha256,)
+        ).fetchone()

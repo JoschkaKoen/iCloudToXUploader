@@ -31,6 +31,7 @@ class Config:
     icloud_username: str
     icloud_password: str
     icloud_recent_count: int
+    icloud_until_found: int   # passes --until-found to icloudpd; 0 = disabled
     icloud_cookie_dir: Path
 
     # Paths
@@ -65,6 +66,11 @@ class Config:
     # Review
     auto_approve: bool
 
+    # Daemon
+    post_interval_hours: int
+    daemon_check_interval: int
+    icloud_lookback_max: int
+
 
 def _require_env(key: str) -> str:
     val = os.getenv(key, "").strip()
@@ -94,6 +100,7 @@ def load_config() -> Config:
         icloud_username=_require_env("ICLOUD_USERNAME"),
         icloud_password=_require_env("ICLOUD_PASSWORD"),
         icloud_recent_count=int(os.getenv("ICLOUD_RECENT_COUNT", "20")),
+        icloud_until_found=int(os.getenv("ICLOUD_UNTIL_FOUND", "3")),
         icloud_cookie_dir=_resolve(os.getenv("ICLOUD_COOKIE_DIR", "./icloud_auth")),
 
         # Paths
@@ -127,6 +134,11 @@ def load_config() -> Config:
 
         # Review
         auto_approve=_bool_env("AUTO_APPROVE", default=False),
+
+        # Daemon
+        post_interval_hours=int(os.getenv("POST_INTERVAL_HOURS", "8")),
+        daemon_check_interval=int(os.getenv("DAEMON_CHECK_INTERVAL", "1800")),
+        icloud_lookback_max=int(os.getenv("ICLOUD_LOOKBACK_MAX", "200")),
     )
 
 

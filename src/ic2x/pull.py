@@ -25,17 +25,31 @@ from ic2x.db import DB
 logger = logging.getLogger("ic2x.pull")
 
 
-def pull(cfg: Config, db: DB) -> list[Path]:
+def pull(cfg: Config, db: DB, recent_override: int = 0) -> list[Path]:
     """
     Run icloudpd, scan inbox/ for new files, update last_asset_date in DB.
-    Returns list of new file paths found in inbox/ after the run.
+    Returns only files not yet processed — already-processed originals are
+    left in inbox/ so icloudpd skips re-downloading them next run.
+
+    recent_override: if > 0, use this instead of cfg.icloud_recent_count.
+    When recent_override > cfg.icloud_recent_count (lookback expansion mode),
+    --until-found is disabled so icloudpd walks back the full window.
     """
     inbox = cfg.inbox_dir
     inbox.mkdir(parents=True, exist_ok=True)
 
-    _run_icloudpd(cfg)
+    _run_icloudpd(cfg, recent_override=recent_override)
 
-    new_files = _scan_inbox(inbox)
+    all_files = _scan_inbox(inbox)
+
+    # Skip files already in the DB — leave them in inbox/ for icloudpd's dedup.
+    all_names = {p.name for p in all_files}
+    already_done = db.filenames_processed(all_names)
+    new_files = [p for p in all_files if p.name not in already_done]
+
+    if already_done:
+        logger.info("pull: skipped %d already-processed file(s) in inbox/", len(already_done))
+
     if new_files:
         newest_mtime = max(p.stat().st_mtime for p in new_files)
         db.set_last_asset_date(datetime.utcfromtimestamp(newest_mtime))
@@ -47,7 +61,11 @@ def pull(cfg: Config, db: DB) -> list[Path]:
     return new_files
 
 
-def _run_icloudpd(cfg: Config) -> None:
+def _run_icloudpd(cfg: Config, recent_override: int = 0) -> None:
+    recent = recent_override if recent_override > 0 else cfg.icloud_recent_count
+    # Disable --until-found when expanding the lookback window: icloudpd would otherwise
+    # stop after the first N consecutive already-downloaded photos, defeating the expansion.
+    disable_until_found = recent_override > cfg.icloud_recent_count
     cmd = [
         sys.executable, "-m", "icloudpd",
         "--username", cfg.icloud_username,
@@ -56,7 +74,12 @@ def _run_icloudpd(cfg: Config) -> None:
         "--mfa-provider", "console",
         "--directory", str(cfg.inbox_dir),
         "--cookie-directory", str(cfg.icloud_cookie_dir),
-        "--recent", str(cfg.icloud_recent_count),
+        "--recent", str(recent),
+        *(
+            []
+            if disable_until_found
+            else (["--until-found", str(cfg.icloud_until_found)] if cfg.icloud_until_found > 0 else [])
+        ),
         "--skip-videos",
         "--no-progress-bar",
         "--auto-delete",

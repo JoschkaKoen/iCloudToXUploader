@@ -153,4 +153,5 @@ def _post_image(
         tweet_id=tweet_id,
         posted_at=datetime.now(timezone.utc).isoformat(),
     )
+    db.set_last_posted_at(datetime.now(timezone.utc))
     return tweet_id, tweet_url
