@@ -22,7 +22,7 @@ x:
 
 limits:
   daily_ai_calls:    200
-  hamming_threshold:   6
+  hamming_threshold:  12
 
 enhance:
   enabled: false

@@ -160,7 +160,7 @@ def run() -> None:
             ui.stage_banner(3, "DEDUP (pHash)")
             phash = dedup.phash_of(path)
             if db.seen_phash_similar(phash, cfg.hamming_threshold):
-                ui.rejected(path.name, "duplicate", "perceptual duplicate of posted image")
+                ui.rejected(path.name, "duplicate", "perceptual near-duplicate of already-processed image")
                 _reject(path, cfg, db, sha, phash, "duplicate", "phash", logs_dir=cfg.logs_dir)
                 rejected_by["duplicate"] += 1
                 continue

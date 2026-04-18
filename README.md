@@ -15,7 +15,7 @@ flowchart TD
     D -->|ok| E{SHA-256\ndedup}
     E -->|seen before| R3[rejected/duplicate/]
     E -->|new| F{pHash\nperceptual dedup}
-    F -->|similar to posted| R3
+    F -->|near-duplicate| R3
     F -->|unique| G[(state.db\nstatus: seen)]
 
     G --> H[Gemini Safety\ngemini-2.5-flash]
@@ -23,7 +23,7 @@ flowchart TD
     H -->|refused| R5[rejected/gemini_refused/]
     H -->|safe| I[Gemini Quality\ngemini-2.5-flash]
     I -->|selfie · blurry\nboring · generic| R6[rejected/quality/]
-    I -->|interesting + caption| J[prepare.py\nexif_transpose + JPEG re-encode\nEXIF strip]
+    I -->|interesting + caption| J[prepare.py\nEXIF + HEIF rotation correction\nJPEG re-encode · EXIF strip]
 
     J --> K{InstructIR\nenhancement\noptional}
     K -->|enabled| L[enhance.py\nsubprocess · CUDA isolated]
@@ -53,6 +53,7 @@ flowchart TD
 ic2x run      # pull from iCloud, filter, dedup, Gemini checks, queue
 ic2x review   # terminal UI: approve / skip / edit caption / quit
 ic2x post     # post all approved photos to X
+ic2x unstick  # reset rows stuck in 'posting' back to 'approved' for retry
 ```
 
 ## Setup
@@ -80,8 +81,8 @@ GEMINI_API_KEY=
 | `icloud.recent_count` | 50 | Max photos pulled per run |
 | `x.dry_run` | `true` | Set `false` only when pipeline is trusted |
 | `enhance.enabled` | `false` | InstructIR local enhancement (needs GPU) |
-| `limits.daily_gemini_calls` | 200 | Hard abort across safety + quality calls |
-| `limits.hamming_threshold` | 6 | Perceptual dedup sensitivity |
+| `limits.daily_ai_calls` | 200 | Hard abort across safety + quality calls |
+| `limits.hamming_threshold` | 12 | Perceptual dedup sensitivity (Hamming distance ≤ threshold) |
 
 ## Rejection stages
 

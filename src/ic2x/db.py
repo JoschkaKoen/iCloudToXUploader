@@ -75,7 +75,7 @@ class DB:
         import imagehash
         target = imagehash.hex_to_hash(phash)
         rows = self._conn.execute(
-            "SELECT phash FROM images WHERE status = 'posted' AND phash IS NOT NULL"
+            "SELECT phash FROM images WHERE status NOT IN ('rejected') AND phash IS NOT NULL"
         ).fetchall()
         for row in rows:
             try:
