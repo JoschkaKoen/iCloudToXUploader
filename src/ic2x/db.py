@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS images (
 
 CREATE TABLE IF NOT EXISTS run_stats (
     date            TEXT PRIMARY KEY,
-    gemini_calls    INTEGER DEFAULT 0,
+    ai_calls        INTEGER DEFAULT 0,
     images_pulled   INTEGER DEFAULT 0,
     images_posted   INTEGER DEFAULT 0
 );
@@ -47,6 +47,16 @@ class DB:
         self._path = str(path)
         self._conn = sqlite3.connect(self._path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        # One-time migration: rename legacy gemini_calls column to ai_calls.
+        # Safe on both fresh databases (table doesn't exist yet) and existing ones
+        # (column already renamed → silently ignored).
+        try:
+            self._conn.execute(
+                "ALTER TABLE run_stats RENAME COLUMN gemini_calls TO ai_calls"
+            )
+            self._conn.commit()
+        except Exception:
+            pass
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
 
@@ -120,7 +130,7 @@ class DB:
             "SELECT * FROM images WHERE status = 'approved'"
         ).fetchall()
 
-    # ── Gemini call budget ────────────────────────────────────────────────────
+    # ── AI call budget ────────────────────────────────────────────────────────
 
     def _today(self) -> str:
         return datetime.utcnow().strftime("%Y-%m-%d")
@@ -131,18 +141,18 @@ class DB:
         )
         self._conn.commit()
 
-    def check_daily_gemini_limit(self, limit: int) -> bool:
-        """Return True if the daily limit has been reached."""
+    def check_daily_ai_limit(self, limit: int) -> bool:
+        """Return True if the daily AI call limit has been reached."""
         self._ensure_today_stats()
         row = self._conn.execute(
-            "SELECT gemini_calls FROM run_stats WHERE date = ?", (self._today(),)
+            "SELECT ai_calls FROM run_stats WHERE date = ?", (self._today(),)
         ).fetchone()
-        return (row["gemini_calls"] if row else 0) >= limit
+        return (row["ai_calls"] if row else 0) >= limit
 
-    def increment_gemini_calls(self, n: int = 1) -> None:
+    def increment_ai_calls(self, n: int = 1) -> None:
         self._ensure_today_stats()
         self._conn.execute(
-            "UPDATE run_stats SET gemini_calls = gemini_calls + ? WHERE date = ?",
+            "UPDATE run_stats SET ai_calls = ai_calls + ? WHERE date = ?",
             (n, self._today()),
         )
         self._conn.commit()

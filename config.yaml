@@ -16,16 +16,13 @@ proxy:
   http:  ""
   https: ""
 
-gemini:
-  safety_model:  gemini-2.5-flash
-  quality_model: gemini-2.5-flash
 
 x:
   dry_run: true   # flip false only when pipeline is trusted
 
 limits:
-  daily_gemini_calls: 200
-  hamming_threshold:  6
+  daily_ai_calls:    200
+  hamming_threshold:   6
 
 enhance:
   enabled: false

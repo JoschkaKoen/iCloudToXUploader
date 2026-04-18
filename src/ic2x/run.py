@@ -1,7 +1,7 @@
 """
 Orchestrator for `ic2x run`.
 
-Pull photos from iCloud → filter → dedup → Gemini safety → Gemini quality
+Pull photos from iCloud → filter → dedup → safety check → quality check
 → prepare (rotate + JPEG + EXIF strip) → optional InstructIR enhancement
 → drop in queue/ for manual review.
 """
@@ -25,6 +25,7 @@ from ic2x import pull as pull_mod
 from ic2x.config import Config, load_config, ensure_dirs
 from ic2x.db import DB
 from ic2x.utils import ui
+from ic2x.utils.ai_client import warmup_ollama, provider_for_model, parse_model_effort
 
 logger = logging.getLogger("ic2x.run")
 
@@ -56,7 +57,7 @@ def _log_decision(
     stage: str,
     outcome: str,
     detail=None,
-    gemini_ms: int | None = None,
+    ai_ms: int | None = None,
 ) -> None:
     record: dict = {
         "ts": datetime.now(timezone.utc).isoformat(),
@@ -68,8 +69,8 @@ def _log_decision(
     }
     if detail is not None:
         record["detail"] = detail
-    if gemini_ms is not None:
-        record["gemini_ms"] = gemini_ms
+    if ai_ms is not None:
+        record["ai_ms"] = ai_ms
 
     log_file = logs_dir / f"{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.jsonl"
     with open(log_file, "a", encoding="utf-8") as f:
@@ -90,6 +91,25 @@ def run() -> None:
     if cfg.proxy_https:
         os.environ.setdefault("https_proxy", cfg.proxy_https)
         os.environ.setdefault("HTTPS_PROXY", cfg.proxy_https)
+
+    # Warmup Ollama if either AI model is local — one-time check before the image loop
+    _default = os.environ.get("AI_DEFAULT_MODEL", "gemini-2.5-flash")
+    _safety_model, _ = parse_model_effort(os.environ.get("SAFETY_MODEL", _default))
+    _quality_model, _ = parse_model_effort(os.environ.get("QUALITY_MODEL", _default))
+    _ollama_models = {
+        m for m in (_safety_model, _quality_model)
+        if provider_for_model(m) == "ollama"
+    }
+    if _ollama_models:
+        _ollama_base = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+        for _m in _ollama_models:
+            ui.info(f"Warming up Ollama model '{_m}' (may take up to 90s on cold start)…")
+            try:
+                warmup_ollama(_ollama_base, _m)
+                ui.ok(f"Ollama '{_m}' ready")
+            except RuntimeError as exc:
+                ui.err(str(exc))
+                return
 
     db = DB(cfg.db_path)
 
@@ -150,23 +170,23 @@ def run() -> None:
 
             # ── [4/6] Safety check ─────────────────────────────────────────
             ui.stage_banner(4, "SAFETY CHECK")
-            if db.check_daily_gemini_limit(cfg.daily_gemini_calls):
-                ui.warn("Daily Gemini call limit reached — stopping")
+            if db.check_daily_ai_limit(cfg.daily_ai_calls):
+                ui.warn("Daily AI call limit reached — stopping")
                 break
             safety, safety_elapsed = judge_safety.call_safety(path)
-            db.increment_gemini_calls()
+            db.increment_ai_calls()
             safety_ms = int(safety_elapsed * 1000)
 
             if not safety["safe"]:
-                stage = "gemini_refused" if "gemini_refused" in safety["flags"] else "safety"
+                stage = "model_refused" if "gemini_refused" in safety["flags"] else "safety"
                 ui.rejected(path.name, stage, safety["flags"])
-                dest_sub = "gemini_refused" if stage == "gemini_refused" else "safety"
+                dest_sub = "model_refused" if stage == "model_refused" else "safety"
                 _reject(
                     path, cfg, db, sha, phash, "rejected", safety["flags"],
                     reject_stage=dest_sub,
                     safety_raw=json.dumps(safety),
                     logs_dir=cfg.logs_dir,
-                    gemini_ms=safety_ms,
+                    ai_ms=safety_ms,
                 )
                 rejected_by[dest_sub] += 1
                 continue
@@ -174,25 +194,28 @@ def run() -> None:
 
             # ── [5/6] Quality check ────────────────────────────────────────
             ui.stage_banner(5, "QUALITY CHECK")
-            if db.check_daily_gemini_limit(cfg.daily_gemini_calls):
-                ui.warn("Daily Gemini call limit reached — stopping")
+            if db.check_daily_ai_limit(cfg.daily_ai_calls):
+                ui.warn("Daily AI call limit reached — stopping")
                 break
             quality, quality_elapsed = judge_quality.call_quality(path)
-            db.increment_gemini_calls()
+            db.increment_ai_calls()
             quality_ms = int(quality_elapsed * 1000)
 
             if not quality["interesting"]:
+                ui.info(f'Description : {quality["description"]}')
                 ui.rejected(path.name, "quality", quality["reason"])
                 _reject(
                     path, cfg, db, sha, phash, "rejected", quality["reason"],
                     reject_stage="quality",
                     quality_raw=json.dumps(quality),
                     logs_dir=cfg.logs_dir,
-                    gemini_ms=quality_ms,
+                    ai_ms=quality_ms,
                 )
                 rejected_by["quality"] += 1
                 continue
             ui.ok(f"interesting  ({quality_ms}ms)")
+            ui.info(f'Caption     : {quality["caption"]}')
+            ui.info(f'Description : {quality["description"]}')
 
             # ── [6/6] Prepare + optional enhance ──────────────────────────
             ui.stage_banner(6, "PREPARE")
@@ -247,7 +270,7 @@ def _reject(
     safety_raw: str | None = None,
     quality_raw: str | None = None,
     logs_dir: Path | None = None,
-    gemini_ms: int | None = None,
+    ai_ms: int | None = None,
 ) -> None:
     reject_subdir = reject_stage or (
         "duplicate" if status == "duplicate" else
@@ -285,5 +308,5 @@ def _reject(
             logs_dir, sha, phash, path.name,
             reject_stage or status, "rejected",
             detail=reason if isinstance(reason, list) else [str(reason)] if reason else [],
-            gemini_ms=gemini_ms,
+            ai_ms=ai_ms,
         )

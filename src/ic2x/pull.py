@@ -10,6 +10,7 @@ Key behaviour:
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import sys
 from datetime import datetime
@@ -61,8 +62,11 @@ def _run_icloudpd(cfg: Config) -> None:
         "--auto-delete",
     ]
 
+    _PROXY_VARS = {"HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"}
+    env = {k: v for k, v in os.environ.items() if k not in _PROXY_VARS}
+
     logger.info("pull: running icloudpd %s", " ".join(cmd[3:]))
-    result = subprocess.run(cmd, capture_output=False, text=True)
+    result = subprocess.run(cmd, capture_output=False, text=True, env=env)
     if result.returncode not in (0, 2):
         # Exit 2 = "nothing new to download" — that's fine
         logger.warning("icloudpd exited with code %d", result.returncode)

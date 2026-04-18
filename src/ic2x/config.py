@@ -55,7 +55,7 @@ class Config:
     x_dry_run: bool
 
     # Limits
-    daily_gemini_calls: int
+    daily_ai_calls: int
     hamming_threshold: int
 
     # Enhancement
@@ -124,7 +124,7 @@ def load_config(config_path: Path | None = None) -> Config:
         x_dry_run=bool(y["x"].get("dry_run", True)),
 
         # Limits
-        daily_gemini_calls=int(y["limits"]["daily_gemini_calls"]),
+        daily_ai_calls=int(y["limits"]["daily_ai_calls"]),
         hamming_threshold=int(y["limits"]["hamming_threshold"]),
 
         # Enhancement
@@ -148,7 +148,7 @@ def ensure_dirs(cfg: Config) -> None:
         cfg.rejected_dir / "screenshot",
         cfg.rejected_dir / "safety",
         cfg.rejected_dir / "quality",
-        cfg.rejected_dir / "gemini_refused",
+        cfg.rejected_dir / "model_refused",
         cfg.logs_dir,
         cfg.icloud_cookie_dir,
     ]

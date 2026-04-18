@@ -163,7 +163,7 @@ def review_header(index: int, total: int, filename: str,
     t.add_column()
     t.add_row("📝", escape(description))
     t.add_row("[bold]💬[/]", f"[bold]Caption:[/] {escape(caption)}")
-    t.add_row("🤔", f"[dim]Gemini:  {escape(reason)}[/]")
+    t.add_row("🤔", f"[dim]Model:   {escape(reason)}[/]")
     console.print()
     console.print(Panel(
         t,

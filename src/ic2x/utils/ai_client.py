@@ -4,8 +4,8 @@
 Provider is inferred automatically from the model name — no separate
 AI_PROVIDER setting is needed.
 
-Supported providers (auto-detected by model name prefix)
----------------------------------------------------------
+Supported providers
+-------------------
 gemini  (model names starting with ``gemini``)
     base_url : https://generativelanguage.googleapis.com/v1beta/openai/
     api_key  : GEMINI_API_KEY  (GOOGLE_API_KEY accepted as fallback)
@@ -16,11 +16,25 @@ xai  (model names starting with ``grok``)
     api_key  : XAI_API_KEY
     example  : grok-4-1-fast-non-reasoning, grok-3
 
-    qwen  (model names starting with ``qwen``)
+qwen  (model names starting with ``qwen``)
     base_url : https://dashscope.aliyuncs.com/compatible-mode/v1
     api_key  : DASHSCOPE_API_KEY
     example  : qwen3.6-plus, qwen3-32b
     note     : Thinking on → streaming required; thinking off → non-streaming.
+
+ollama  (exact model names registered in ``exact_models``)
+    base_url : OLLAMA_BASE_URL env var  (default: http://localhost:11434/v1)
+               Override with a Tailscale IP to offload inference to another machine.
+    api_key  : not required — "ollama" is used automatically as a dummy value
+    example  : qwen3-vl:8b
+    note     : To add another Ollama model, append its name to ``exact_models``
+               in the Ollama ``_ProviderDef`` entry.
+
+Provider routing
+----------------
+Exact model names (``exact_models``) are checked first across all providers.
+Prefix matching (``model_prefixes``) is used as a fallback for cloud providers
+whose model families share a common name prefix.
 
 Per-call-type model overrides
 ------------------------------
@@ -41,6 +55,7 @@ Environment variables (API keys)
 GEMINI_API_KEY    Required for gemini models  (GOOGLE_API_KEY accepted as fallback)
 XAI_API_KEY       Required for grok models
 DASHSCOPE_API_KEY Required for qwen models
+OLLAMA_BASE_URL   Optional — Ollama server URL (default: http://localhost:11434/v1)
 """
 
 from __future__ import annotations
@@ -56,10 +71,15 @@ class _ProviderDef:
     name: str
     base_url: str
     api_key_env: str
-    model_prefixes: tuple[str, ...]  # first match against model name prefix wins
+    model_prefixes: tuple[str, ...]   # prefix match against model name (cloud providers)
+    exact_models: tuple[str, ...] = ()  # exact model names that route to this provider
+    api_key_default: str | None = None  # used when env var is unset (e.g. Ollama dummy key)
+    timeout: float | None = None        # per-provider request timeout in seconds
 
 
-# Registry of known providers. To add a new provider, append one entry here.
+# Registry of known providers.
+# Routing: exact_models checked first (across all providers), then model_prefixes.
+# To add a new Ollama model, append its name to the Ollama entry's exact_models tuple.
 _PROVIDER_REGISTRY: list[_ProviderDef] = [
     _ProviderDef(
         name="gemini",
@@ -79,6 +99,15 @@ _PROVIDER_REGISTRY: list[_ProviderDef] = [
         api_key_env="DASHSCOPE_API_KEY",
         model_prefixes=("qwen",),
     ),
+    _ProviderDef(
+        name="ollama",
+        base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1"),
+        api_key_env="OLLAMA_API_KEY",
+        model_prefixes=(),
+        exact_models=("qwen3-vl:8b",),
+        api_key_default="ollama",  # SDK requires non-empty; Ollama ignores the value
+        timeout=120.0,             # cold model load can take 10-30s on first call
+    ),
 ]
 
 # Fallback model when no model env var is set anywhere.
@@ -86,11 +115,18 @@ _DEFAULT_MODEL = "gemini-2.5-flash"
 
 
 def provider_for_model(model: str) -> str:
-    """Return the provider name for *model* based on its name prefix.
+    """Return the provider name for *model*.
 
-    Falls back to ``gemini`` for unknown model names.
+    Exact matches (``exact_models``) are checked first across all providers,
+    then prefix matches (``model_prefixes``).  Falls back to ``gemini`` for
+    unknown model names.
     """
     m = model.lower()
+    # Pass 1: exact match takes absolute priority
+    for pdef in _PROVIDER_REGISTRY:
+        if m in pdef.exact_models:
+            return pdef.name
+    # Pass 2: prefix match for cloud provider model families
     for pdef in _PROVIDER_REGISTRY:
         if any(m.startswith(pfx) for pfx in pdef.model_prefixes):
             return pdef.name
@@ -185,15 +221,123 @@ def make_ai_client(
     api_key = os.environ.get(pdef.api_key_env, "").strip()
     if not api_key and pdef.name == "gemini":
         api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
+    if not api_key and pdef.api_key_default:
+        api_key = pdef.api_key_default
     if not api_key:
         return None
 
     try:
-        client = OpenAI(api_key=api_key, base_url=pdef.base_url)
+        client_kwargs: dict = {"api_key": api_key, "base_url": pdef.base_url}
+        if pdef.timeout is not None:
+            client_kwargs["timeout"] = pdef.timeout
+        client = OpenAI(**client_kwargs)
     except Exception:
         return None
 
     return client, model, provider, effort
+
+
+def warmup_ollama(base_url: str, model: str, max_wait: float = 90.0) -> None:
+    """Block until the Ollama model is loaded into VRAM, or raise on failure.
+
+    Steps:
+    1. GET /api/tags — verify the model is pulled (fast, no VRAM needed).
+       Raises RuntimeError with an actionable message if missing.
+    2. POST /api/generate with an empty prompt — the native Ollama endpoint
+       blocks until the model is resident in VRAM, then returns.  This is
+       the Ollama-documented way to pre-load a model; it never returns 503.
+
+    Parameters
+    ----------
+    base_url:
+        OpenAI-compatible URL, e.g. ``http://localhost:11434/v1``.
+        The native Ollama API root is derived by stripping ``/v1``.
+    model:
+        Exact Ollama model name, e.g. ``qwen3-vl:8b``.
+    max_wait:
+        Maximum seconds to wait for the model to load into VRAM.
+    """
+    import urllib.request
+    import json as _json
+
+    api_base = base_url.rstrip("/")
+    if api_base.endswith("/v1"):
+        api_base = api_base[:-3]
+
+    # Step 1: verify model is pulled
+    try:
+        with urllib.request.urlopen(f"{api_base}/api/tags", timeout=10) as resp:
+            tags = _json.loads(resp.read())
+        pulled = [m["name"] for m in tags.get("models", [])]
+        model_base = model.split(":")[0]
+        if not any(m == model or m.startswith(model_base + ":") for m in pulled):
+            raise RuntimeError(
+                f"Ollama model '{model}' is not pulled.\n"
+                f"Run:  ollama pull {model}"
+            )
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(
+            f"Cannot reach Ollama at {api_base}. Is it running?\n"
+            f"Error: {exc}"
+        ) from exc
+
+    # Step 2: load model into VRAM via native API — blocks until ready, no 503
+    try:
+        payload = _json.dumps({"model": model, "prompt": "", "keep_alive": "10m"}).encode()
+        req = urllib.request.Request(
+            f"{api_base}/api/generate",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=max_wait) as resp:
+            resp.read()
+    except Exception as exc:
+        raise RuntimeError(
+            f"Ollama model '{model}' did not load within {max_wait:.0f}s.\n"
+            f"Error: {exc}"
+        ) from exc
+
+
+def call_ollama_chat(
+    base_url: str,
+    model: str,
+    prompt: str,
+    image_b64: str,
+    *,
+    timeout: float = 120.0,
+) -> str:
+    """Call the native Ollama /api/chat endpoint; return raw response text.
+
+    Uses urllib.request only — no httpx, no proxy interference.
+    Images go in the ``images`` array (raw base64, no data-URI prefix).
+    ``format: "json"`` constrains the model to emit valid JSON.
+    """
+    import urllib.request
+    import json as _json
+
+    api_base = base_url.rstrip("/")
+    if api_base.endswith("/v1"):
+        api_base = api_base[:-3]
+
+    payload = _json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt, "images": [image_b64]}],
+        "stream": False,
+        "format": "json",
+    }).encode()
+
+    req = urllib.request.Request(
+        f"{api_base}/api/chat",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = _json.loads(resp.read())
+    return data["message"]["content"]
 
 
 def strip_json_fences(raw: str) -> str:
