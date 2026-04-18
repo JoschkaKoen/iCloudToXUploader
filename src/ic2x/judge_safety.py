@@ -58,11 +58,12 @@ def call_safety(image_path: Path) -> tuple[dict, float]:
         use_stream, extra_kwargs = build_thinking_kwargs(provider, effort)
 
         prompt = SAFETY_PROMPT
-        _max_px: int | None = None
         if provider == "ollama":
             _raw_px = os.environ.get("OLLAMA_IMAGE_MAX_PX", "").strip()
-            if _raw_px.isdigit():
-                _max_px = int(_raw_px)
+            _max_px: int | None = int(_raw_px) if _raw_px.isdigit() else None
+        else:
+            _raw_px = os.environ.get("SAFETY_IMAGE_MAX_PX", "1024").strip()
+            _max_px = int(_raw_px) if _raw_px.isdigit() else 1024
         img_b64 = encode_image_b64(image_path, max_px=_max_px)
 
         if provider == "ollama":

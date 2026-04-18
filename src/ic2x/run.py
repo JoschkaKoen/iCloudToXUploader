@@ -20,7 +20,7 @@ import pillow_heif  # noqa: F401
 pillow_heif.register_heif_opener()
 
 from ic2x import dedup, enhance, filter, prepare
-from ic2x import judge_quality, judge_safety
+from ic2x import judge_quality, judge_rotation, judge_safety
 from ic2x import pull as pull_mod
 from ic2x.config import Config, load_config, ensure_dirs
 from ic2x.db import DB
@@ -96,8 +96,9 @@ def run() -> None:
     _default = os.environ.get("AI_DEFAULT_MODEL", "gemini-2.5-flash")
     _safety_model, _ = parse_model_effort(os.environ.get("SAFETY_MODEL", _default))
     _quality_model, _ = parse_model_effort(os.environ.get("QUALITY_MODEL", _default))
+    _rotation_model, _ = parse_model_effort(os.environ.get("ROTATION_MODEL", _default))
     _ollama_models = {
-        m for m in (_safety_model, _quality_model)
+        m for m in (_safety_model, _quality_model, _rotation_model)
         if provider_for_model(m) == "ollama"
     }
     if _ollama_models:
@@ -237,6 +238,21 @@ def run() -> None:
             else:
                 ui.ok(f"{prepared.name}  [enhance: disabled]")
 
+            # ── [7/7] Visual rotation check ───────────────────────────────
+            ui.stage_banner(7, "ROTATION CHECK")
+            if db.check_daily_ai_limit(cfg.daily_ai_calls):
+                ui.warn("Daily AI call limit reached — skipping rotation check")
+            else:
+                rotation, rotation_elapsed = judge_rotation.call_rotation(prepared)
+                db.increment_ai_calls()
+                rotation_ms = int(rotation_elapsed * 1000)
+                degrees = rotation["rotate_cw_degrees"]
+                if not rotation["upright"] and degrees != 0:
+                    _apply_rotation(prepared, degrees)
+                    ui.ok(f"rotated {degrees}°  ({rotation_ms}ms)")
+                else:
+                    ui.ok(f"upright  ({rotation_ms}ms)")
+
             # Write quality sidecar JSON
             (cfg.queue_dir / f"{phash}.json").write_text(
                 json.dumps(quality, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -316,3 +332,13 @@ def _reject(
             detail=reason if isinstance(reason, list) else [str(reason)] if reason else [],
             ai_ms=ai_ms,
         )
+
+
+def _apply_rotation(path: Path, cw_degrees: int) -> None:
+    """Rotate a JPEG clockwise by cw_degrees and overwrite it in place."""
+    from PIL import Image
+    with Image.open(path) as img:
+        # PIL rotate() is counter-clockwise; negate for clockwise rotation
+        rotated = img.rotate(-cw_degrees, expand=True)
+        rotated.save(path, "JPEG", quality=92, exif=b"")
+    logger.info("rotation: applied %d° CW to %s", cw_degrees, path.name)

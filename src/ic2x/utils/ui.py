@@ -12,7 +12,7 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
-_TOTAL_STAGES = 6  # SHA-256 dedup, screenshot, pHash dedup, safety, quality, prepare
+_TOTAL_STAGES = 7  # SHA-256 dedup, screenshot, pHash dedup, safety, quality, prepare, rotation
 
 console = Console()               # stdout — all UI output
 err_console = Console(stderr=True)  # stderr — only ui.err()
