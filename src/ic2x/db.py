@@ -125,6 +125,14 @@ class DB:
             "SELECT * FROM images WHERE status = 'posting'"
         ).fetchall()
 
+    def reset_stuck_posting(self) -> int:
+        """Reset all rows stuck in 'posting' back to 'approved'. Returns count updated."""
+        cur = self._conn.execute(
+            "UPDATE images SET status='approved' WHERE status='posting'"
+        )
+        self._conn.commit()
+        return cur.rowcount
+
     def get_approved(self) -> list[sqlite3.Row]:
         return self._conn.execute(
             "SELECT * FROM images WHERE status = 'approved'"

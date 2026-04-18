@@ -88,10 +88,12 @@ def post() -> None:
             posted_count += 1
             continue
 
+        _post_succeeded = False
         try:
             tweet_id, tweet_url = _post_image(
                 img_path, caption, sha256, db, cfg, api_v1, client_v2
             )
+            _post_succeeded = True
             ui.post_ok(tweet_url)
             shutil.move(str(img_path), cfg.posted_dir / filename)
             # Move sidecar JSON if present
@@ -103,6 +105,12 @@ def post() -> None:
         except Exception as exc:
             logger.error("Failed to post %s: %s", filename, exc, exc_info=True)
             ui.err(f"Failed to post {filename}: {exc}")
+        finally:
+            # Reset to 'approved' on any failure (including Ctrl+C / KeyboardInterrupt)
+            # so the startup guard never blocks the next run.
+            if not _post_succeeded:
+                db.set_status(sha256, "approved")
+                ui.info("Status reset to 'approved' — will retry on next `ic2x post`.")
 
     ui.post_summary(posted_count, cfg.x_dry_run)
     db.close()

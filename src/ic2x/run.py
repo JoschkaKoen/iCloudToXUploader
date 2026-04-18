@@ -25,7 +25,7 @@ from ic2x import pull as pull_mod
 from ic2x.config import Config, load_config, ensure_dirs
 from ic2x.db import DB
 from ic2x.utils import ui
-from ic2x.utils.ai_client import warmup_ollama, provider_for_model, parse_model_effort
+from ic2x.utils.ai_client import warmup_ollama, unload_ollama, provider_for_model, parse_model_effort
 
 logger = logging.getLogger("ic2x.run")
 
@@ -191,6 +191,7 @@ def run() -> None:
                 rejected_by[dest_sub] += 1
                 continue
             ui.ok(f"safe  ({safety_ms}ms)")
+            ui.info(f'Flags       : {", ".join(safety["flags"]) or "none"}')
 
             # ── [5/6] Quality check ────────────────────────────────────────
             ui.stage_banner(5, "QUALITY CHECK")
@@ -256,6 +257,11 @@ def run() -> None:
 
     ui.run_summary(len(files), queued_count, dict(rejected_by))
     db.close()
+
+    if _ollama_models:
+        for _m in _ollama_models:
+            ui.info(f"Unloading Ollama model '{_m}'…")
+            unload_ollama(_ollama_base, _m)
 
 
 def _reject(

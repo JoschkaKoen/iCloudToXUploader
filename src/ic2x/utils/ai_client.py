@@ -301,6 +301,34 @@ def warmup_ollama(base_url: str, model: str, max_wait: float = 90.0) -> None:
         ) from exc
 
 
+def unload_ollama(base_url: str, model: str) -> None:
+    """Immediately unload *model* from Ollama's memory.
+
+    Sends ``keep_alive: 0`` to the native ``/api/generate`` endpoint, which
+    is the Ollama-documented way to evict a model from VRAM/RAM.
+    Errors are silently ignored — unloading is best-effort.
+    """
+    import urllib.request
+    import json as _json
+
+    api_base = base_url.rstrip("/")
+    if api_base.endswith("/v1"):
+        api_base = api_base[:-3]
+
+    try:
+        payload = _json.dumps({"model": model, "keep_alive": 0}).encode()
+        req = urllib.request.Request(
+            f"{api_base}/api/generate",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+    except Exception:
+        pass  # best-effort — don't crash the pipeline over a cleanup call
+
+
 def call_ollama_chat(
     base_url: str,
     model: str,

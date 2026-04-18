@@ -58,7 +58,12 @@ def call_safety(image_path: Path) -> tuple[dict, float]:
         use_stream, extra_kwargs = build_thinking_kwargs(provider, effort)
 
         prompt = SAFETY_PROMPT
-        img_b64 = encode_image_b64(image_path)
+        _max_px: int | None = None
+        if provider == "ollama":
+            _raw_px = os.environ.get("OLLAMA_IMAGE_MAX_PX", "").strip()
+            if _raw_px.isdigit():
+                _max_px = int(_raw_px)
+        img_b64 = encode_image_b64(image_path, max_px=_max_px)
 
         if provider == "ollama":
             ollama_base = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1")
