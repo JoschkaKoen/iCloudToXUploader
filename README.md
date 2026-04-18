@@ -60,8 +60,8 @@ ic2x unstick  # reset rows stuck in 'posting' back to 'approved' for retry
 
 ```bash
 pip install -e .
-cp .env.example .env   # fill in API keys
-# edit config.yaml: icloud.username, paths, enhance settings
+cp .env.example .env   # fill in API keys + ICLOUD_USERNAME
+# override any default.env value in .env if needed
 ```
 
 ### Required keys in `.env`
@@ -74,15 +74,15 @@ TWITTER_ACCESS_TOKEN_SECRET=
 GEMINI_API_KEY=
 ```
 
-### config.yaml highlights
+### Key settings in `default.env`
 
-| Key | Default | Notes |
-|-----|---------|-------|
-| `icloud.recent_count` | 50 | Max photos pulled per run |
-| `x.dry_run` | `true` | Set `false` only when pipeline is trusted |
-| `enhance.enabled` | `false` | InstructIR local enhancement (needs GPU) |
-| `limits.daily_ai_calls` | 200 | Hard abort across safety + quality calls |
-| `limits.hamming_threshold` | 12 | Perceptual dedup sensitivity (Hamming distance ≤ threshold) |
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `ICLOUD_RECENT_COUNT` | `20` | Max photos pulled per run |
+| `X_DRY_RUN` | `true` | Set `false` in `.env` when ready to post for real |
+| `ENHANCE_ENABLED` | `false` | InstructIR local enhancement (needs GPU) |
+| `DAILY_AI_CALLS` | `200` | Hard abort across safety + quality calls |
+| `HAMMING_THRESHOLD` | `12` | Perceptual dedup sensitivity (Hamming distance ≤ threshold) |
 
 ## Rejection stages
 

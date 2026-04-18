@@ -13,7 +13,7 @@ dependencies = [
   "imagehash",
   "tweepy>=4.14",
   "openai",
-  "pyyaml",
+  "pyyaml",       # used by enhance.py subprocess (InstructIR model config)
   "python-dotenv",
   "rich>=13",
 ]

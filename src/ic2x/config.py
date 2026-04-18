@@ -1,6 +1,6 @@
 """
-Load configuration from default.env + .env (secrets) and config.yaml (non-secret settings).
-All other modules import from here — nothing reads env vars or yaml directly.
+Load configuration from default.env (committed defaults) + .env (secrets).
+All other modules import from here — nothing reads env vars directly.
 """
 
 from __future__ import annotations
@@ -9,7 +9,6 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-import yaml
 from dotenv import load_dotenv
 
 _PROJECT_ROOT = Path(__file__).parent.parent.parent
@@ -85,55 +84,49 @@ def _resolve(p: str) -> Path:
     return path
 
 
-def load_config(config_path: Path | None = None) -> Config:
-    path = config_path or (_PROJECT_ROOT / "config.yaml")
-    with open(path, "r", encoding="utf-8") as f:
-        y = yaml.safe_load(f)
+def _bool_env(key: str, default: bool = False) -> bool:
+    return os.getenv(key, str(default)).strip().lower() in ("1", "true", "yes")
 
-    icloud_password = _require_env("ICLOUD_PASSWORD")
-    twitter_consumer_key    = _require_env("TWITTER_CONSUMER_KEY")
-    twitter_consumer_secret = _require_env("TWITTER_CONSUMER_SECRET")
-    twitter_access_token    = _require_env("TWITTER_ACCESS_TOKEN")
-    twitter_access_token_secret = _require_env("TWITTER_ACCESS_TOKEN_SECRET")
 
+def load_config() -> Config:
     return Config(
         # iCloud
-        icloud_username=y["icloud"]["username"],
-        icloud_password=icloud_password,
-        icloud_recent_count=int(y["icloud"]["recent_count"]),
-        icloud_cookie_dir=_resolve(y["icloud"]["cookie_dir"]),
+        icloud_username=_require_env("ICLOUD_USERNAME"),
+        icloud_password=_require_env("ICLOUD_PASSWORD"),
+        icloud_recent_count=int(os.getenv("ICLOUD_RECENT_COUNT", "20")),
+        icloud_cookie_dir=_resolve(os.getenv("ICLOUD_COOKIE_DIR", "./icloud_auth")),
 
         # Paths
-        inbox_dir=_resolve(y["paths"]["inbox"]),
-        queue_dir=_resolve(y["paths"]["queue"]),
-        approved_dir=_resolve(y["paths"]["approved"]),
-        posted_dir=_resolve(y["paths"]["posted"]),
-        rejected_dir=_resolve(y["paths"]["rejected"]),
-        db_path=_resolve(y["paths"]["db"]),
-        logs_dir=_resolve(y["paths"]["logs"]),
+        inbox_dir=_resolve(os.getenv("INBOX_DIR", "./inbox")),
+        queue_dir=_resolve(os.getenv("QUEUE_DIR", "./queue")),
+        approved_dir=_resolve(os.getenv("APPROVED_DIR", "./approved")),
+        posted_dir=_resolve(os.getenv("POSTED_DIR", "./posted")),
+        rejected_dir=_resolve(os.getenv("REJECTED_DIR", "./rejected")),
+        db_path=_resolve(os.getenv("DB_PATH", "./state.db")),
+        logs_dir=_resolve(os.getenv("LOGS_DIR", "./logs")),
 
         # Proxy
-        proxy_http=y.get("proxy", {}).get("http", ""),
-        proxy_https=y.get("proxy", {}).get("https", ""),
+        proxy_http=os.getenv("IC2X_HTTP_PROXY", ""),
+        proxy_https=os.getenv("IC2X_HTTPS_PROXY", ""),
 
         # X
-        twitter_consumer_key=twitter_consumer_key,
-        twitter_consumer_secret=twitter_consumer_secret,
-        twitter_access_token=twitter_access_token,
-        twitter_access_token_secret=twitter_access_token_secret,
-        x_dry_run=bool(y["x"].get("dry_run", True)),
+        twitter_consumer_key=_require_env("TWITTER_CONSUMER_KEY"),
+        twitter_consumer_secret=_require_env("TWITTER_CONSUMER_SECRET"),
+        twitter_access_token=_require_env("TWITTER_ACCESS_TOKEN"),
+        twitter_access_token_secret=_require_env("TWITTER_ACCESS_TOKEN_SECRET"),
+        x_dry_run=_bool_env("X_DRY_RUN", default=True),
 
         # Limits
-        daily_ai_calls=int(y["limits"]["daily_ai_calls"]),
-        hamming_threshold=int(y["limits"]["hamming_threshold"]),
+        daily_ai_calls=int(os.getenv("DAILY_AI_CALLS", "200")),
+        hamming_threshold=int(os.getenv("HAMMING_THRESHOLD", "12")),
 
         # Enhancement
-        enhance_enabled=bool(y["enhance"].get("enabled", False)),
-        enhance_instructir_dir=_resolve(y["enhance"]["instructir_dir"]),
-        enhance_prompt=y["enhance"].get("prompt", ""),
+        enhance_enabled=_bool_env("ENHANCE_ENABLED", default=False),
+        enhance_instructir_dir=_resolve(os.getenv("ENHANCE_INSTRUCTIR_DIR", "~/Programming/InstructIR")),
+        enhance_prompt=os.getenv("ENHANCE_PROMPT", "sharpen this image, remove blur, improve clarity"),
 
         # Review
-        auto_approve=bool(y["review"].get("auto_approve", False)),
+        auto_approve=_bool_env("AUTO_APPROVE", default=False),
     )
 
 
