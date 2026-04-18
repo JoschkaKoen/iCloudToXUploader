@@ -50,6 +50,9 @@ def _run_icloudpd(cfg: Config) -> None:
     cmd = [
         sys.executable, "-m", "icloudpd",
         "--username", cfg.icloud_username,
+        "--password-provider", "parameter",
+        "-p", cfg.icloud_password,
+        "--mfa-provider", "console",
         "--directory", str(cfg.inbox_dir),
         "--cookie-directory", str(cfg.icloud_cookie_dir),
         "--recent", str(cfg.icloud_recent_count),

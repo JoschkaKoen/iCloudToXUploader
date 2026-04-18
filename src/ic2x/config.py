@@ -21,6 +21,7 @@ load_dotenv(_PROJECT_ROOT / ".env")
 class Config:
     # iCloud
     icloud_username: str
+    icloud_password: str
     icloud_recent_count: int
     icloud_cookie_dir: Path
 
@@ -85,6 +86,7 @@ def load_config(config_path: Path | None = None) -> Config:
     with open(path, "r", encoding="utf-8") as f:
         y = yaml.safe_load(f)
 
+    icloud_password = _require_env("ICLOUD_PASSWORD")
     gemini_api_key = _require_env("GEMINI_API_KEY")
     twitter_consumer_key    = _require_env("TWITTER_CONSUMER_KEY")
     twitter_consumer_secret = _require_env("TWITTER_CONSUMER_SECRET")
@@ -94,6 +96,7 @@ def load_config(config_path: Path | None = None) -> Config:
     return Config(
         # iCloud
         icloud_username=y["icloud"]["username"],
+        icloud_password=icloud_password,
         icloud_recent_count=int(y["icloud"]["recent_count"]),
         icloud_cookie_dir=_resolve(y["icloud"]["cookie_dir"]),
 
