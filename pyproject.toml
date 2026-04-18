@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ic2x"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+  "icloudpd",
+  "pillow",
+  "pillow-heif",
+  "imagehash",
+  "tweepy>=4.14",
+  "google-genai",
+  "pyyaml",
+  "python-dotenv",
+]
+
+[project.scripts]
+ic2x = "ic2x.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

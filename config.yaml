@@ -1,0 +1,36 @@
+icloud:
+  username: you@icloud.com
+  recent_count: 50
+  cookie_dir: ./icloud_auth
+
+paths:
+  inbox:    ./inbox
+  queue:    ./queue
+  approved: ./approved
+  posted:   ./posted
+  rejected: ./rejected
+  db:       ./state.db
+  logs:     ./logs
+
+proxy:
+  http:  http://127.0.0.1:7890
+  https: http://127.0.0.1:7890
+
+gemini:
+  safety_model:  gemini-2.5-flash-preview-04-17
+  quality_model: gemini-2.5-flash-preview-04-17
+
+x:
+  dry_run: true   # flip false only when pipeline is trusted
+
+limits:
+  daily_gemini_calls: 200
+  hamming_threshold:  6
+
+enhance:
+  enabled: false
+  instructir_dir: ~/Programming/InstructIR
+  prompt: "sharpen this image, remove blur, improve clarity"
+
+review:
+  auto_approve: false
