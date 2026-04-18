@@ -1,29 +1,21 @@
 """
 Console UI helpers — pretty terminal output for ic2x.
-All functions use print() directly so they never appear in log files.
+All functions use rich Console directly so they never appear in log files.
 Ported and adapted from XBot-3/utils/ui.py.
 """
 
 import os
-import sys
-import shutil
 
-# ── ANSI colours ──────────────────────────────────────────────────────────────
-_R      = "\033[0m"
-_BOLD   = "\033[1m"
-_DIM    = "\033[2m"
-_CYAN   = "\033[96m"
-_GREEN  = "\033[92m"
-_YELLOW = "\033[93m"
-_RED    = "\033[91m"
-_GRAY   = "\033[90m"
-_WHITE  = "\033[97m"
+from rich import box
+from rich.console import Console
+from rich.markup import escape
+from rich.panel import Panel
+from rich.table import Table
 
 _TOTAL_STAGES = 6  # SHA-256 dedup, screenshot, pHash dedup, safety, quality, prepare
 
-
-def _w() -> int:
-    return min(shutil.get_terminal_size((80, 24)).columns, 80)
+console = Console()               # stdout — all UI output
+err_console = Console(stderr=True)  # stderr — only ui.err()
 
 
 # ── Startup ───────────────────────────────────────────────────────────────────
@@ -31,7 +23,6 @@ def _w() -> int:
 def startup_banner(cfg) -> None:
     """Printed once at the start of ic2x run."""
     from ic2x.utils.ai_client import parse_model_effort
-    w = _w()
     dry = "YES  ⚠" if cfg.x_dry_run else "no"
     enhance = "enabled" if cfg.enhance_enabled else "disabled"
     _default = os.environ.get("AI_DEFAULT_MODEL", "gemini-2.5-flash")
@@ -43,83 +34,83 @@ def startup_banner(cfg) -> None:
     )
     safety_str = f"{safety_model} [{safety_effort or 'default'}]"
     quality_str = f"{quality_model} [{quality_effort or 'default'}]"
-    print()
-    print(f"{_CYAN}{_BOLD}{'═' * w}{_R}")
-    print(f"{_CYAN}{_BOLD}  📸  IC2X — iCloud → X Photo Pipeline{_R}")
-    print(f"{_CYAN}{'─' * w}{_R}")
     rows = [
-        ("👤", "iCloud user",    cfg.icloud_username),
-        ("🔢", "Recent count",   str(cfg.icloud_recent_count)),
-        ("🤖", "Safety model",   safety_str),
-        ("🤖", "Quality model",  quality_str),
-        ("✨", "Enhance",        enhance),
-        ("🐦", "Dry run",        dry),
+        ("👤", "iCloud user",   cfg.icloud_username),
+        ("🔢", "Recent count",  str(cfg.icloud_recent_count)),
+        ("🤖", "Safety model",  safety_str),
+        ("🤖", "Quality model", quality_str),
+        ("✨", "Enhance",       enhance),
+        ("🐦", "Dry run",       dry),
     ]
+    t = Table.grid(padding=(0, 2))
+    t.add_column(style="bold cyan")
+    t.add_column(style="cyan")
     for icon, label, value in rows:
-        print(f"{_CYAN}  {icon}  {_BOLD}{label:<16}{_R}{_CYAN}{value}{_R}")
-    print(f"{_CYAN}{_BOLD}{'═' * w}{_R}")
-    print()
+        t.add_row(f"{icon}  {label}", escape(value))
+    console.print()
+    console.print(Panel(
+        t,
+        title="[bold cyan]📸  IC2X — iCloud → X Photo Pipeline[/]",
+        border_style="cyan",
+        box=box.DOUBLE,
+    ))
+    console.print()
 
 
 # ── Section headers ───────────────────────────────────────────────────────────
 
 def run_banner() -> None:
-    w = _w()
-    print()
-    print(f"{_BOLD}{'━' * w}{_R}")
-    print(f"{_BOLD}  📥  PULLING FROM iCLOUD{_R}")
-    print(f"{_BOLD}{'━' * w}{_R}")
-    print()
+    console.print()
+    console.rule("[bold]📥  PULLING FROM iCLOUD[/]", style="bold")
+    console.print()
 
 
 def review_section_banner(total: int) -> None:
-    w = _w()
-    print()
-    print(f"{_BOLD}{'━' * w}{_R}")
-    print(f"{_BOLD}  🖼   REVIEW QUEUE  ({total} image{'s' if total != 1 else ''}){_R}")
-    print(f"{_BOLD}{'━' * w}{_R}")
-    print()
+    label = f"🖼   REVIEW QUEUE  ({total} image{'s' if total != 1 else ''})"
+    console.print()
+    console.rule(f"[bold]{escape(label)}[/]", style="bold")
+    console.print()
 
 
 def post_section_banner(total: int, dry_run: bool) -> None:
-    w = _w()
     tag = "  [DRY RUN]" if dry_run else ""
-    print()
-    print(f"{_BOLD}{'━' * w}{_R}")
-    print(f"{_BOLD}  📤  POSTING{tag}  ({total} image{'s' if total != 1 else ''}){_R}")
-    print(f"{_BOLD}{'━' * w}{_R}")
-    print()
+    label = f"📤  POSTING{tag}  ({total} image{'s' if total != 1 else ''})"
+    console.print()
+    console.rule(f"[bold]{escape(label)}[/]", style="bold")
+    console.print()
 
 
 # ── Per-image headers ─────────────────────────────────────────────────────────
 
 def file_header(filename: str, index: int, total: int) -> None:
-    print()
-    print(f"  {_BOLD}📷  {filename}{_R}  {_GRAY}({index} / {total}){_R}")
+    console.print()
+    console.print(f"  [bold]📷  {escape(filename)}[/]  [dim]({index} / {total})[/]")
 
 
 def stage_banner(step: int, name: str) -> None:
-    w = _w()
-    print(f"  {_CYAN}{'─' * (w - 2)}{_R}")
-    print(f"  {_CYAN}▶  [{step}/{_TOTAL_STAGES}]  {name.upper()}{_R}")
+    console.rule(
+        f"[cyan]▶  [{step}/{_TOTAL_STAGES}]  {escape(name.upper())}[/]",
+        style="cyan",
+        align="left",
+    )
 
 
 # ── Inline status ─────────────────────────────────────────────────────────────
 
 def ok(msg: str) -> None:
-    print(f"  {_GREEN}✅  {msg}{_R}")
+    console.print(f"  [green]✅  {escape(msg)}[/]")
 
 
 def info(msg: str) -> None:
-    print(f"  {_GRAY}ℹ   {msg}{_R}")
+    console.print(f"  [dim]ℹ   {escape(msg)}[/]")
 
 
 def warn(msg: str) -> None:
-    print(f"  {_YELLOW}⚠   {msg}{_R}")
+    console.print(f"  [yellow]⚠   {escape(msg)}[/]")
 
 
 def err(msg: str) -> None:
-    print(f"  {_RED}✖   {msg}{_R}", file=sys.stderr)
+    err_console.print(f"  [red]✖   {escape(msg)}[/]")
 
 
 # ── Decision outputs ──────────────────────────────────────────────────────────
@@ -129,73 +120,92 @@ def rejected(filename: str, stage: str, reason) -> None:
         reason_str = ", ".join(str(r) for r in reason)
     else:
         reason_str = str(reason) if reason else stage
-    print(f"  {_RED}✖  {filename} → rejected [{stage}: {reason_str}]{_R}")
+    console.print(
+        f"  [red]✖  {escape(filename)} → rejected "
+        f"[{escape(stage)}: {escape(reason_str)}][/]"
+    )
 
 
 def queued(filename: str, phash: str, caption: str) -> None:
-    w = _w()
-    print(f"  {_CYAN}{'─' * (w - 2)}{_R}")
-    print(f"  {_GREEN}{_BOLD}✅  {filename} → queued{_R}")
-    print(f"  {_GRAY}    phash  : {phash[:16]}...{_R}")
-    print(f"  {_GRAY}    caption: {caption}{_R}")
+    console.rule(style="cyan")
+    console.print(f"  [green bold]✅  {escape(filename)} → queued[/]")
+    console.print(f"  [dim]    phash  : {escape(phash[:16])}...[/]")
+    console.print(f"  [dim]    caption: {escape(caption)}[/]")
 
 
 # ── Summaries ─────────────────────────────────────────────────────────────────
 
 def run_summary(pulled: int, queued_count: int, rejected_by: dict) -> None:
-    w = _w()
     total_rejected = sum(rejected_by.values())
-    print()
-    print(f"{_GREEN}{_BOLD}{'═' * w}{_R}")
-    print(f"{_GREEN}{_BOLD}  ✅  RUN COMPLETE{_R}")
-    print(f"{_GREEN}  📥  Pulled     {pulled:>4}{_R}")
-    print(f"{_GREEN}  ✅  Queued     {queued_count:>4}{_R}")
+    t = Table.grid(padding=(0, 2))
+    t.add_column(style="green")
+    t.add_column(justify="right", style="green")
+    t.add_row("📥  Pulled", str(pulled))
+    t.add_row("✅  Queued", str(queued_count))
     if total_rejected:
-        print(f"{_RED}  ✖   Rejected   {total_rejected:>4}{_R}")
+        t.add_row(f"[red]✖   Rejected[/]", f"[red]{total_rejected}[/]")
         for stage, count in sorted(rejected_by.items(), key=lambda x: -x[1]):
-            print(f"{_GRAY}       {stage:<16} {count}{_R}")
-    print(f"{_GREEN}{_BOLD}{'═' * w}{_R}")
-    print()
+            t.add_row(f"[dim]     {escape(stage)}[/]", f"[dim]{count}[/]")
+    console.print()
+    console.print(Panel(
+        t,
+        title="[bold green]✅  RUN COMPLETE[/]",
+        border_style="green",
+        box=box.DOUBLE,
+    ))
+    console.print()
 
 
 def review_header(index: int, total: int, filename: str,
                   description: str, caption: str, reason: str) -> None:
-    w = _w()
-    print()
-    print(f"{_BOLD}{'━' * w}{_R}")
-    print(f"{_BOLD}  🖼   [{index} / {total}]  {filename}{_R}")
-    print(f"{'─' * w}")
-    print(f"  {_GRAY}📝  {description}{_R}")
-    print(f"  {_BOLD}💬  Caption: {caption}{_R}")
-    print(f"  {_GRAY}🤔  Gemini:  {reason}{_R}")
-    print()
+    t = Table.grid(padding=(0, 1))
+    t.add_column(style="dim")
+    t.add_column()
+    t.add_row("📝", escape(description))
+    t.add_row("[bold]💬[/]", f"[bold]Caption:[/] {escape(caption)}")
+    t.add_row("🤔", f"[dim]Gemini:  {escape(reason)}[/]")
+    console.print()
+    console.print(Panel(
+        t,
+        title=f"[bold]🖼   [{index} / {total}]  {escape(filename)}[/]",
+        border_style="bold",
+    ))
+    console.print()
 
 
 def review_prompt() -> None:
-    print(f"  {_CYAN}[y]{_R} post  {_CYAN}[n]{_R} skip  {_CYAN}[e]{_R} edit caption  {_CYAN}[q]{_R} quit", end="  ")
+    # end="  " keeps the cursor on the same line so input() lands right after
+    console.print(
+        r"  [cyan]\[y][/] post  [cyan]\[n][/] skip  "
+        r"[cyan]\[e][/] edit caption  [cyan]\[q][/] quit",
+        end="  ",
+    )
 
 
 def post_banner(filename: str, caption: str, dry_run: bool) -> None:
-    w = _w()
     tag = "  [DRY RUN]" if dry_run else ""
-    print(f"  {_CYAN}{'─' * (w - 2)}{_R}")
-    print(f"  {_BOLD}📤  POSTING{tag}  {filename}{_R}")
-    print(f"  {_GRAY}    Caption: {caption}{_R}")
+    console.rule(style="cyan")
+    console.print(f"  [bold]📤  POSTING{escape(tag)}  {escape(filename)}[/]")
+    console.print(f"  [dim]    Caption: {escape(caption)}[/]")
 
 
 def post_ok(tweet_url: str) -> None:
-    print(f"  {_GREEN}✅  Posted → {tweet_url}{_R}")
+    console.print(f"  [green]✅  Posted → {escape(tweet_url)}[/]")
 
 
 def post_dry(filename: str, caption: str) -> None:
-    print(f"  {_YELLOW}⚠   [DRY RUN] would post {filename}: {caption}{_R}")
+    console.print(
+        f"  [yellow]⚠   [DRY RUN] would post {escape(filename)}: {escape(caption)}[/]"
+    )
 
 
 def post_summary(posted: int, dry_run: bool) -> None:
-    w = _w()
     tag = "  [DRY RUN]" if dry_run else ""
-    print()
-    print(f"{_GREEN}{_BOLD}{'═' * w}{_R}")
-    print(f"{_GREEN}{_BOLD}  ✅  POST COMPLETE{tag} — {posted} tweet{'s' if posted != 1 else ''} posted{_R}")
-    print(f"{_GREEN}{_BOLD}{'═' * w}{_R}")
-    print()
+    label = f"✅  POST COMPLETE{tag} — {posted} tweet{'s' if posted != 1 else ''} posted"
+    console.print()
+    console.print(Panel(
+        f"[bold green]{escape(label)}[/]",
+        border_style="green",
+        box=box.DOUBLE,
+    ))
+    console.print()

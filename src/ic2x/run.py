@@ -30,14 +30,20 @@ logger = logging.getLogger("ic2x.run")
 
 
 def _setup_logging(logs_dir: Path) -> None:
+    from rich.logging import RichHandler
     logs_dir.mkdir(parents=True, exist_ok=True)
     log_file = logs_dir / f"{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.log"
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s  %(name)-20s  %(levelname)s  %(message)s")
+    )
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s  %(name)-20s  %(levelname)s  %(message)s",
+        format="%(message)s",
+        datefmt="[%X]",
         handlers=[
-            logging.FileHandler(log_file),
-            logging.StreamHandler(),
+            file_handler,
+            RichHandler(rich_tracebacks=True, show_path=False),
         ],
     )
 
