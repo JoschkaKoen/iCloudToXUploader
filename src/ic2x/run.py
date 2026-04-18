@@ -19,8 +19,6 @@ from pathlib import Path
 import pillow_heif  # noqa: F401
 pillow_heif.register_heif_opener()
 
-from google import genai
-
 from ic2x import dedup, enhance, filter, prepare
 from ic2x import judge_quality, judge_safety
 from ic2x import pull as pull_mod
@@ -99,8 +97,6 @@ def run() -> None:
         )
         return
 
-    gemini_client = genai.Client(api_key=cfg.gemini_api_key)
-
     ui.run_banner()
     files = pull_mod.pull(cfg, db)
     ui.info(f"Pulled {len(files)} file(s) from iCloud")
@@ -151,7 +147,7 @@ def run() -> None:
             if db.check_daily_gemini_limit(cfg.daily_gemini_calls):
                 ui.warn("Daily Gemini call limit reached — stopping")
                 break
-            safety, safety_elapsed = judge_safety.call_safety(path, gemini_client, cfg.gemini_safety_model)
+            safety, safety_elapsed = judge_safety.call_safety(path)
             db.increment_gemini_calls()
             safety_ms = int(safety_elapsed * 1000)
 
@@ -168,14 +164,14 @@ def run() -> None:
                 )
                 rejected_by[dest_sub] += 1
                 continue
-            ui.ok(f"safe  ({cfg.gemini_safety_model}, {safety_ms}ms)")
+            ui.ok(f"safe  ({safety_ms}ms)")
 
             # ── [5/6] Quality check ────────────────────────────────────────
             ui.stage_banner(5, "QUALITY CHECK")
             if db.check_daily_gemini_limit(cfg.daily_gemini_calls):
                 ui.warn("Daily Gemini call limit reached — stopping")
                 break
-            quality, quality_elapsed = judge_quality.call_quality(path, gemini_client, cfg.gemini_quality_model)
+            quality, quality_elapsed = judge_quality.call_quality(path)
             db.increment_gemini_calls()
             quality_ms = int(quality_elapsed * 1000)
 
@@ -190,7 +186,7 @@ def run() -> None:
                 )
                 rejected_by["quality"] += 1
                 continue
-            ui.ok(f"interesting  ({cfg.gemini_quality_model}, {quality_ms}ms)")
+            ui.ok(f"interesting  ({quality_ms}ms)")
 
             # ── [6/6] Prepare + optional enhance ──────────────────────────
             ui.stage_banner(6, "PREPARE")

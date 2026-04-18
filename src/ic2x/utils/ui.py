@@ -4,6 +4,7 @@ All functions use print() directly so they never appear in log files.
 Ported and adapted from XBot-3/utils/ui.py.
 """
 
+import os
 import sys
 import shutil
 
@@ -29,9 +30,19 @@ def _w() -> int:
 
 def startup_banner(cfg) -> None:
     """Printed once at the start of ic2x run."""
+    from ic2x.utils.ai_client import parse_model_effort
     w = _w()
     dry = "YES  ⚠" if cfg.x_dry_run else "no"
     enhance = "enabled" if cfg.enhance_enabled else "disabled"
+    _default = os.environ.get("AI_DEFAULT_MODEL", "gemini-2.5-flash")
+    safety_model, safety_effort = parse_model_effort(
+        os.environ.get("SAFETY_MODEL", _default)
+    )
+    quality_model, quality_effort = parse_model_effort(
+        os.environ.get("QUALITY_MODEL", _default)
+    )
+    safety_str = f"{safety_model} [{safety_effort or 'default'}]"
+    quality_str = f"{quality_model} [{quality_effort or 'default'}]"
     print()
     print(f"{_CYAN}{_BOLD}{'═' * w}{_R}")
     print(f"{_CYAN}{_BOLD}  📸  IC2X — iCloud → X Photo Pipeline{_R}")
@@ -39,8 +50,8 @@ def startup_banner(cfg) -> None:
     rows = [
         ("👤", "iCloud user",    cfg.icloud_username),
         ("🔢", "Recent count",   str(cfg.icloud_recent_count)),
-        ("🤖", "Safety model",   cfg.gemini_safety_model),
-        ("🤖", "Quality model",  cfg.gemini_quality_model),
+        ("🤖", "Safety model",   safety_str),
+        ("🤖", "Quality model",  quality_str),
         ("✨", "Enhance",        enhance),
         ("🐦", "Dry run",        dry),
     ]

@@ -12,7 +12,7 @@ dependencies = [
   "pillow-heif",
   "imagehash",
   "tweepy>=4.14",
-  "google-genai",
+  "openai",
   "pyyaml",
   "python-dotenv",
 ]

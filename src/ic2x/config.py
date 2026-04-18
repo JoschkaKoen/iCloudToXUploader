@@ -1,5 +1,5 @@
 """
-Load configuration from .env (secrets) and config.yaml (non-secret settings).
+Load configuration from default.env + .env (secrets) and config.yaml (non-secret settings).
 All other modules import from here — nothing reads env vars or yaml directly.
 """
 
@@ -12,9 +12,18 @@ from pathlib import Path
 import yaml
 from dotenv import load_dotenv
 
-# Load .env from the project root (two levels up from this file: src/ic2x/config.py)
 _PROJECT_ROOT = Path(__file__).parent.parent.parent
-load_dotenv(_PROJECT_ROOT / ".env")
+
+
+def load_project_env() -> None:
+    """Load default.env (committed defaults) then .env (secrets, override=True)."""
+    default_env = _PROJECT_ROOT / "default.env"
+    if default_env.exists():
+        load_dotenv(default_env, override=False)
+    load_dotenv(_PROJECT_ROOT / ".env", override=True)
+
+
+load_project_env()
 
 
 @dataclass
@@ -37,11 +46,6 @@ class Config:
     # Proxy
     proxy_http: str
     proxy_https: str
-
-    # Gemini
-    gemini_api_key: str
-    gemini_safety_model: str
-    gemini_quality_model: str
 
     # X / Twitter
     twitter_consumer_key: str
@@ -87,7 +91,6 @@ def load_config(config_path: Path | None = None) -> Config:
         y = yaml.safe_load(f)
 
     icloud_password = _require_env("ICLOUD_PASSWORD")
-    gemini_api_key = _require_env("GEMINI_API_KEY")
     twitter_consumer_key    = _require_env("TWITTER_CONSUMER_KEY")
     twitter_consumer_secret = _require_env("TWITTER_CONSUMER_SECRET")
     twitter_access_token    = _require_env("TWITTER_ACCESS_TOKEN")
@@ -112,11 +115,6 @@ def load_config(config_path: Path | None = None) -> Config:
         # Proxy
         proxy_http=y.get("proxy", {}).get("http", ""),
         proxy_https=y.get("proxy", {}).get("https", ""),
-
-        # Gemini
-        gemini_api_key=gemini_api_key,
-        gemini_safety_model=y["gemini"]["safety_model"],
-        gemini_quality_model=y["gemini"]["quality_model"],
 
         # X
         twitter_consumer_key=twitter_consumer_key,

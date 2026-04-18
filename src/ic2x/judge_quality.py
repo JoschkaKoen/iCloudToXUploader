@@ -1,8 +1,7 @@
 """
-Gemini quality / interest check.
+Quality / interest check using the multi-provider AI client.
 
 Only runs if the image passed the safety check.
-The prompt is intentionally tunable — iterate after the first week of data.
 """
 
 from __future__ import annotations
@@ -12,7 +11,13 @@ import logging
 import time
 from pathlib import Path
 
-from PIL import Image
+from ic2x.utils.ai_client import (
+    make_ai_client,
+    build_thinking_kwargs,
+    collect_streamed_response,
+    strip_json_fences,
+)
+from ic2x.utils.image_utils import encode_image_b64
 
 logger = logging.getLogger("ic2x.judge_quality")
 
@@ -40,50 +45,54 @@ Reject as NOT interesting:
 JSON only."""
 
 
-def call_quality(image_path: Path, client, model_name: str) -> tuple[dict, float]:
-    """
-    Run the Gemini quality check on image_path.
+def call_quality(image_path: Path) -> tuple[dict, float]:
+    """Run the quality check on image_path.
+
     Returns (result_dict, elapsed_seconds).
     result_dict always has {"interesting": bool, "description", "caption", "reason"}.
     """
-    from google.genai import types
-
     t0 = time.monotonic()
+    _error_result = {"interesting": False, "description": "", "caption": "", "reason": ""}
     try:
-        with Image.open(image_path) as img:
-            img_copy = img.copy()
+        result = make_ai_client(model_env="QUALITY_MODEL")
+        if result is None:
+            logger.warning("quality: no AI client available (check GEMINI_API_KEY / QUALITY_MODEL)")
+            _error_result["reason"] = "error:no_client"
+            return _error_result, time.monotonic() - t0
 
-        resp = client.models.generate_content(
-            model=model_name,
-            contents=[QUALITY_PROMPT, img_copy],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json"
-            ),
-        )
+        client, model, provider, effort = result
+        use_stream, extra_kwargs = build_thinking_kwargs(provider, effort)
 
-        candidate = resp.candidates[0] if resp.candidates else None
-        if candidate and candidate.finish_reason.name == "SAFETY":
-            logger.info("quality: Gemini refused to analyse %s", image_path.name)
-            return {
-                "interesting": False,
-                "description": "",
-                "caption": "",
-                "reason": "gemini_refused",
-            }, time.monotonic() - t0
+        img_b64 = encode_image_b64(image_path)
+        messages = [{"role": "user", "content": [
+            {"type": "text", "text": QUALITY_PROMPT},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+        ]}]
 
-        result = json.loads(resp.text)
-        if "interesting" not in result:
-            raise ValueError(f"Unexpected response shape: {resp.text[:200]}")
-        # Truncate caption to 100 chars just in case
-        if result.get("caption"):
-            result["caption"] = result["caption"][:100]
-        return result, time.monotonic() - t0
+        if use_stream:
+            stream = client.chat.completions.create(
+                model=model, messages=messages, stream=True, **extra_kwargs
+            )
+            raw = collect_streamed_response(stream)
+        else:
+            resp = client.chat.completions.create(
+                model=model, messages=messages, stream=False,
+                response_format={"type": "json_object"}, **extra_kwargs
+            )
+            if resp.choices[0].finish_reason == "content_filter":
+                logger.info("quality: model refused to analyse %s", image_path.name)
+                _error_result["reason"] = "gemini_refused"
+                return _error_result, time.monotonic() - t0
+            raw = resp.choices[0].message.content or ""
+
+        parsed = json.loads(strip_json_fences(raw))
+        if "interesting" not in parsed:
+            raise ValueError(f"Unexpected response shape: {raw[:200]}")
+        if parsed.get("caption"):
+            parsed["caption"] = parsed["caption"][:100]
+        return parsed, time.monotonic() - t0
 
     except Exception as exc:
         logger.warning("quality: error for %s: %s", image_path.name, exc)
-        return {
-            "interesting": False,
-            "description": "",
-            "caption": "",
-            "reason": f"error:{type(exc).__name__}",
-        }, time.monotonic() - t0
+        _error_result["reason"] = f"error:{type(exc).__name__}"
+        return _error_result, time.monotonic() - t0

@@ -69,10 +69,10 @@ def _run_icloudpd(cfg: Config) -> None:
 
 
 def _scan_inbox(inbox: Path) -> list[Path]:
-    """Return all image files currently in inbox/, sorted by mtime ascending."""
+    """Return all image files in inbox/ (recursively), sorted by mtime ascending."""
     extensions = {".heic", ".jpg", ".jpeg", ".png"}
     files = [
-        p for p in inbox.iterdir()
+        p for p in inbox.rglob("*")
         if p.is_file() and p.suffix.lower() in extensions
     ]
     return sorted(files, key=lambda p: p.stat().st_mtime)

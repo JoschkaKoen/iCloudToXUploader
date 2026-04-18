@@ -1,8 +1,7 @@
 """
-Gemini safety check.
+Safety check using the multi-provider AI client.
 
-Fail closed: any error (network, quota, parse failure, Gemini refusal)
-rejects the image. Never fail open.
+Fail closed: any error (network, quota, parse failure, refusal) rejects the image.
 """
 
 from __future__ import annotations
@@ -12,7 +11,13 @@ import logging
 import time
 from pathlib import Path
 
-from PIL import Image
+from ic2x.utils.ai_client import (
+    make_ai_client,
+    build_thinking_kwargs,
+    collect_streamed_response,
+    strip_json_fences,
+)
+from ic2x.utils.image_utils import encode_image_b64
 
 logger = logging.getLogger("ic2x.judge_safety")
 
@@ -34,36 +39,47 @@ Be strict. When in doubt, flag. Return {"safe": false, "flags": ["flag_name"]} t
 JSON only."""
 
 
-def call_safety(image_path: Path, client, model_name: str) -> tuple[dict, float]:
-    """
-    Run the Gemini safety check on image_path.
+def call_safety(image_path: Path) -> tuple[dict, float]:
+    """Run the safety check on image_path.
+
     Returns (result_dict, elapsed_seconds).
     result_dict always has {"safe": bool, "flags": list}.
     """
-    from google.genai import types
-
     t0 = time.monotonic()
     try:
-        with Image.open(image_path) as img:
-            img_copy = img.copy()
+        result = make_ai_client(model_env="SAFETY_MODEL")
+        if result is None:
+            logger.warning("safety: no AI client available (check GEMINI_API_KEY / SAFETY_MODEL)")
+            return {"safe": False, "flags": ["error:no_client"]}, time.monotonic() - t0
 
-        resp = client.models.generate_content(
-            model=model_name,
-            contents=[SAFETY_PROMPT, img_copy],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json"
-            ),
-        )
+        client, model, provider, effort = result
+        use_stream, extra_kwargs = build_thinking_kwargs(provider, effort)
 
-        candidate = resp.candidates[0] if resp.candidates else None
-        if candidate and candidate.finish_reason.name == "SAFETY":
-            logger.info("safety: Gemini refused to analyse %s", image_path.name)
-            return {"safe": False, "flags": ["gemini_refused"]}, time.monotonic() - t0
+        img_b64 = encode_image_b64(image_path)
+        messages = [{"role": "user", "content": [
+            {"type": "text", "text": SAFETY_PROMPT},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+        ]}]
 
-        result = json.loads(resp.text)
-        if "safe" not in result:
-            raise ValueError(f"Unexpected response shape: {resp.text[:200]}")
-        return result, time.monotonic() - t0
+        if use_stream:
+            stream = client.chat.completions.create(
+                model=model, messages=messages, stream=True, **extra_kwargs
+            )
+            raw = collect_streamed_response(stream)
+        else:
+            resp = client.chat.completions.create(
+                model=model, messages=messages, stream=False,
+                response_format={"type": "json_object"}, **extra_kwargs
+            )
+            if resp.choices[0].finish_reason == "content_filter":
+                logger.info("safety: model refused to analyse %s", image_path.name)
+                return {"safe": False, "flags": ["gemini_refused"]}, time.monotonic() - t0
+            raw = resp.choices[0].message.content or ""
+
+        parsed = json.loads(strip_json_fences(raw))
+        if "safe" not in parsed:
+            raise ValueError(f"Unexpected response shape: {raw[:200]}")
+        return parsed, time.monotonic() - t0
 
     except Exception as exc:
         logger.warning("safety: error for %s: %s", image_path.name, exc)

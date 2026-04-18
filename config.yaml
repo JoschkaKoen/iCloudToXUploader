@@ -13,12 +13,12 @@ paths:
   logs:     ./logs
 
 proxy:
-  http:  http://127.0.0.1:7890
-  https: http://127.0.0.1:7890
+  http:  ""
+  https: ""
 
 gemini:
-  safety_model:  gemini-2.5-flash-preview-04-17
-  quality_model: gemini-2.5-flash-preview-04-17
+  safety_model:  gemini-2.5-flash
+  quality_model: gemini-2.5-flash
 
 x:
   dry_run: true   # flip false only when pipeline is trusted
