@@ -20,7 +20,7 @@ import pillow_heif  # noqa: F401
 pillow_heif.register_heif_opener()
 
 from ic2x import dedup, enhance, filter, prepare
-from ic2x import judge_quality, judge_rotation, judge_safety
+from ic2x import judge_rotation, judge_safety_quality
 from ic2x import pull as pull_mod
 from ic2x.config import Config, load_config, ensure_dirs
 from ic2x.db import DB
@@ -106,11 +106,10 @@ def run(
 
     # Warmup Ollama if either AI model is local — one-time check before the image loop
     _default = os.environ.get("AI_DEFAULT_MODEL", "gemini-2.5-flash")
-    _safety_model, _ = parse_model_effort(os.environ.get("SAFETY_MODEL", _default))
-    _quality_model, _ = parse_model_effort(os.environ.get("QUALITY_MODEL", _default))
+    _judge_model,    _ = parse_model_effort(os.environ.get("JUDGE_MODEL",    _default))
     _rotation_model, _ = parse_model_effort(os.environ.get("ROTATION_MODEL", _default))
     _ollama_models = {
-        m for m in (_safety_model, _quality_model, _rotation_model)
+        m for m in (_judge_model, _rotation_model)
         if provider_for_model(m) == "ollama"
     }
     if _ollama_models:
@@ -197,58 +196,49 @@ def run(
             if _existing is None:
                 db.insert_seen(sha, phash, path.name)
 
-            # ── [4/6] Safety check ─────────────────────────────────────────
-            ui.stage_banner(4, "SAFETY CHECK")
+            # ── [4/6] Safety + quality check ──────────────────────────────
+            ui.stage_banner(4, "SAFETY + QUALITY CHECK")
             if db.check_daily_ai_limit(cfg.daily_ai_calls):
                 ui.warn("Daily AI call limit reached — stopping")
                 break
-            safety, safety_elapsed = judge_safety.call_safety(path)
+            result, sq_elapsed = judge_safety_quality.call_safety_quality(path)
             db.increment_ai_calls()
-            safety_ms = int(safety_elapsed * 1000)
+            sq_ms = int(sq_elapsed * 1000)
 
-            if not safety["safe"]:
-                stage = "model_refused" if "gemini_refused" in safety["flags"] else "safety"
-                ui.rejected(path.name, stage, safety["flags"])
+            if not result["safe"]:
+                stage = "model_refused" if "gemini_refused" in result["flags"] else "safety"
+                ui.rejected(path.name, stage, result["flags"])
                 dest_sub = "model_refused" if stage == "model_refused" else "safety"
                 _reject(
-                    path, cfg, db, sha, phash, "rejected", safety["flags"],
+                    path, cfg, db, sha, phash, "rejected", result["flags"],
                     reject_stage=dest_sub,
-                    safety_raw=json.dumps(safety),
+                    safety_raw=json.dumps({"safe": result["safe"], "flags": result["flags"]}),
                     logs_dir=cfg.logs_dir,
-                    ai_ms=safety_ms,
+                    ai_ms=sq_ms,
                 )
                 rejected_by[dest_sub] += 1
                 continue
-            ui.ok(f"safe  ({safety_ms}ms)")
-            ui.info(f'Flags       : {", ".join(safety["flags"]) or "none"}')
+            ui.ok(f"safe  ({sq_ms}ms)")
+            ui.info(f'Flags       : {", ".join(result["flags"]) or "none"}')
 
-            # ── [5/6] Quality check ────────────────────────────────────────
-            ui.stage_banner(5, "QUALITY CHECK")
-            if db.check_daily_ai_limit(cfg.daily_ai_calls):
-                ui.warn("Daily AI call limit reached — stopping")
-                break
-            quality, quality_elapsed = judge_quality.call_quality(path)
-            db.increment_ai_calls()
-            quality_ms = int(quality_elapsed * 1000)
-
-            if not quality["interesting"]:
-                ui.info(f'Description : {quality["description"]}')
-                ui.rejected(path.name, "quality", quality["reason"])
+            if not result["interesting"]:
+                ui.info(f'Description : {result["description"]}')
+                ui.rejected(path.name, "quality", result["reason"])
                 _reject(
-                    path, cfg, db, sha, phash, "rejected", quality["reason"],
+                    path, cfg, db, sha, phash, "rejected", result["reason"],
                     reject_stage="quality",
-                    quality_raw=json.dumps(quality),
+                    quality_raw=json.dumps({k: result[k] for k in ("interesting", "description", "caption", "reason")}),
                     logs_dir=cfg.logs_dir,
-                    ai_ms=quality_ms,
+                    ai_ms=sq_ms,
                 )
                 rejected_by["quality"] += 1
                 continue
-            ui.ok(f"interesting  ({quality_ms}ms)")
-            ui.info(f'Caption     : {quality["caption"]}')
-            ui.info(f'Description : {quality["description"]}')
+            ui.ok(f"interesting  ({sq_ms}ms)")
+            ui.info(f'Caption     : {result["caption"]}')
+            ui.info(f'Description : {result["description"]}')
 
-            # ── [6/6] Prepare + optional enhance ──────────────────────────
-            ui.stage_banner(6, "PREPARE")
+            # ── [5/6] Prepare + optional enhance ──────────────────────────
+            ui.stage_banner(5, "PREPARE")
             prepared = prepare.prepare(path, cfg.queue_dir, phash)
 
             if cfg.enhance_enabled:
@@ -266,8 +256,8 @@ def run(
             else:
                 ui.ok(f"{prepared.name}  [enhance: disabled]")
 
-            # ── [7/7] Visual rotation check ───────────────────────────────
-            ui.stage_banner(7, "ROTATION CHECK")
+            # ── [6/6] Visual rotation check ───────────────────────────────
+            ui.stage_banner(6, "ROTATION CHECK")
             if db.check_daily_ai_limit(cfg.daily_ai_calls):
                 ui.warn("Daily AI call limit reached — skipping rotation check")
             else:
@@ -283,8 +273,9 @@ def run(
 
             # Write quality sidecar JSON to queue_dir first
             sidecar_path = cfg.queue_dir / f"{phash}.json"
+            sidecar_data = {k: result[k] for k in ("interesting", "description", "caption", "reason")}
             sidecar_path.write_text(
-                json.dumps(quality, ensure_ascii=False, indent=2), encoding="utf-8"
+                json.dumps(sidecar_data, ensure_ascii=False, indent=2), encoding="utf-8"
             )
 
             if cfg.auto_approve:
@@ -293,21 +284,21 @@ def run(
                 dest_json = cfg.approved_dir / f"{phash}.json"
                 shutil.move(str(prepared), dest_img)
                 shutil.move(str(sidecar_path), dest_json)
-                db.set_status(sha, "approved", caption=quality["caption"])
+                db.set_status(sha, "approved", caption=result["caption"])
                 _log_decision(
                     cfg.logs_dir, sha, phash, path.name,
-                    "queue", "auto-approved", detail=quality["caption"],
+                    "queue", "auto-approved", detail=result["caption"],
                 )
                 approved_count += 1
                 ui.info(f"[AUTO-APPROVE] → approved/{phash[:12]}…")
             else:
-                db.set_status(sha, "queued", caption=quality["caption"])
+                db.set_status(sha, "queued", caption=result["caption"])
                 _log_decision(
                     cfg.logs_dir, sha, phash, path.name,
-                    "queue", "queued", detail=quality["caption"],
+                    "queue", "queued", detail=result["caption"],
                 )
                 queued_count += 1
-                ui.queued(path.name, phash, quality["caption"])
+                ui.queued(path.name, phash, result["caption"])
 
         except Exception as exc:
             logger.error("Unhandled error for %s: %s", path, exc, exc_info=True)

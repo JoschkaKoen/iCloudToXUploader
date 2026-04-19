@@ -12,7 +12,7 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
-_TOTAL_STAGES = 7  # SHA-256 dedup, screenshot, pHash dedup, safety, quality, prepare, rotation
+_TOTAL_STAGES = 6  # SHA-256 dedup, screenshot, pHash dedup, safety+quality, prepare, rotation
 
 console = Console()               # stdout — all UI output
 err_console = Console(stderr=True)  # stderr — only ui.err()
@@ -26,19 +26,14 @@ def startup_banner(cfg) -> None:
     dry = "YES  ⚠" if cfg.x_dry_run else "no"
     enhance = "enabled" if cfg.enhance_enabled else "disabled"
     _default = os.environ.get("AI_DEFAULT_MODEL", "gemini-2.5-flash")
-    safety_model, safety_effort = parse_model_effort(
-        os.environ.get("SAFETY_MODEL", _default)
+    judge_model, judge_effort = parse_model_effort(
+        os.environ.get("JUDGE_MODEL", _default)
     )
-    quality_model, quality_effort = parse_model_effort(
-        os.environ.get("QUALITY_MODEL", _default)
-    )
-    safety_str = f"{safety_model} [{safety_effort or 'default'}]"
-    quality_str = f"{quality_model} [{quality_effort or 'default'}]"
+    judge_str = f"{judge_model} [{judge_effort or 'default'}]"
     rows = [
         ("👤", "iCloud user",   cfg.icloud_username),
         ("🔢", "Recent count",  str(cfg.icloud_recent_count)),
-        ("🤖", "Safety model",  safety_str),
-        ("🤖", "Quality model", quality_str),
+        ("🤖", "Judge model",   judge_str),
         ("✨", "Enhance",       enhance),
         ("🐦", "Dry run",       dry),
     ]
