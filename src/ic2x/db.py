@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -157,7 +157,7 @@ class DB:
     # ── AI call budget ────────────────────────────────────────────────────────
 
     def _today(self) -> str:
-        return datetime.utcnow().strftime("%Y-%m-%d")
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     def _ensure_today_stats(self) -> None:
         self._conn.execute(

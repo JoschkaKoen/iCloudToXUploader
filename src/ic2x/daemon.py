@@ -2,8 +2,9 @@
 Fully automatic daemon: pull → filter → judge → (auto-approve) → post.
 
 Runs in a continuous loop, firing the pipeline whenever a post is due
-(controlled by POST_INTERVAL_HOURS). When no new images are found, the
-iCloud lookback window doubles each tick up to ICLOUD_LOOKBACK_MAX.
+(controlled by POST_INTERVAL_HOURS). When no new images are found the daemon
+searches backwards through iCloud history one image at a time, downloading
+only the next older unprocessed photo on each step.
 
 Requires AUTO_APPROVE=true for fully unattended operation.
 """
@@ -14,6 +15,7 @@ import logging
 import signal
 import time
 from datetime import datetime, timedelta, timezone
+from typing import Callable
 
 from ic2x.config import Config, load_config, ensure_dirs
 from ic2x.db import DB
@@ -50,7 +52,7 @@ def daemon() -> None:
 
     try:
         while not _stop:
-            _tick(cfg)
+            _tick(cfg, lambda: _stop)
             if not _stop:
                 next_check = datetime.now(timezone.utc) + timedelta(seconds=cfg.daemon_check_interval)
                 ui.info(
@@ -66,67 +68,106 @@ def daemon() -> None:
         ui.info("Daemon stopped.")
 
 
-def _tick(cfg: Config) -> None:
+def _tick(cfg: Config, should_stop: Callable[[], bool]) -> None:
+    # ── Read state ────────────────────────────────────────────────────────────
     db = DB(cfg.db_path)
-    last_posted = db.get_last_posted_at()
-    depth = db.get_lookback_depth() or cfg.icloud_recent_count
+
+    # Auto-unstick once per tick (daemon is unattended — can't ask for confirmation)
+    stuck = db.get_stuck_posting()
+    if stuck:
+        logger.warning("daemon: auto-resetting %d stuck 'posting' row(s)", len(stuck))
+        db.reset_stuck_posting()
+
+    last_posted      = db.get_last_posted_at()
+    initial_depth    = db.get_lookback_depth() or cfg.icloud_recent_count
     approved_waiting = len(db.get_approved())
     db.close()
 
-    now = datetime.utcnow()
-    if last_posted is None:
-        hours_since = float("inf")
-    else:
-        hours_since = (now - last_posted).total_seconds() / 3600
-
+    # ── Is a post due? ────────────────────────────────────────────────────────
+    now = datetime.now(timezone.utc)
+    hours_since = (now - last_posted).total_seconds() / 3600 if last_posted else float("inf")
     post_due = hours_since >= cfg.post_interval_hours
 
     if not post_due:
         logger.info("daemon: next post in %.1fh", cfg.post_interval_hours - hours_since)
         return
 
-    # Post is due
+    # ── Approved images already waiting → post immediately ───────────────────
     if approved_waiting > 0:
         logger.info("daemon: %d approved image(s) ready, posting now", approved_waiting)
         from ic2x.post import post
         post()
         return
 
-    # No ready images — pull and process with current lookback depth
-    logger.info("daemon: running pipeline with --recent %d", depth)
+    # ── Search loop: one image at a time ─────────────────────────────────────
+    # First iteration processes the initial batch (depth = ICLOUD_RECENT_COUNT).
+    # Each subsequent iteration increments depth by 1, which causes icloudpd to
+    # download exactly one new image (the next older one not yet in inbox/).
     from ic2x.run import run
-    new_pulled, queued, approved = run(recent_override=depth, auto_unstick=True, show_banner=False)
 
-    # Images were found but all rejected (or daily AI limit hit) — don't expand lookback.
-    # The AI limit resets at midnight; rejections are normal — retry same depth next tick.
-    if new_pulled > 0 and queued == 0 and approved == 0:
+    depth = initial_depth
+
+    while not should_stop() and depth <= cfg.icloud_lookback_max:
+        # Check AI budget before each pipeline run (avoids a wasted icloudpd call)
+        db_chk = DB(cfg.db_path)
+        limit_hit = db_chk.check_daily_ai_limit(cfg.daily_ai_calls)
+        db_chk.close()
+        if limit_hit:
+            logger.info("daemon: daily AI limit reached — will retry tomorrow")
+            break
+
         logger.info(
-            "daemon: %d image(s) pulled but none passed filters (or AI limit reached)",
-            new_pulled,
+            "daemon: searching at lookback depth %d / %d",
+            depth, cfg.icloud_lookback_max,
         )
-        return
+        new_pulled, queued, approved = run(
+            recent_override=depth,
+            auto_unstick=False,  # already handled above
+            show_banner=False,
+        )
 
-    if new_pulled == 0:
-        new_depth = min(depth * 2, cfg.icloud_lookback_max)
-        db2 = DB(cfg.db_path)
-        db2.set_lookback_depth(new_depth)
-        db2.close()
-        if new_depth == depth:
-            logger.info("daemon: lookback already at max (%d); waiting for new iCloud photos", depth)
-        else:
-            logger.info("daemon: nothing new at depth %d; expanding to %d", depth, new_depth)
-        return
+        if approved > 0:
+            logger.info("daemon: postable image found at depth %d, posting now", depth)
+            from ic2x.post import post
+            post()
+            # Reset so the next post cycle restarts from the newest photos
+            db_rst = DB(cfg.db_path)
+            db_rst.set_lookback_depth(cfg.icloud_recent_count)
+            db_rst.close()
+            return
 
-    # Found new images — reset lookback depth to default
-    db2 = DB(cfg.db_path)
-    db2.set_lookback_depth(cfg.icloud_recent_count)
-    db2.close()
+        if queued > 0 and not cfg.auto_approve:
+            # Manual mode: something is interesting but needs human review
+            db_sv = DB(cfg.db_path)
+            db_sv.set_lookback_depth(depth)
+            db_sv.close()
+            logger.info(
+                "daemon: %d image(s) queued for manual review — "
+                "run `ic2x review` then `ic2x post`",
+                queued,
+            )
+            return
 
-    if cfg.auto_approve and approved > 0:
-        logger.info("daemon: %d auto-approved image(s), posting now", approved)
-        from ic2x.post import post
-        post()
-    elif not cfg.auto_approve and queued > 0:
+        # Nothing postable at this depth — step one image deeper.
+        db_sv = DB(cfg.db_path)
+        if depth >= cfg.icloud_lookback_max:
+            # Already at max. Save and break — loop condition would stay True
+            # forever if we incremented to min(max+1, max) = max again.
+            # Saving max (not max+1) ensures the next tick still runs icloudpd
+            # --recent <max>, which picks up new iCloud photos as photo #1.
+            db_sv.set_lookback_depth(depth)
+            db_sv.close()
+            break
+        depth += 1
+        db_sv.set_lookback_depth(depth)
+        db_sv.close()
+
+    # ── Post-loop: log why we stopped ────────────────────────────────────────
+    if should_stop():
+        logger.info("daemon: search interrupted by stop signal at depth %d", depth)
+    elif depth >= cfg.icloud_lookback_max:
         logger.info(
-            "daemon: %d image(s) queued — run `ic2x review` then `ic2x post`", queued
+            "daemon: exhausted %d-image lookback — will check again next tick "
+            "(new iCloud photos arriving in future will be picked up automatically)",
+            cfg.icloud_lookback_max,
         )

@@ -31,6 +31,8 @@ logger = logging.getLogger("ic2x.run")
 
 
 def setup_logging(logs_dir: Path) -> None:
+    if logging.getLogger().handlers:
+        return  # already configured — don't leak a second FileHandler
     from rich.logging import RichHandler
     logs_dir.mkdir(parents=True, exist_ok=True)
     log_file = logs_dir / f"{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.log"
@@ -120,7 +122,7 @@ def run(
                 ui.ok(f"Ollama '{_m}' ready")
             except RuntimeError as exc:
                 ui.err(str(exc))
-                return
+                return 0, 0, 0
 
     db = DB(cfg.db_path)
 
@@ -138,9 +140,11 @@ def run(
                 "Manually verify whether the tweet was posted before retrying.\n"
                 + "\n".join(f"  sha256={r['sha256']}  file={r['source_filename']}" for r in stuck)
             )
+            db.close()
             return 0, 0, 0
 
-    ui.run_banner()
+    if show_banner:
+        ui.run_banner()
     files = pull_mod.pull(cfg, db, recent_override=recent_override)
     new_pulled = len(files)
     ui.info(f"Pulled {new_pulled} file(s) from iCloud")

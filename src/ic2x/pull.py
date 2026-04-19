@@ -13,7 +13,7 @@ import logging
 import os
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pillow_heif  # noqa: F401 — registers HEIC opener with PIL on import
@@ -52,7 +52,7 @@ def pull(cfg: Config, db: DB, recent_override: int = 0) -> list[Path]:
 
     if new_files:
         newest_mtime = max(p.stat().st_mtime for p in new_files)
-        db.set_last_asset_date(datetime.utcfromtimestamp(newest_mtime))
+        db.set_last_asset_date(datetime.fromtimestamp(newest_mtime, tz=timezone.utc))
         db.increment_images_pulled(len(new_files))
         logger.info("pull: found %d new file(s) in inbox/", len(new_files))
     else:
@@ -88,7 +88,12 @@ def _run_icloudpd(cfg: Config, recent_override: int = 0) -> None:
     _PROXY_VARS = {"HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"}
     env = {k: v for k, v in os.environ.items() if k not in _PROXY_VARS}
 
-    logger.info("pull: running icloudpd %s", " ".join(cmd[3:]))
+    logger.info(
+        "pull: running icloudpd --username %s --recent %d%s",
+        cfg.icloud_username,
+        recent,
+        " (--until-found disabled)" if disable_until_found else "",
+    )
     result = subprocess.run(cmd, capture_output=False, text=True, env=env)
     if result.returncode not in (0, 2):
         # Exit 2 = "nothing new to download" — that's fine
