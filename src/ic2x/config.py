@@ -65,6 +65,7 @@ class Config:
 
     # Review
     auto_approve: bool
+    group_hamming_threshold: int  # 0 = disabled; >0 = bundle similar approved images into one tweet
 
     # Daemon
     post_interval_hours: int
@@ -134,6 +135,7 @@ def load_config() -> Config:
 
         # Review
         auto_approve=_bool_env("AUTO_APPROVE", default=False),
+        group_hamming_threshold=int(os.getenv("GROUP_HAMMING_THRESHOLD", "30")),
 
         # Daemon
         post_interval_hours=int(os.getenv("POST_INTERVAL_HOURS", "8")),

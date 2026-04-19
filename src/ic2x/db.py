@@ -253,6 +253,31 @@ class DB:
         )
         self._conn.commit()
 
+    # ── Clean pipeline ────────────────────────────────────────────────────────
+
+    def get_cleanable_filenames(self) -> list[str]:
+        rows = self._conn.execute(
+            "SELECT source_filename FROM images WHERE status IN ('queued', 'approved', 'seen')"
+        ).fetchall()
+        return [r["source_filename"] for r in rows if r["source_filename"]]
+
+    def get_cleanable_counts(self) -> dict[str, int]:
+        result: dict[str, int] = {}
+        for status in ("queued", "approved", "seen"):
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM images WHERE status = ?", (status,)
+            ).fetchone()
+            result[status] = row[0]
+        return result
+
+    def clean_pipeline(self) -> int:
+        """Delete all non-posted image records (queued, approved, seen). Returns count deleted."""
+        cur = self._conn.execute(
+            "DELETE FROM images WHERE status IN ('queued', 'approved', 'seen')"
+        )
+        self._conn.commit()
+        return cur.rowcount
+
     # ── Image lookup by SHA ───────────────────────────────────────────────────
 
     def get_image_by_sha(self, sha256: str) -> "sqlite3.Row | None":

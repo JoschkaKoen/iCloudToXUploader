@@ -6,6 +6,7 @@ Commands:
   ic2x review  Terminal UI: approve / skip / edit caption / quit
   ic2x post    Post all approved images to X
   ic2x unstick Reset rows stuck in 'posting' back to 'approved'
+  ic2x clean   Discard queued/approved images and their DB records
   ic2x daemon  Fully automatic loop: pull → judge → post every N hours
 """
 
@@ -24,6 +25,7 @@ def main() -> None:
     sub.add_parser("review",  help="Approve or reject queued photos")
     sub.add_parser("post",    help="Post approved photos to X")
     sub.add_parser("unstick", help="Reset rows stuck in 'posting' status back to 'approved'")
+    sub.add_parser("clean",   help="Discard queued/approved images and their DB records")
     sub.add_parser("daemon",  help="Fully automatic loop: pull → judge → post every N hours")
 
     args = p.parse_args()
@@ -40,6 +42,9 @@ def main() -> None:
     elif args.cmd == "unstick":
         from ic2x.unstick import unstick
         unstick()
+    elif args.cmd == "clean":
+        from ic2x.clean import clean
+        clean()
     elif args.cmd == "daemon":
         from ic2x.daemon import daemon
         daemon()

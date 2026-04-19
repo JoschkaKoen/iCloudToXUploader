@@ -79,7 +79,7 @@ def _tick(cfg: Config, should_stop: Callable[[], bool]) -> None:
         db.reset_stuck_posting()
 
     last_posted      = db.get_last_posted_at()
-    initial_depth    = db.get_lookback_depth() or cfg.icloud_recent_count
+    saved_depth      = db.get_lookback_depth() or cfg.icloud_recent_count
     approved_waiting = len(db.get_approved())
     db.close()
 
@@ -100,12 +100,13 @@ def _tick(cfg: Config, should_stop: Callable[[], bool]) -> None:
         return
 
     # ── Search loop: one image at a time ─────────────────────────────────────
-    # First iteration processes the initial batch (depth = ICLOUD_RECENT_COUNT).
-    # Each subsequent iteration increments depth by 1, which causes icloudpd to
-    # download exactly one new image (the next older one not yet in inbox/).
+    # Every tick starts with a fresh check of the latest ICLOUD_RECENT_COUNT
+    # images (--until-found enabled, normal mode) to catch newly uploaded photos.
+    # After the initial batch, the loop jumps to saved_depth and continues
+    # one image at a time through older history (--until-found disabled).
     from ic2x.run import run
 
-    depth = initial_depth
+    depth = cfg.icloud_recent_count  # always start fresh each tick
 
     while not should_stop() and depth <= cfg.icloud_lookback_max:
         # Check AI budget before each pipeline run (avoids a wasted icloudpd call)
@@ -116,10 +117,11 @@ def _tick(cfg: Config, should_stop: Callable[[], bool]) -> None:
             logger.info("daemon: daily AI limit reached — will retry tomorrow")
             break
 
-        logger.info(
-            "daemon: searching at lookback depth %d / %d",
-            depth, cfg.icloud_lookback_max,
-        )
+        if depth == cfg.icloud_recent_count:
+            logger.info("daemon: checking latest %d images", depth)
+        else:
+            logger.info("daemon: searching at lookback depth %d / %d", depth, cfg.icloud_lookback_max)
+
         new_pulled, queued, approved = run(
             recent_override=depth,
             auto_unstick=False,  # already handled above
@@ -151,14 +153,17 @@ def _tick(cfg: Config, should_stop: Callable[[], bool]) -> None:
         # Nothing postable at this depth — step one image deeper.
         db_sv = DB(cfg.db_path)
         if depth >= cfg.icloud_lookback_max:
-            # Already at max. Save and break — loop condition would stay True
-            # forever if we incremented to min(max+1, max) = max again.
-            # Saving max (not max+1) ensures the next tick still runs icloudpd
-            # --recent <max>, which picks up new iCloud photos as photo #1.
-            db_sv.set_lookback_depth(depth)
+            # Exhausted the full lookback — reset so next tick starts fresh
+            # rather than re-entering expansion mode immediately.
+            db_sv.set_lookback_depth(cfg.icloud_recent_count)
             db_sv.close()
             break
-        depth += 1
+        # After the initial batch, jump directly to the saved search position
+        # to skip re-processing the already-examined history range.
+        if depth == cfg.icloud_recent_count and saved_depth > cfg.icloud_recent_count:
+            depth = saved_depth
+        else:
+            depth += 1
         db_sv.set_lookback_depth(depth)
         db_sv.close()
 
@@ -167,7 +172,6 @@ def _tick(cfg: Config, should_stop: Callable[[], bool]) -> None:
         logger.info("daemon: search interrupted by stop signal at depth %d", depth)
     elif depth >= cfg.icloud_lookback_max:
         logger.info(
-            "daemon: exhausted %d-image lookback — will check again next tick "
-            "(new iCloud photos arriving in future will be picked up automatically)",
+            "daemon: exhausted %d-image lookback — will check for new photos next tick",
             cfg.icloud_lookback_max,
         )
