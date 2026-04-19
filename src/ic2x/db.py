@@ -154,6 +154,12 @@ class DB:
             "SELECT * FROM images WHERE status = 'approved'"
         ).fetchall()
 
+    def get_pending(self) -> list[sqlite3.Row]:
+        """Return all queued and approved rows — images that could still be posted."""
+        return self._conn.execute(
+            "SELECT * FROM images WHERE status IN ('queued', 'approved')"
+        ).fetchall()
+
     # ── AI call budget ────────────────────────────────────────────────────────
 
     def _today(self) -> str:

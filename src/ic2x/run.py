@@ -22,6 +22,7 @@ pillow_heif.register_heif_opener()
 from ic2x import dedup, enhance, filter, prepare
 from ic2x import judge_rotation, judge_safety_quality
 from ic2x import pull as pull_mod
+from ic2x.group import cluster_by_phash
 from ic2x.config import Config, load_config, ensure_dirs
 from ic2x.db import DB
 from ic2x.utils import ui
@@ -306,6 +307,16 @@ def run(
             continue
 
     ui.run_summary(new_pulled, queued_count + approved_count, dict(rejected_by))
+
+    if cfg.group_hamming_threshold > 0:
+        pending = db.get_pending()
+        if len(pending) >= 2:
+            groups = cluster_by_phash(pending, cfg.group_hamming_threshold)
+            for group in groups:
+                if len(group) > 1:
+                    names = " + ".join((r["phash"] or "")[:16] + ".jpg" for r in group)
+                    ui.info(f"Will post together ({len(group)} images): {names}")
+
     db.close()
 
     if _ollama_models:

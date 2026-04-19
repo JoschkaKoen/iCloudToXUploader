@@ -30,6 +30,7 @@ from pathlib import Path
 import tweepy
 
 from ic2x.config import Config, load_config, ensure_dirs
+from ic2x.group import cluster_by_phash
 from ic2x.db import DB
 from ic2x.utils import ui
 from ic2x.utils.retry import with_retry
@@ -55,38 +56,7 @@ def _build_clients(cfg: Config):
 
 
 def _group_approved(approved: list, threshold: int) -> list[list]:
-    """Cluster approved DB rows into groups for multi-image tweets.
-
-    Greedy first-fit by pHash Hamming distance: each image joins the first
-    existing group that has a member within `threshold` distance and fewer
-    than 4 images (Twitter's per-tweet media limit).
-    threshold=0 → no grouping; every image posts alone.
-    """
-    if threshold <= 0:
-        return [[row] for row in approved]
-
-    import imagehash
-
-    groups: list[list] = []
-    for row in approved:
-        phash = row["phash"] or ""
-        placed = False
-        if phash:
-            h = imagehash.hex_to_hash(phash)
-            for group in groups:
-                if len(group) >= 4:
-                    continue
-                for member in group:
-                    mphash = member["phash"] or ""
-                    if mphash and (h - imagehash.hex_to_hash(mphash)) <= threshold:
-                        group.append(row)
-                        placed = True
-                        break
-                if placed:
-                    break
-        if not placed:
-            groups.append([row])
-    return groups
+    return cluster_by_phash(approved, threshold)
 
 
 def post() -> None:
