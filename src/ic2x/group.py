@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+# X / Twitter caps a single tweet at 4 attached images.
+MAX_IMAGES_PER_TWEET = 4
+
 
 def cluster_by_phash(rows: list, threshold: int) -> list[list]:
     """Greedy first-fit clustering by pHash Hamming distance.
 
-    Each image joins the first existing group that has a member within
-    `threshold` distance and fewer than 4 images (Twitter's per-tweet limit).
+    Each image joins the first existing group with a member within `threshold`
+    distance and room under `MAX_IMAGES_PER_TWEET`.
     threshold=0 → no grouping; every image is its own group.
     """
     if threshold <= 0:
@@ -22,7 +25,7 @@ def cluster_by_phash(rows: list, threshold: int) -> list[list]:
         if phash:
             h = imagehash.hex_to_hash(phash)
             for group in groups:
-                if len(group) >= 4:
+                if len(group) >= MAX_IMAGES_PER_TWEET:
                     continue
                 for member in group:
                     mphash = member["phash"] or ""

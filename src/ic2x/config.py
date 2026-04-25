@@ -13,6 +13,10 @@ from dotenv import load_dotenv
 
 _PROJECT_ROOT = Path(__file__).parent.parent.parent
 
+_DEFAULT_AI_MODEL    = "gemini-2.5-flash"
+_DEFAULT_OLLAMA_URL  = "http://localhost:11434/v1"
+_DEFAULT_JUDGE_MAX_PX = 1024
+
 
 def load_project_env() -> None:
     """Load default.env (committed defaults) then .env (secrets, override=True)."""
@@ -66,11 +70,21 @@ class Config:
     # Review
     auto_approve: bool
     group_hamming_threshold: int  # 0 = disabled; >0 = bundle similar approved images into one tweet
+    editor: str
 
     # Daemon
     post_interval_hours: int
     daemon_check_interval: int
     icloud_lookback_max: int
+
+    # AI models / vision
+    default_model: str             # AI_DEFAULT_MODEL (with optional ", effort" suffix)
+    judge_model: str               # JUDGE_MODEL or default_model
+    rotation_model: str            # ROTATION_MODEL or default_model
+    ollama_base_url: str
+    judge_image_max_px: int | None       # cloud providers; None = full-res (rare)
+    rotation_image_max_px: int | None
+    ollama_image_max_px: int | None      # all Ollama calls (memory-bound)
 
 
 def _require_env(key: str) -> str:
@@ -95,13 +109,42 @@ def _bool_env(key: str, default: bool = False) -> bool:
     return os.getenv(key, str(default)).strip().lower() in ("1", "true", "yes")
 
 
+def _int_env(key: str, default: int) -> int:
+    raw = os.getenv(key, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(
+            f"Environment variable {key}={raw!r} is not a valid integer"
+        )
+
+
+def _opt_int_env(key: str, default: int | None) -> int | None:
+    """Like _int_env but returns None when the env var is unset and default is None."""
+    raw = os.getenv(key, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(
+            f"Environment variable {key}={raw!r} is not a valid integer"
+        )
+
+
 def load_config() -> Config:
+    default_model = os.getenv("AI_DEFAULT_MODEL", "").strip() or _DEFAULT_AI_MODEL
+    judge_model    = os.getenv("JUDGE_MODEL",    "").strip() or default_model
+    rotation_model = os.getenv("ROTATION_MODEL", "").strip() or default_model
+
     return Config(
         # iCloud
         icloud_username=_require_env("ICLOUD_USERNAME"),
         icloud_password=_require_env("ICLOUD_PASSWORD"),
-        icloud_recent_count=int(os.getenv("ICLOUD_RECENT_COUNT", "20")),
-        icloud_until_found=int(os.getenv("ICLOUD_UNTIL_FOUND", "3")),
+        icloud_recent_count=_int_env("ICLOUD_RECENT_COUNT", 20),
+        icloud_until_found=_int_env("ICLOUD_UNTIL_FOUND", 3),
         icloud_cookie_dir=_resolve(os.getenv("ICLOUD_COOKIE_DIR", "./icloud_auth")),
 
         # Paths
@@ -125,8 +168,8 @@ def load_config() -> Config:
         x_dry_run=_bool_env("X_DRY_RUN", default=True),
 
         # Limits
-        daily_ai_calls=int(os.getenv("DAILY_AI_CALLS", "200")),
-        hamming_threshold=int(os.getenv("HAMMING_THRESHOLD", "12")),
+        daily_ai_calls=_int_env("DAILY_AI_CALLS", 200),
+        hamming_threshold=_int_env("HAMMING_THRESHOLD", 12),
 
         # Enhancement
         enhance_enabled=_bool_env("ENHANCE_ENABLED", default=False),
@@ -135,12 +178,22 @@ def load_config() -> Config:
 
         # Review
         auto_approve=_bool_env("AUTO_APPROVE", default=False),
-        group_hamming_threshold=int(os.getenv("GROUP_HAMMING_THRESHOLD", "30")),
+        group_hamming_threshold=_int_env("GROUP_HAMMING_THRESHOLD", 30),
+        editor=os.getenv("EDITOR", "nano"),
 
         # Daemon
-        post_interval_hours=int(os.getenv("POST_INTERVAL_HOURS", "8")),
-        daemon_check_interval=int(os.getenv("DAEMON_CHECK_INTERVAL", "1800")),
-        icloud_lookback_max=int(os.getenv("ICLOUD_LOOKBACK_MAX", "200")),
+        post_interval_hours=_int_env("POST_INTERVAL_HOURS", 8),
+        daemon_check_interval=_int_env("DAEMON_CHECK_INTERVAL", 1800),
+        icloud_lookback_max=_int_env("ICLOUD_LOOKBACK_MAX", 200),
+
+        # AI models / vision
+        default_model=default_model,
+        judge_model=judge_model,
+        rotation_model=rotation_model,
+        ollama_base_url=os.getenv("OLLAMA_BASE_URL", "").strip() or _DEFAULT_OLLAMA_URL,
+        judge_image_max_px=_opt_int_env("JUDGE_IMAGE_MAX_PX", _DEFAULT_JUDGE_MAX_PX),
+        rotation_image_max_px=_opt_int_env("ROTATION_IMAGE_MAX_PX", _DEFAULT_JUDGE_MAX_PX),
+        ollama_image_max_px=_opt_int_env("OLLAMA_IMAGE_MAX_PX", None),
     )
 
 

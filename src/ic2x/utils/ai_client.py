@@ -60,9 +60,15 @@ OLLAMA_BASE_URL   Optional — Ollama server URL (default: http://localhost:1143
 
 from __future__ import annotations
 
+import json
+import logging
 import os
+import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger("ic2x.ai_client")
 
 
 @dataclass(frozen=True)
@@ -101,7 +107,10 @@ _PROVIDER_REGISTRY: list[_ProviderDef] = [
     ),
     _ProviderDef(
         name="ollama",
-        base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1"),
+        # Default for `make_ai_client` callers that don't pass an explicit
+        # ollama_base_url. Production callers should pass cfg.ollama_base_url
+        # so the URL is sourced from a single place (config.py).
+        base_url="http://localhost:11434/v1",
         api_key_env="OLLAMA_API_KEY",
         model_prefixes=(),
         exact_models=("qwen3-vl:8b",),
@@ -183,38 +192,30 @@ def build_thinking_kwargs(provider: str, effort: str | None) -> tuple[bool, dict
 
 
 def make_ai_client(
+    model_string: str,
     *,
-    model_env: str = "AI_DEFAULT_MODEL",
-    legacy_model_env: str = "XAI_MODEL",
-    default_model: str | None = None,
+    ollama_base_url: str | None = None,
 ) -> tuple[Any, str, str, str | None] | None:
     """Return ``(client, model_name, provider, effort)`` or ``None`` if the API key is missing.
 
     Parameters
     ----------
-    model_env:
-        Primary env var for the model (e.g. ``"NL_MODEL"``).  May contain a
-        thinking-effort suffix: ``"gemini-2.5-flash, low"``.
-    legacy_model_env:
-        Fallback env var if *model_env* is unset (e.g. ``"AI_DEFAULT_MODEL"``).
-    default_model:
-        Model string (optionally with effort suffix) when neither env var is set.
-        Defaults to ``AI_DEFAULT_MODEL`` → ``_DEFAULT_MODEL``.
+    model_string:
+        Pre-resolved model identifier from Config, optionally with a
+        thinking-effort suffix: ``"gemini-2.5-flash, low"``. Callers compose
+        this from cfg.judge_model / cfg.rotation_model so this module no
+        longer reads model env vars itself.
+    ollama_base_url:
+        When the resolved provider is ``ollama``, override the registry's
+        default base URL with this value. Pass ``cfg.ollama_base_url`` so all
+        Ollama traffic goes through one configured endpoint.
     """
     try:
         from openai import OpenAI
     except ImportError:
         return None
 
-    raw = (
-        os.environ.get(model_env, "").strip()
-        or os.environ.get(legacy_model_env, "").strip()
-        or default_model
-        or os.environ.get("AI_DEFAULT_MODEL", "").strip()
-        or _DEFAULT_MODEL
-    )
-
-    model, effort = parse_model_effort(raw)
+    model, effort = parse_model_effort(model_string or _DEFAULT_MODEL)
     provider = provider_for_model(model)
     pdef = next((p for p in _PROVIDER_REGISTRY if p.name == provider), _PROVIDER_REGISTRY[0])
 
@@ -226,8 +227,9 @@ def make_ai_client(
     if not api_key:
         return None
 
+    base_url = ollama_base_url if (pdef.name == "ollama" and ollama_base_url) else pdef.base_url
     try:
-        client_kwargs: dict = {"api_key": api_key, "base_url": pdef.base_url}
+        client_kwargs: dict = {"api_key": api_key, "base_url": base_url}
         if pdef.timeout is not None:
             client_kwargs["timeout"] = pdef.timeout
         client = OpenAI(**client_kwargs)
@@ -407,18 +409,6 @@ def strip_json_fences(raw: str) -> str:
     return s
 
 
-def get_api_key_env_name(provider: str | None = None) -> str:
-    """Return the env var name for the given provider's API key.
-
-    If *provider* is None, returns the key env for the default model's provider.
-    """
-    p = provider if provider else provider_for_model(
-        os.environ.get("AI_DEFAULT_MODEL", "").strip() or _DEFAULT_MODEL
-    )
-    pdef = next((pd for pd in _PROVIDER_REGISTRY if pd.name == p), _PROVIDER_REGISTRY[0])
-    return pdef.api_key_env
-
-
 def collect_streamed_response(stream: Any) -> str:
     """Consume a streaming chat completion and return the answer text.
 
@@ -490,3 +480,83 @@ def print_streamed_response(
     if print_content and content_parts:
         print()  # trailing newline after content
     return "".join(content_parts).strip()
+
+
+# ─── vision judge dispatch ────────────────────────────────────────────────────
+
+
+@dataclass
+class JudgeCall:
+    """Inputs to a single vision-judge call.
+
+    fail_value is returned (with elapsed_s) on any error: missing client,
+    network failure, JSON decode failure, schema validation failure.
+    refused_value is returned when the model issues a content_filter refusal;
+    if None, fail_value is used.
+    """
+    image_path: Path
+    prompt: str
+    max_px: int | None
+    fail_value: dict
+    refused_value: dict | None = None
+    label: str = "judge"   # used in log messages, e.g. "judge:" or "rotation:"
+
+
+def call_vision_judge(
+    *,
+    model_string: str,
+    ollama_base_url: str,
+    call: JudgeCall,
+) -> tuple[dict, float, bool]:
+    """Run a vision JSON judge end-to-end.
+
+    Returns (result_dict, elapsed_seconds, ok). When ok=True the dict is the
+    model's parsed JSON — the caller is responsible for schema validation
+    and any post-processing. When ok=False the dict is `call.fail_value`
+    (any error) or `call.refused_value` (content_filter), already in the
+    caller's expected shape; return it directly.
+    """
+    from ic2x.utils.image_utils import encode_image_b64
+
+    t0 = time.monotonic()
+    refused = call.refused_value if call.refused_value is not None else call.fail_value
+
+    try:
+        result = make_ai_client(model_string, ollama_base_url=ollama_base_url)
+        if result is None:
+            logger.warning("%s: no AI client available (check API key / model)", call.label)
+            return call.fail_value, time.monotonic() - t0, False
+
+        client, model, provider, effort = result
+        use_stream, extra_kwargs = build_thinking_kwargs(provider, effort)
+        img_b64 = encode_image_b64(call.image_path, max_px=call.max_px)
+
+        if provider == "ollama":
+            raw = call_ollama_chat(
+                ollama_base_url, model, "/no_think\n" + call.prompt, img_b64
+            )
+        else:
+            messages = [{"role": "user", "content": [
+                {"type": "text", "text": call.prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+            ]}]
+            if use_stream:
+                stream = client.chat.completions.create(
+                    model=model, messages=messages, stream=True, **extra_kwargs
+                )
+                raw = collect_streamed_response(stream)
+            else:
+                resp = client.chat.completions.create(
+                    model=model, messages=messages, stream=False,
+                    response_format={"type": "json_object"}, **extra_kwargs
+                )
+                if resp.choices[0].finish_reason == "content_filter":
+                    logger.info("%s: model refused %s", call.label, call.image_path.name)
+                    return refused, time.monotonic() - t0, False
+                raw = resp.choices[0].message.content or ""
+
+        return json.loads(strip_json_fences(raw)), time.monotonic() - t0, True
+
+    except Exception as exc:
+        logger.warning("%s: error for %s: %s", call.label, call.image_path.name, exc)
+        return call.fail_value, time.monotonic() - t0, False

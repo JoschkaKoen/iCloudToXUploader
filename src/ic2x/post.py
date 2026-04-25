@@ -32,6 +32,7 @@ import tweepy
 from ic2x.config import Config, load_config, ensure_dirs
 from ic2x.group import cluster_by_phash
 from ic2x.db import DB
+from ic2x.status import Status
 from ic2x.utils import ui
 from ic2x.utils.retry import with_retry
 
@@ -62,6 +63,9 @@ def _group_approved(approved: list, threshold: int) -> list[list]:
 def post() -> None:
     cfg = load_config()
     ensure_dirs(cfg)
+
+    from ic2x.utils.logging_setup import setup_logging
+    setup_logging(cfg.logs_dir)
 
     db = DB(cfg.db_path)
     approved = db.get_approved()
@@ -120,7 +124,7 @@ def post() -> None:
                 ui.err(f"Failed to post {filename}: {exc}")
             finally:
                 if not _post_succeeded:
-                    db.set_status(sha256, "approved")
+                    db.set_status(sha256, Status.APPROVED)
                     ui.info("Status reset to 'approved' — will retry on next `ic2x post`.")
 
         else:
@@ -164,7 +168,7 @@ def post() -> None:
             finally:
                 if not _post_succeeded:
                     for sha in shas:
-                        db.set_status(sha, "approved")
+                        db.set_status(sha, Status.APPROVED)
                     ui.info("Group status reset to 'approved' — will retry on next `ic2x post`.")
 
     ui.post_summary(posted_count, cfg.x_dry_run)
@@ -199,12 +203,12 @@ def _post_image(
 ) -> tuple[str, str]:
     media_id = _upload_image(api_v1, path)
 
-    db.set_status(sha256, "posting")   # idempotency anchor — written BEFORE tweet
+    db.set_status(sha256, Status.POSTING)   # idempotency anchor — written BEFORE tweet
 
     tweet_id, tweet_url = _create_tweet_api(client_v2, caption, [media_id])
 
     db.set_status(
-        sha256, "posted",
+        sha256, Status.POSTED,
         tweet_id=tweet_id,
         posted_at=datetime.now(timezone.utc).isoformat(),
     )
@@ -224,12 +228,12 @@ def _post_group(
 
     # Idempotency anchor: mark ALL group members before the tweet
     for sha in sha256s:
-        db.set_status(sha, "posting")
+        db.set_status(sha, Status.POSTING)
 
     tweet_id, tweet_url = _create_tweet_api(client_v2, caption, media_ids)
 
     posted_at = datetime.now(timezone.utc).isoformat()
     for sha in sha256s:
-        db.set_status(sha, "posted", tweet_id=tweet_id, posted_at=posted_at)
+        db.set_status(sha, Status.POSTED, tweet_id=tweet_id, posted_at=posted_at)
     db.set_last_posted_at(datetime.now(timezone.utc))
     return tweet_id, tweet_url

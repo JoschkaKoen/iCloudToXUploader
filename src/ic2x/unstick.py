@@ -10,6 +10,10 @@ from ic2x.utils import ui
 def unstick() -> None:
     cfg = load_config()
     ensure_dirs(cfg)
+
+    from ic2x.utils.logging_setup import setup_logging
+    setup_logging(cfg.logs_dir)
+
     db = DB(cfg.db_path)
 
     stuck = db.get_stuck_posting()

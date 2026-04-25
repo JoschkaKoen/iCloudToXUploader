@@ -96,8 +96,14 @@ def _run_icloudpd(cfg: Config, recent_override: int = 0) -> None:
     )
     result = subprocess.run(cmd, capture_output=False, text=True, env=env)
     if result.returncode not in (0, 2):
-        # Exit 2 = "nothing new to download" — that's fine
-        logger.warning("icloudpd exited with code %d", result.returncode)
+        # Exit 2 = "nothing new to download" — that's fine.
+        # Anything else (auth expired, MFA needed, rate limit) means the
+        # inbox may be empty for the wrong reason; tell the user where to look.
+        logger.warning(
+            "icloudpd exited with code %d — re-run interactively to refresh "
+            "MFA or check %s for stale cookies",
+            result.returncode, cfg.icloud_cookie_dir,
+        )
 
 
 def _scan_inbox(inbox: Path) -> list[Path]:

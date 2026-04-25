@@ -11,21 +11,25 @@ For each image in queue/ (oldest first):
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
-from ic2x.config import load_config, ensure_dirs
+from ic2x.config import Config, load_config, ensure_dirs
 from ic2x.db import DB
+from ic2x.status import Status
 from ic2x.utils import ui
 
 
 def review() -> None:
     cfg = load_config()
     ensure_dirs(cfg)
+
+    from ic2x.utils.logging_setup import setup_logging
+    setup_logging(cfg.logs_dir)
+
     db = DB(cfg.db_path)
 
     queue_items = _load_queue(cfg.queue_dir)
@@ -69,7 +73,7 @@ def review() -> None:
                 break
 
             elif choice == "e":
-                edited = _edit_caption(caption)
+                edited = _edit_caption(caption, cfg)
                 if edited is not None:
                     caption = edited
                     ui.info(f"Caption updated: {caption}")
@@ -111,14 +115,12 @@ def _load_queue(queue_dir: Path) -> list[tuple[Path, dict]]:
 def _approve(jpg_path: Path, phash: str, caption: str, cfg, db: DB) -> None:
     dest = cfg.approved_dir / jpg_path.name
     shutil.move(str(jpg_path), dest)
-    # Move sidecar JSON too
     json_src = jpg_path.with_suffix(".json")
     if json_src.exists():
         shutil.move(str(json_src), cfg.approved_dir / json_src.name)
-    # Look up sha256 from DB via phash
-    sha = _sha_for_phash(db, phash)
+    sha = db.get_sha_for_phash(phash)
     if sha:
-        db.set_status(sha, "approved", caption=caption)
+        db.set_status(sha, Status.APPROVED, caption=caption)
 
 
 def _skip(jpg_path: Path, phash: str, cfg, db: DB) -> None:
@@ -128,16 +130,9 @@ def _skip(jpg_path: Path, phash: str, cfg, db: DB) -> None:
     json_src = jpg_path.with_suffix(".json")
     if json_src.exists():
         json_src.unlink()
-    sha = _sha_for_phash(db, phash)
+    sha = db.get_sha_for_phash(phash)
     if sha:
-        db.set_status(sha, "rejected", reject_stage="quality", reject_reason="reviewer_skip")
-
-
-def _sha_for_phash(db: DB, phash: str) -> str | None:
-    row = db._conn.execute(
-        "SELECT sha256 FROM images WHERE phash = ? ORDER BY id DESC LIMIT 1", (phash,)
-    ).fetchone()
-    return row["sha256"] if row else None
+        db.set_status(sha, Status.REJECTED, reject_stage="quality", reject_reason="reviewer_skip")
 
 
 def _open_image(path: Path) -> None:
@@ -148,19 +143,18 @@ def _open_image(path: Path) -> None:
         pass
 
 
-def _edit_caption(current: str) -> str | None:
-    editor = os.environ.get("EDITOR", "nano")
+def _edit_caption(current: str, cfg: Config) -> str | None:
     with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as f:
         f.write(current)
         tmp = f.name
     try:
-        subprocess.run([editor, tmp], check=True)
+        subprocess.run([cfg.editor, tmp], check=True)
         result = Path(tmp).read_text(encoding="utf-8").strip()
         return result if result else None
     except Exception:
         return None
     finally:
         try:
-            os.unlink(tmp)
+            Path(tmp).unlink()
         except Exception:
             pass

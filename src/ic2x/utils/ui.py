@@ -4,15 +4,11 @@ All functions use rich Console directly so they never appear in log files.
 Ported and adapted from XBot-3/utils/ui.py.
 """
 
-import os
-
 from rich import box
 from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
-
-_TOTAL_STAGES = 6  # SHA-256 dedup, screenshot, pHash dedup, safety+quality, prepare, rotation
 
 console = Console()               # stdout — all UI output
 err_console = Console(stderr=True)  # stderr — only ui.err()
@@ -25,10 +21,7 @@ def startup_banner(cfg) -> None:
     from ic2x.utils.ai_client import parse_model_effort
     dry = "YES  ⚠" if cfg.x_dry_run else "no"
     enhance = "enabled" if cfg.enhance_enabled else "disabled"
-    _default = os.environ.get("AI_DEFAULT_MODEL", "gemini-2.5-flash")
-    judge_model, judge_effort = parse_model_effort(
-        os.environ.get("JUDGE_MODEL", _default)
-    )
+    judge_model, judge_effort = parse_model_effort(cfg.judge_model)
     judge_str = f"{judge_model} [{judge_effort or 'default'}]"
     rows = [
         ("👤", "iCloud user",   cfg.icloud_username),
@@ -82,9 +75,9 @@ def file_header(filename: str, index: int, total: int) -> None:
     console.print(f"  [bold]📷  {escape(filename)}[/]  [dim]({index} / {total})[/]")
 
 
-def stage_banner(step: int, name: str) -> None:
+def stage_banner(step: int, total: int, name: str) -> None:
     console.rule(
-        f"[cyan]▶  [{step}/{_TOTAL_STAGES}]  {escape(name.upper())}[/]",
+        f"[cyan]▶  [{step}/{total}]  {escape(name.upper())}[/]",
         style="cyan",
         align="left",
     )

@@ -28,7 +28,7 @@ def daemon() -> None:
     cfg = load_config()
     ensure_dirs(cfg)
 
-    from ic2x.run import setup_logging
+    from ic2x.utils.logging_setup import setup_logging
     setup_logging(cfg.logs_dir)
 
     _stop = False
@@ -69,9 +69,14 @@ def daemon() -> None:
 
 
 def _tick(cfg: Config, should_stop: Callable[[], bool]) -> None:
-    # ── Read state ────────────────────────────────────────────────────────────
     db = DB(cfg.db_path)
+    try:
+        _tick_with_db(cfg, db, should_stop)
+    finally:
+        db.close()
 
+
+def _tick_with_db(cfg: Config, db: DB, should_stop: Callable[[], bool]) -> None:
     # Auto-unstick once per tick (daemon is unattended — can't ask for confirmation)
     stuck = db.get_stuck_posting()
     if stuck:
@@ -81,7 +86,6 @@ def _tick(cfg: Config, should_stop: Callable[[], bool]) -> None:
     last_posted      = db.get_last_posted_at()
     saved_depth      = db.get_lookback_depth() or cfg.icloud_recent_count
     approved_waiting = len(db.get_approved())
-    db.close()
 
     # ── Is a post due? ────────────────────────────────────────────────────────
     now = datetime.now(timezone.utc)
@@ -110,10 +114,7 @@ def _tick(cfg: Config, should_stop: Callable[[], bool]) -> None:
 
     while not should_stop() and depth <= cfg.icloud_lookback_max:
         # Check AI budget before each pipeline run (avoids a wasted icloudpd call)
-        db_chk = DB(cfg.db_path)
-        limit_hit = db_chk.check_daily_ai_limit(cfg.daily_ai_calls)
-        db_chk.close()
-        if limit_hit:
+        if db.check_daily_ai_limit(cfg.daily_ai_calls):
             logger.info("daemon: daily AI limit reached — will retry tomorrow")
             break
 
@@ -122,6 +123,8 @@ def _tick(cfg: Config, should_stop: Callable[[], bool]) -> None:
         else:
             logger.info("daemon: searching at lookback depth %d / %d", depth, cfg.icloud_lookback_max)
 
+        # `run` opens its own DB — its writes are visible to ours via SQLite's
+        # autocommit + Row factory (each method commits immediately).
         new_pulled, queued, approved = run(
             recent_override=depth,
             auto_unstick=False,  # already handled above
@@ -133,16 +136,12 @@ def _tick(cfg: Config, should_stop: Callable[[], bool]) -> None:
             from ic2x.post import post
             post()
             # Reset so the next post cycle restarts from the newest photos
-            db_rst = DB(cfg.db_path)
-            db_rst.set_lookback_depth(cfg.icloud_recent_count)
-            db_rst.close()
+            db.set_lookback_depth(cfg.icloud_recent_count)
             return
 
         if queued > 0 and not cfg.auto_approve:
             # Manual mode: something is interesting but needs human review
-            db_sv = DB(cfg.db_path)
-            db_sv.set_lookback_depth(depth)
-            db_sv.close()
+            db.set_lookback_depth(depth)
             logger.info(
                 "daemon: %d image(s) queued for manual review — "
                 "run `ic2x review` then `ic2x post`",
@@ -151,12 +150,10 @@ def _tick(cfg: Config, should_stop: Callable[[], bool]) -> None:
             return
 
         # Nothing postable at this depth — step one image deeper.
-        db_sv = DB(cfg.db_path)
         if depth >= cfg.icloud_lookback_max:
             # Exhausted the full lookback — reset so next tick starts fresh
             # rather than re-entering expansion mode immediately.
-            db_sv.set_lookback_depth(cfg.icloud_recent_count)
-            db_sv.close()
+            db.set_lookback_depth(cfg.icloud_recent_count)
             break
         # After the initial batch, jump directly to the saved search position
         # to skip re-processing the already-examined history range.
@@ -164,8 +161,7 @@ def _tick(cfg: Config, should_stop: Callable[[], bool]) -> None:
             depth = saved_depth
         else:
             depth += 1
-        db_sv.set_lookback_depth(depth)
-        db_sv.close()
+        db.set_lookback_depth(depth)
 
     # ── Post-loop: log why we stopped ────────────────────────────────────────
     if should_stop():

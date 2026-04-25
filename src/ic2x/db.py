@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from ic2x.status import Status
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS images (
@@ -48,14 +50,15 @@ class DB:
         self._conn = sqlite3.connect(self._path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         # One-time migration: rename legacy gemini_calls column to ai_calls.
-        # Safe on both fresh databases (table doesn't exist yet) and existing ones
-        # (column already renamed → silently ignored).
+        # OperationalError covers both expected cases (table doesn't exist on
+        # fresh DBs; column already renamed on migrated ones). Anything else
+        # — disk-full, locked DB, corruption — must surface, not be swallowed.
         try:
             self._conn.execute(
                 "ALTER TABLE run_stats RENAME COLUMN gemini_calls TO ai_calls"
             )
             self._conn.commit()
-        except Exception:
+        except sqlite3.OperationalError:
             pass
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
@@ -74,24 +77,29 @@ class DB:
     def filenames_processed(self, filenames: set[str]) -> set[str]:
         """Return the subset of filenames that already have a completed DB record.
 
-        'Completed' means status beyond 'seen' (queued, approved, posted, rejected).
-        Used by pull.py to skip already-processed files before any pipeline step.
+        'Completed' means status beyond `Status.SEEN` (queued, approved, posted,
+        rejected). Used by pull.py to skip already-processed files before any
+        pipeline step.
         """
         if not filenames:
             return set()
         placeholders = ",".join("?" * len(filenames))
         rows = self._conn.execute(
             f"SELECT source_filename FROM images "
-            f"WHERE source_filename IN ({placeholders}) AND status != 'seen'",
-            list(filenames),
+            f"WHERE source_filename IN ({placeholders}) AND status != ?",
+            list(filenames) + [Status.SEEN.value],
         ).fetchall()
         return {row["source_filename"] for row in rows}
 
     def seen_phash_similar(self, phash: str, threshold: int) -> bool:
+        # Note: O(N) full table scan + Python-side Hamming compare per call,
+        # so a `run` over K new images is O(K·N). Currently fine; will need a
+        # bk-tree (or precomputed buckets) past a few thousand kept rows.
         import imagehash
         target = imagehash.hex_to_hash(phash)
         rows = self._conn.execute(
-            "SELECT phash FROM images WHERE status NOT IN ('rejected') AND phash IS NOT NULL"
+            "SELECT phash FROM images WHERE status != ? AND phash IS NOT NULL",
+            (Status.REJECTED.value,),
         ).fetchall()
         for row in rows:
             try:
@@ -105,13 +113,14 @@ class DB:
     def insert_seen(self, sha256: str, phash: str, filename: str) -> int:
         cur = self._conn.execute(
             "INSERT OR IGNORE INTO images (sha256, phash, source_filename, status) "
-            "VALUES (?, ?, ?, 'seen')",
-            (sha256, phash, filename),
+            "VALUES (?, ?, ?, ?)",
+            (sha256, phash, filename, Status.SEEN.value),
         )
         self._conn.commit()
         return cur.lastrowid
 
-    def set_status(self, sha256: str, status: str, **kwargs: Any) -> None:
+    def set_status(self, sha256: str, status: Status | str, **kwargs: Any) -> None:
+        status_value = status.value if isinstance(status, Status) else status
         allowed = {
             "reject_stage", "reject_reason", "safety_raw", "quality_raw",
             "caption", "tweet_id", "posted_at", "phash",
@@ -127,38 +136,48 @@ class DB:
         if set_clause:
             self._conn.execute(
                 f"UPDATE images SET status = ?, {set_clause} WHERE sha256 = ?",
-                [status] + values + [sha256],
+                [status_value] + values + [sha256],
             )
         else:
             self._conn.execute(
                 "UPDATE images SET status = ? WHERE sha256 = ?",
-                (status, sha256),
+                (status_value, sha256),
             )
         self._conn.commit()
 
     def get_stuck_posting(self) -> list[sqlite3.Row]:
         return self._conn.execute(
-            "SELECT * FROM images WHERE status = 'posting'"
+            "SELECT * FROM images WHERE status = ?", (Status.POSTING.value,),
         ).fetchall()
 
     def reset_stuck_posting(self) -> int:
-        """Reset all rows stuck in 'posting' back to 'approved'. Returns count updated."""
+        """Reset all rows stuck in `posting` back to `approved`. Returns count updated."""
         cur = self._conn.execute(
-            "UPDATE images SET status='approved' WHERE status='posting'"
+            "UPDATE images SET status = ? WHERE status = ?",
+            (Status.APPROVED.value, Status.POSTING.value),
         )
         self._conn.commit()
         return cur.rowcount
 
     def get_approved(self) -> list[sqlite3.Row]:
         return self._conn.execute(
-            "SELECT * FROM images WHERE status = 'approved'"
+            "SELECT * FROM images WHERE status = ?", (Status.APPROVED.value,),
         ).fetchall()
 
     def get_pending(self) -> list[sqlite3.Row]:
         """Return all queued and approved rows — images that could still be posted."""
         return self._conn.execute(
-            "SELECT * FROM images WHERE status IN ('queued', 'approved')"
+            "SELECT * FROM images WHERE status IN (?, ?)",
+            (Status.QUEUED.value, Status.APPROVED.value),
         ).fetchall()
+
+    def get_sha_for_phash(self, phash: str) -> str | None:
+        """Look up the most recent image SHA-256 for a given pHash."""
+        row = self._conn.execute(
+            "SELECT sha256 FROM images WHERE phash = ? ORDER BY id DESC LIMIT 1",
+            (phash,),
+        ).fetchone()
+        return row["sha256"] if row else None
 
     # ── AI call budget ────────────────────────────────────────────────────────
 
@@ -261,25 +280,31 @@ class DB:
 
     # ── Clean pipeline ────────────────────────────────────────────────────────
 
+    _CLEANABLE_STATUSES = (Status.QUEUED, Status.APPROVED, Status.SEEN)
+
     def get_cleanable_filenames(self) -> list[str]:
+        placeholders = ",".join("?" * len(self._CLEANABLE_STATUSES))
         rows = self._conn.execute(
-            "SELECT source_filename FROM images WHERE status IN ('queued', 'approved', 'seen')"
+            f"SELECT source_filename FROM images WHERE status IN ({placeholders})",
+            [s.value for s in self._CLEANABLE_STATUSES],
         ).fetchall()
         return [r["source_filename"] for r in rows if r["source_filename"]]
 
     def get_cleanable_counts(self) -> dict[str, int]:
         result: dict[str, int] = {}
-        for status in ("queued", "approved", "seen"):
+        for status in self._CLEANABLE_STATUSES:
             row = self._conn.execute(
-                "SELECT COUNT(*) FROM images WHERE status = ?", (status,)
+                "SELECT COUNT(*) FROM images WHERE status = ?", (status.value,),
             ).fetchone()
-            result[status] = row[0]
+            result[status.value] = row[0]
         return result
 
     def clean_pipeline(self) -> int:
-        """Delete all non-posted image records (queued, approved, seen). Returns count deleted."""
+        """Delete all non-posted image records. Returns count deleted."""
+        placeholders = ",".join("?" * len(self._CLEANABLE_STATUSES))
         cur = self._conn.execute(
-            "DELETE FROM images WHERE status IN ('queued', 'approved', 'seen')"
+            f"DELETE FROM images WHERE status IN ({placeholders})",
+            [s.value for s in self._CLEANABLE_STATUSES],
         )
         self._conn.commit()
         return cur.rowcount

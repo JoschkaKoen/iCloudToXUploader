@@ -25,31 +25,14 @@ from ic2x import pull as pull_mod
 from ic2x.group import cluster_by_phash
 from ic2x.config import Config, load_config, ensure_dirs
 from ic2x.db import DB
+from ic2x.status import Status
 from ic2x.utils import ui
-from ic2x.utils.ai_client import warmup_ollama, unload_ollama, provider_for_model, parse_model_effort
+from ic2x.utils.logging_setup import setup_logging
+from ic2x.utils.ai_client import warmup_ollama, unload_ollama, provider_for_model, parse_model_effort  # noqa: F401
 
 logger = logging.getLogger("ic2x.run")
 
-
-def setup_logging(logs_dir: Path) -> None:
-    if logging.getLogger().handlers:
-        return  # already configured — don't leak a second FileHandler
-    from rich.logging import RichHandler
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    log_file = logs_dir / f"{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.log"
-    file_handler = logging.FileHandler(log_file)
-    file_handler.setFormatter(
-        logging.Formatter("%(asctime)s  %(name)-20s  %(levelname)s  %(message)s")
-    )
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(message)s",
-        datefmt="[%X]",
-        handlers=[
-            file_handler,
-            RichHandler(rich_tracebacks=True, show_path=False),
-        ],
-    )
+_TOTAL_STAGES = 6  # SHA-256 dedup, screenshot, pHash dedup, safety+quality, prepare, rotation
 
 
 def _log_decision(
@@ -97,7 +80,8 @@ def run(
     if show_banner:
         ui.startup_banner(cfg)
 
-    # Inject proxy into os.environ before any network activity
+    # Inject proxy into os.environ before any network activity. This must
+    # happen before openai/httpx/tweepy import their underlying TLS clients.
     if cfg.proxy_http:
         os.environ.setdefault("http_proxy",  cfg.proxy_http)
         os.environ.setdefault("HTTP_PROXY",  cfg.proxy_http)
@@ -106,19 +90,16 @@ def run(
         os.environ.setdefault("HTTPS_PROXY", cfg.proxy_https)
 
     # Warmup Ollama if either AI model is local — one-time check before the image loop
-    _default = os.environ.get("AI_DEFAULT_MODEL", "gemini-2.5-flash")
-    _judge_model,    _ = parse_model_effort(os.environ.get("JUDGE_MODEL",    _default))
-    _rotation_model, _ = parse_model_effort(os.environ.get("ROTATION_MODEL", _default))
+    _judge_m, _    = parse_model_effort(cfg.judge_model)
+    _rotation_m, _ = parse_model_effort(cfg.rotation_model)
     _ollama_models = {
-        m for m in (_judge_model, _rotation_model)
-        if provider_for_model(m) == "ollama"
+        m for m in (_judge_m, _rotation_m) if provider_for_model(m) == "ollama"
     }
     if _ollama_models:
-        _ollama_base = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1")
         for _m in _ollama_models:
             ui.info(f"Warming up Ollama model '{_m}' (may take up to 90s on cold start)…")
             try:
-                warmup_ollama(_ollama_base, _m)
+                warmup_ollama(cfg.ollama_base_url, _m)
                 ui.ok(f"Ollama '{_m}' ready")
             except RuntimeError as exc:
                 ui.err(str(exc))
@@ -160,13 +141,13 @@ def run(
 
         try:
             # ── [1/6] SHA-256 dedup ────────────────────────────────────────
-            ui.stage_banner(1, "DEDUP (SHA-256)")
+            ui.stage_banner(1, _TOTAL_STAGES, "DEDUP (SHA-256)")
             sha = dedup.sha256_of(path)
             _existing = db.get_image_by_sha(sha)
-            if _existing is not None and _existing["status"] != "seen":
+            if _existing is not None and _existing["status"] != Status.SEEN.value:
                 # Fully processed or rejected before — true duplicate
                 ui.rejected(path.name, "duplicate", "sha256 already seen")
-                _reject(path, cfg, db, sha, "", "duplicate", "sha256", logs_dir=cfg.logs_dir)
+                _reject(path, cfg, db, sha, "", "duplicate", "sha256")
                 rejected_by["duplicate"] += 1
                 continue
             # _existing is None (new image) or status=='seen' (crashed mid-pipeline → resume)
@@ -175,21 +156,21 @@ def run(
             ui.ok(f"new  ({sha[:12]}…)")
 
             # ── [2/6] Screenshot filter ────────────────────────────────────
-            ui.stage_banner(2, "SCREENSHOT CHECK")
+            ui.stage_banner(2, _TOTAL_STAGES, "SCREENSHOT CHECK")
             is_ss, ss_reason = filter.is_screenshot(path)
             if is_ss:
                 ui.rejected(path.name, "screenshot", ss_reason)
-                _reject(path, cfg, db, sha, "", "screenshot", ss_reason, logs_dir=cfg.logs_dir)
+                _reject(path, cfg, db, sha, "", "screenshot", ss_reason)
                 rejected_by["screenshot"] += 1
                 continue
             ui.ok("not a screenshot")
 
             # ── [3/6] pHash dedup ──────────────────────────────────────────
-            ui.stage_banner(3, "DEDUP (pHash)")
+            ui.stage_banner(3, _TOTAL_STAGES, "DEDUP (pHash)")
             phash = dedup.phash_of(path)
             if db.seen_phash_similar(phash, cfg.hamming_threshold):
                 ui.rejected(path.name, "duplicate", "perceptual near-duplicate of already-processed image")
-                _reject(path, cfg, db, sha, phash, "duplicate", "phash", logs_dir=cfg.logs_dir)
+                _reject(path, cfg, db, sha, phash, "duplicate", "phash")
                 rejected_by["duplicate"] += 1
                 continue
             ui.ok("unique")
@@ -198,11 +179,11 @@ def run(
                 db.insert_seen(sha, phash, path.name)
 
             # ── [4/6] Safety + quality check ──────────────────────────────
-            ui.stage_banner(4, "SAFETY + QUALITY CHECK")
+            ui.stage_banner(4, _TOTAL_STAGES, "SAFETY + QUALITY CHECK")
             if db.check_daily_ai_limit(cfg.daily_ai_calls):
                 ui.warn("Daily AI call limit reached — stopping")
                 break
-            result, sq_elapsed = judge_safety_quality.call_safety_quality(path)
+            result, sq_elapsed = judge_safety_quality.call_safety_quality(path, cfg)
             db.increment_ai_calls()
             sq_ms = int(sq_elapsed * 1000)
 
@@ -211,10 +192,8 @@ def run(
                 ui.rejected(path.name, stage, result["flags"])
                 dest_sub = "model_refused" if stage == "model_refused" else "safety"
                 _reject(
-                    path, cfg, db, sha, phash, "rejected", result["flags"],
-                    reject_stage=dest_sub,
+                    path, cfg, db, sha, phash, dest_sub, result["flags"],
                     safety_raw=json.dumps({"safe": result["safe"], "flags": result["flags"]}),
-                    logs_dir=cfg.logs_dir,
                     ai_ms=sq_ms,
                 )
                 rejected_by[dest_sub] += 1
@@ -224,12 +203,11 @@ def run(
 
             if not result["interesting"]:
                 ui.info(f'Description : {result["description"]}')
+                ui.info(f'Reason      : {result["reason"]}')
                 ui.rejected(path.name, "quality", result["reason"])
                 _reject(
-                    path, cfg, db, sha, phash, "rejected", result["reason"],
-                    reject_stage="quality",
+                    path, cfg, db, sha, phash, "quality", result["reason"],
                     quality_raw=json.dumps({k: result[k] for k in ("interesting", "description", "caption", "reason")}),
-                    logs_dir=cfg.logs_dir,
                     ai_ms=sq_ms,
                 )
                 rejected_by["quality"] += 1
@@ -239,7 +217,7 @@ def run(
             ui.info(f'Description : {result["description"]}')
 
             # ── [5/6] Prepare + optional enhance ──────────────────────────
-            ui.stage_banner(5, "PREPARE")
+            ui.stage_banner(5, _TOTAL_STAGES, "PREPARE")
             prepared = prepare.prepare(path, cfg.queue_dir, phash)
 
             if cfg.enhance_enabled:
@@ -258,11 +236,11 @@ def run(
                 ui.ok(f"{prepared.name}  [enhance: disabled]")
 
             # ── [6/6] Visual rotation check ───────────────────────────────
-            ui.stage_banner(6, "ROTATION CHECK")
+            ui.stage_banner(6, _TOTAL_STAGES, "ROTATION CHECK")
             if db.check_daily_ai_limit(cfg.daily_ai_calls):
                 ui.warn("Daily AI call limit reached — skipping rotation check")
             else:
-                rotation, rotation_elapsed = judge_rotation.call_rotation(prepared)
+                rotation, rotation_elapsed = judge_rotation.call_rotation(prepared, cfg)
                 db.increment_ai_calls()
                 rotation_ms = int(rotation_elapsed * 1000)
                 degrees = rotation["rotate_cw_degrees"]
@@ -285,7 +263,7 @@ def run(
                 dest_json = cfg.approved_dir / f"{phash}.json"
                 shutil.move(str(prepared), dest_img)
                 shutil.move(str(sidecar_path), dest_json)
-                db.set_status(sha, "approved", caption=result["caption"])
+                db.set_status(sha, Status.APPROVED, caption=result["caption"])
                 _log_decision(
                     cfg.logs_dir, sha, phash, path.name,
                     "queue", "auto-approved", detail=result["caption"],
@@ -293,7 +271,7 @@ def run(
                 approved_count += 1
                 ui.info(f"[AUTO-APPROVE] → approved/{phash[:12]}…")
             else:
-                db.set_status(sha, "queued", caption=result["caption"])
+                db.set_status(sha, Status.QUEUED, caption=result["caption"])
                 _log_decision(
                     cfg.logs_dir, sha, phash, path.name,
                     "queue", "queued", detail=result["caption"],
@@ -322,7 +300,7 @@ def run(
     if _ollama_models:
         for _m in _ollama_models:
             ui.info(f"Unloading Ollama model '{_m}'…")
-            unload_ollama(_ollama_base, _m)
+            unload_ollama(cfg.ollama_base_url, _m)
 
     return new_pulled, queued_count, approved_count
 
@@ -333,20 +311,17 @@ def _reject(
     db: DB,
     sha: str,
     phash: str,
-    status: str,
-    reason,
-    reject_stage: str | None = None,
+    reject_stage: str,                 # also the rejected/<stage>/ subfolder name
+    reason,                            # str or list[str] — flagged reasons
+    *,
     safety_raw: str | None = None,
     quality_raw: str | None = None,
-    logs_dir: Path | None = None,
     ai_ms: int | None = None,
 ) -> None:
-    reject_subdir = reject_stage or (
-        "duplicate" if status == "duplicate" else
-        "screenshot" if status == "screenshot" else
-        "safety"
-    )
-    dest_dir = cfg.rejected_dir / reject_subdir
+    """Move a rejected image to rejected/<stage>/, mark the row REJECTED,
+    and append a decision record to logs/YYYY-MM-DD.jsonl.
+    """
+    dest_dir = cfg.rejected_dir / reject_stage
     dest_dir.mkdir(parents=True, exist_ok=True)
     try:
         shutil.copy2(str(path), dest_dir / path.name)
@@ -355,11 +330,9 @@ def _reject(
         pass  # file may not exist yet (e.g. sha256 hit before download)
 
     if sha:
-        kwargs: dict = {}
+        kwargs: dict = {"reject_stage": reject_stage}
         if phash:
             kwargs["phash"] = phash
-        if reject_stage:
-            kwargs["reject_stage"] = reject_stage
         if reason:
             kwargs["reject_reason"] = json.dumps(reason) if isinstance(reason, list) else str(reason)
         if safety_raw:
@@ -367,19 +340,16 @@ def _reject(
         if quality_raw:
             kwargs["quality_raw"] = quality_raw
 
-        if db.seen_sha256(sha):
-            db.set_status(sha, "rejected", **kwargs)
-        else:
+        if not db.seen_sha256(sha):
             db.insert_seen(sha, phash or "", path.name)
-            db.set_status(sha, "rejected", **kwargs)
+        db.set_status(sha, Status.REJECTED, **kwargs)
 
-    if logs_dir:
-        _log_decision(
-            logs_dir, sha, phash, path.name,
-            reject_stage or status, "rejected",
-            detail=reason if isinstance(reason, list) else [str(reason)] if reason else [],
-            ai_ms=ai_ms,
-        )
+    _log_decision(
+        cfg.logs_dir, sha, phash, path.name,
+        reject_stage, "rejected",
+        detail=reason if isinstance(reason, list) else [str(reason)] if reason else [],
+        ai_ms=ai_ms,
+    )
 
 
 def _apply_rotation(path: Path, cw_degrees: int) -> None:

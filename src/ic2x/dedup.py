@@ -13,30 +13,11 @@ import logging
 from pathlib import Path
 
 import imagehash
-from PIL import Image, ImageOps
+from PIL import Image
+
+from ic2x.utils.image_utils import oriented
 
 logger = logging.getLogger("ic2x.dedup")
-
-_HEIF_OPS = {
-    2: Image.FLIP_LEFT_RIGHT,
-    3: Image.ROTATE_180,
-    4: Image.FLIP_TOP_BOTTOM,
-    5: Image.TRANSPOSE,
-    6: Image.ROTATE_270,
-    7: Image.TRANSVERSE,
-    8: Image.ROTATE_90,
-}
-
-
-def _oriented(img: Image.Image) -> Image.Image:
-    """Apply EXIF orientation (JPEG) or HEIF orientation (HEIC) to img."""
-    img = ImageOps.exif_transpose(img)          # standard JPEG EXIF path
-    orientation = img.info.get("orientation")   # pillow_heif fallback (int 1-8)
-    if orientation and orientation != 1:
-        op = _HEIF_OPS.get(orientation)
-        if op:
-            img = img.transpose(op)
-    return img
 
 
 def sha256_of(path: Path) -> str:
@@ -45,5 +26,4 @@ def sha256_of(path: Path) -> str:
 
 def phash_of(path: Path) -> str:
     with Image.open(path) as img:
-        img = _oriented(img)
-        return str(imagehash.phash(img))
+        return str(imagehash.phash(oriented(img)))

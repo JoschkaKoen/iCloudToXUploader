@@ -4,18 +4,23 @@ from __future__ import annotations
 
 from ic2x.config import load_config, ensure_dirs
 from ic2x.db import DB
+from ic2x.status import Status
 from ic2x.utils import ui
 
 
 def clean() -> None:
     cfg = load_config()
     ensure_dirs(cfg)
+
+    from ic2x.utils.logging_setup import setup_logging
+    setup_logging(cfg.logs_dir)
+
     db = DB(cfg.db_path)
 
     counts        = db.get_cleanable_counts()
-    queued_rows   = counts["queued"]
-    approved_rows = counts["approved"]
-    seen_rows     = counts["seen"]
+    queued_rows   = counts[Status.QUEUED.value]
+    approved_rows = counts[Status.APPROVED.value]
+    seen_rows     = counts[Status.SEEN.value]
     total_rows    = queued_rows + approved_rows + seen_rows
     inbox_names   = set(db.get_cleanable_filenames())
 

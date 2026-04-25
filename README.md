@@ -8,9 +8,7 @@ Automated pipeline that pulls photos from iCloud, runs Gemini AI safety and qual
 flowchart TD
     A([iCloud Photos]) -->|icloudpd --skip-videos| B[inbox/]
 
-    B --> C{Format check\nHEIC · JPG · PNG}
-    C -->|rejected| R1[rejected/format/]
-    C -->|ok| D{Screenshot\ndetection}
+    B --> D{Screenshot\ndetection}
     D -->|rejected| R2[rejected/screenshot/]
     D -->|ok| E{SHA-256\ndedup}
     E -->|seen before| R3[rejected/duplicate/]
@@ -18,12 +16,11 @@ flowchart TD
     F -->|near-duplicate| R3
     F -->|unique| G[(state.db\nstatus: seen)]
 
-    G --> H[Gemini Safety\ngemini-2.5-flash]
+    G --> H[Combined safety + quality\njudge_safety_quality.py\nJUDGE_MODEL]
     H -->|nudity · violence\nprivacy · hate…| R4[rejected/safety/]
-    H -->|refused| R5[rejected/gemini_refused/]
-    H -->|safe| I[Gemini Quality\ngemini-2.5-flash]
-    I -->|selfie · blurry\nboring · generic| R6[rejected/quality/]
-    I -->|interesting + caption| J[prepare.py\nEXIF + HEIF rotation correction\nJPEG re-encode · EXIF strip]
+    H -->|refused| R5[rejected/model_refused/]
+    H -->|selfie · blurry\nboring · generic| R6[rejected/quality/]
+    H -->|safe + interesting + caption| J[prepare.py\nEXIF + HEIF rotation correction\nJPEG re-encode · EXIF strip]
 
     J --> K{InstructIR\nenhancement\noptional}
     K -->|enabled| L[enhance.py\nsubprocess · CUDA isolated]
@@ -59,7 +56,7 @@ ic2x unstick  # reset rows stuck in 'posting' back to 'approved' for retry
 ## Setup
 
 ```bash
-pip install -e .
+uv sync                # or: pip install -e .
 cp .env.example .env   # fill in API keys + ICLOUD_USERNAME
 # override any default.env value in .env if needed
 ```
@@ -71,7 +68,7 @@ TWITTER_CONSUMER_KEY=
 TWITTER_CONSUMER_SECRET=
 TWITTER_ACCESS_TOKEN=
 TWITTER_ACCESS_TOKEN_SECRET=
-GEMINI_API_KEY=
+GEMINI_API_KEY=                   # GOOGLE_API_KEY also accepted as fallback
 ```
 
 ### Key settings in `default.env`
@@ -88,17 +85,19 @@ GEMINI_API_KEY=
 
 | Folder | Reason |
 |--------|--------|
-| `rejected/format/` | Non-image file type |
-| `rejected/screenshot/` | Detected as device screenshot |
+| `rejected/screenshot/` | No camera Make/Model EXIF (likely a screenshot) |
 | `rejected/duplicate/` | SHA-256 or perceptual duplicate of seen/posted image |
-| `rejected/safety/` | Gemini flagged nudity, violence, privacy, etc. |
-| `rejected/gemini_refused/` | Gemini refused to analyse — treated as unsafe |
-| `rejected/quality/` | Gemini judged not interesting, or reviewer said no |
+| `rejected/safety/` | Model flagged nudity, violence, privacy, etc. |
+| `rejected/model_refused/` | Model refused to analyse — treated as unsafe |
+| `rejected/quality/` | Model judged not interesting, or reviewer said no |
 
 ## State machine
 
+Defined as the `Status` enum in [`src/ic2x/status.py`](src/ic2x/status.py).
+
 ```
 seen → queued → approved → posting → posted
+                                   ↘ rejected (from any earlier stage)
 ```
 
-`posting` is the idempotency anchor: written before the API call, `posted` written after. Any row stuck in `posting` on startup triggers a warning and halts — never silently retried.
+`posting` is the idempotency anchor: written before the X API call, `posted` written after. Any row stuck in `posting` on startup triggers a warning and halts — never silently retried (use `ic2x unstick` after manually verifying the tweet wasn't posted).

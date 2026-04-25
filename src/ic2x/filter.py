@@ -21,28 +21,23 @@ from PIL import Image
 logger = logging.getLogger("ic2x.filter")
 
 
-def is_screenshot(path: Path, album_name: str | None = None) -> tuple[bool, str]:
+_EXIF_TAG_MAKE  = 271
+_EXIF_TAG_MODEL = 272
+
+
+def is_screenshot(path: Path) -> tuple[bool, str]:
     """Return (True, reason) if the file has no camera EXIF, else (False, "").
 
     iCloud preserves the original Make/Model EXIF for every camera photo.
     Any file that lacks these tags was not shot by a camera (screenshot,
     saved image, etc.) and is rejected.
-
-    The ``album_name`` parameter is accepted for API compatibility but is no
-    longer used — the EXIF check alone is sufficient and device-agnostic.
     """
     try:
         with Image.open(path) as img:
             exif_data = img.getexif() or {}
-
-        MAKE  = 271
-        MODEL = 272
-        has_camera = exif_data.get(MAKE) or exif_data.get(MODEL)
-        if has_camera:
+        if exif_data.get(_EXIF_TAG_MAKE) or exif_data.get(_EXIF_TAG_MODEL):
             return False, ""
-
         return True, "no camera EXIF (Make/Model absent)"
-
     except Exception as exc:
         logger.debug("filter: could not inspect %s: %s", path.name, exc)
         return False, ""
