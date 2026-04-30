@@ -35,8 +35,15 @@ from ic2x.utils.ai_client import (
     parse_model_effort,
     reset_run_usage,
     get_run_usage,
+    require_vision_api_credentials,
 )
-from ic2x.utils.cost_report import compute_cost, format_usage_log, pricing_currency
+from ic2x.utils.cost_report import (
+    compute_cost,
+    format_total_cost_line,
+    format_usage_log,
+    pricing_currency,
+    write_run_cost_artifacts,
+)
 
 logger = logging.getLogger("ic2x.run")
 
@@ -84,6 +91,12 @@ def run(
     cfg = load_config()
     ensure_dirs(cfg)
     setup_logging(cfg.logs_dir)
+
+    try:
+        require_vision_api_credentials(cfg.judge_model, cfg.rotation_model)
+    except ValueError as exc:
+        ui.err(str(exc))
+        return 0, 0, 0
 
     if show_banner:
         ui.startup_banner(cfg)
@@ -300,10 +313,18 @@ def run(
 
     usage = get_run_usage()
     if usage:
-        total, _ = compute_cost(usage)
-        cur = pricing_currency()
-        cost_line = f"est_cost={total} {cur}"
+        total, breakdown = compute_cost(usage)
+        cost_line = format_total_cost_line(total)
         logger.info("AI usage — %s", format_usage_log(usage, cost_line=cost_line))
+        write_run_cost_artifacts(
+            cfg.logs_dir,
+            breakdown=breakdown,
+            total_cost=total,
+            currency=pricing_currency(),
+            new_pulled=new_pulled,
+            queued=queued_count,
+            approved=approved_count,
+        )
 
     if cfg.group_hamming_threshold > 0:
         pending = db.get_pending()

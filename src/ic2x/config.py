@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 
 _PROJECT_ROOT = Path(__file__).parent.parent.parent
 
-_DEFAULT_AI_MODEL    = "gemini-2.5-flash"
+_DEFAULT_AI_MODEL    = "qwen3.6-flash"
 _DEFAULT_OLLAMA_URL  = "http://localhost:11434/v1"
 _DEFAULT_JUDGE_MAX_PX = 1024
 

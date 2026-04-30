@@ -1,13 +1,75 @@
 {
-  "currency": "USD",
-  "note": "Rough public-list prices per 1M tokens; update for your billing region. Unknown models → 0.",
+  "currency": "RMB",
+  "note": "Generated from eXercise AI API costs.xlsx — rates per 1M tokens (RMB). Regenerate: python scripts/export_pricing_from_exercise_xlsx.py",
+  "source_xlsx": "eXercise/AI API costs.xlsx",
   "models": {
-    "gemini-2.5-flash": { "input_per_million": 0.30, "output_per_million": 2.50 },
-    "gemini-2.5-flash-lite": { "input_per_million": 0.10, "output_per_million": 0.40 },
-    "gemini-2.5-pro": { "input_per_million": 1.25, "output_per_million": 10.00 },
-    "grok-3": { "input_per_million": 3.00, "output_per_million": 15.00 },
-    "grok-4": { "input_per_million": 3.00, "output_per_million": 15.00 },
-    "qwen3.6-plus": { "input_per_million": 0.40, "output_per_million": 1.20 },
-    "qwen3-max": { "input_per_million": 0.60, "output_per_million": 1.80 }
+    "gemini-2.5-flash": {
+      "input_per_million": 2.05,
+      "output_per_million": 17.08
+    },
+    "gemini-2.5-flash-lite": {
+      "input_per_million": 0.68,
+      "output_per_million": 2.73
+    },
+    "gemini-2.5-pro": {
+      "input_per_million": 8.54,
+      "output_per_million": 68.3
+    },
+    "gemini-3-flash-preview": {
+      "input_per_million": 3.42,
+      "output_per_million": 20.49
+    },
+    "gemini-3.1-flash-lite-preview": {
+      "input_per_million": 1.71,
+      "output_per_million": 10.25
+    },
+    "gemini-3.1-pro-preview": {
+      "input_per_million": 13.66,
+      "output_per_million": 81.96
+    },
+    "grok-4": {
+      "input_per_million": 13.66,
+      "output_per_million": 40.98
+    },
+    "grok-4-1-fast-non-reasoning": {
+      "input_per_million": 1.37,
+      "output_per_million": 3.42
+    },
+    "qwen-doc-turbo": {
+      "input_per_million": 0.6,
+      "output_per_million": 1.0
+    },
+    "qwen-long": {
+      "input_per_million": 0.5,
+      "output_per_million": 2.0
+    },
+    "qwen3-max": {
+      "input_per_million": 8.2,
+      "output_per_million": 40.98
+    },
+    "qwen3-vl-flash": {
+      "input_per_million": 1.37,
+      "output_per_million": 10.93
+    },
+    "qwen3-vl-plus": {
+      "input_per_million": 1.0,
+      "output_per_million": 10.0
+    },
+    "qwen3.5-flash": {
+      "input_per_million": 0.68,
+      "output_per_million": 2.73
+    },
+    "qwen3.5-plus": {
+      "input_per_million": 2.73,
+      "output_per_million": 16.39
+    },
+    "qwen3.6-flash": {
+      "input_per_million": 1.2,
+      "output_per_million": 7.2
+    },
+    "qwen3.6-plus": {
+      "input_per_million": 2.0,
+      "output_per_million": 12.0
+    }
   }
 }

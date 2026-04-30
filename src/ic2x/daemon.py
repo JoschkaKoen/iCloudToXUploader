@@ -20,6 +20,7 @@ from typing import Callable
 from ic2x.config import Config, load_config, ensure_dirs
 from ic2x.db import DB
 from ic2x.utils import ui
+from ic2x.utils.ai_client import require_vision_api_credentials
 
 logger = logging.getLogger("ic2x.daemon")
 
@@ -30,6 +31,12 @@ def daemon() -> None:
 
     from ic2x.utils.logging_setup import setup_logging
     setup_logging(cfg.logs_dir)
+
+    try:
+        require_vision_api_credentials(cfg.judge_model, cfg.rotation_model)
+    except ValueError as exc:
+        ui.err(str(exc))
+        return
 
     _stop = False
 

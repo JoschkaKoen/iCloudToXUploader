@@ -194,7 +194,60 @@ _PROVIDER_REGISTRY: list[_ProviderDef] = [
     ),
 ]
 
-_DEFAULT_MODEL = "gemini-2.5-flash"
+_DEFAULT_MODEL = "qwen3.6-flash"
+
+
+def why_no_ai_client(model_string: str) -> str | None:
+    """If :func:`make_ai_client` would return ``None``, return a short reason; else ``None``."""
+    try:
+        import openai  # noqa: F401
+    except ImportError:
+        return "Python package 'openai' is not installed."
+
+    model, _ = parse_model_effort(model_string or _DEFAULT_MODEL)
+    provider = provider_for_model(model)
+    pdef = next((p for p in _PROVIDER_REGISTRY if p.name == provider), _PROVIDER_REGISTRY[0])
+
+    api_key = os.environ.get(pdef.api_key_env, "").strip()
+    if not api_key and pdef.name == "gemini":
+        api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
+    if not api_key and pdef.api_key_default:
+        api_key = pdef.api_key_default
+    if api_key:
+        return None
+
+    if provider == "gemini":
+        return "Missing GEMINI_API_KEY or GOOGLE_API_KEY in .env."
+    if provider == "xai":
+        return "Missing XAI_API_KEY in .env."
+    if provider == "qwen":
+        return (
+            "Missing DASHSCOPE_API_KEY in .env (Alibaba DashScope — required for qwen* models)."
+        )
+    if provider == "kimi":
+        return "Missing KIMI_API_KEY in .env."
+    return f"Missing {pdef.api_key_env} in .env."
+
+
+def require_vision_api_credentials(judge_model: str, rotation_model: str) -> None:
+    """Raise ``ValueError`` if judge or rotation models cannot obtain an API client."""
+    seen: set[str] = set()
+    errors: list[str] = []
+    for label, m in (("JUDGE_MODEL", judge_model), ("ROTATION_MODEL", rotation_model)):
+        key = m.strip()
+        if key in seen:
+            continue
+        seen.add(key)
+        reason = why_no_ai_client(m)
+        if reason:
+            errors.append(f"  • {label}={m!r}: {reason}")
+    if errors:
+        raise ValueError(
+            "Cannot run vision AI — missing credentials:\n"
+            + "\n".join(errors)
+            + "\nAdd the key(s) to .env (see .env.example) or set JUDGE_MODEL / ROTATION_MODEL "
+            "to a provider you already use (e.g. gemini-2.5-flash with GEMINI_API_KEY)."
+        )
 
 
 def provider_for_model(model: str) -> str:
@@ -555,7 +608,8 @@ def call_vision_judge(
     try:
         result = make_ai_client(model_string, ollama_base_url=ollama_base_url)
         if result is None:
-            logger.warning("%s: no AI client available (check API key / model)", call.label)
+            detail = why_no_ai_client(model_string) or "check API key / model id"
+            logger.warning("%s: no AI client — %s", call.label, detail)
             return call.fail_value, _elapsed(), False, False
 
         client, model, provider, effort = result
@@ -673,12 +727,14 @@ __all__ = [
     "get_run_usage",
     "make_ai_client",
     "parse_model_effort",
+    "require_vision_api_credentials",
     "print_streamed_response",
     "provider_for_model",
     "record_usage",
     "reset_run_call_stats",
     "reset_run_usage",
     "strip_json_fences",
+    "why_no_ai_client",
     "unload_ollama",
     "warmup_ollama",
 ]
