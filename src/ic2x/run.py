@@ -28,7 +28,15 @@ from ic2x.db import DB
 from ic2x.status import Status
 from ic2x.utils import ui
 from ic2x.utils.logging_setup import setup_logging
-from ic2x.utils.ai_client import warmup_ollama, unload_ollama, provider_for_model, parse_model_effort  # noqa: F401
+from ic2x.utils.ai_client import (
+    warmup_ollama,
+    unload_ollama,
+    provider_for_model,
+    parse_model_effort,
+    reset_run_usage,
+    get_run_usage,
+)
+from ic2x.utils.cost_report import compute_cost, format_usage_log, pricing_currency
 
 logger = logging.getLogger("ic2x.run")
 
@@ -104,6 +112,8 @@ def run(
             except RuntimeError as exc:
                 ui.err(str(exc))
                 return 0, 0, 0
+
+    reset_run_usage()
 
     db = DB(cfg.db_path)
 
@@ -183,8 +193,9 @@ def run(
             if db.check_daily_ai_limit(cfg.daily_ai_calls):
                 ui.warn("Daily AI call limit reached — stopping")
                 break
-            result, sq_elapsed = judge_safety_quality.call_safety_quality(path, cfg)
-            db.increment_ai_calls()
+            result, sq_elapsed, sq_used_net = judge_safety_quality.call_safety_quality(path, cfg)
+            if sq_used_net:
+                db.increment_ai_calls()
             sq_ms = int(sq_elapsed * 1000)
 
             if not result["safe"]:
@@ -240,8 +251,9 @@ def run(
             if db.check_daily_ai_limit(cfg.daily_ai_calls):
                 ui.warn("Daily AI call limit reached — skipping rotation check")
             else:
-                rotation, rotation_elapsed = judge_rotation.call_rotation(prepared, cfg)
-                db.increment_ai_calls()
+                rotation, rotation_elapsed, rot_used_net = judge_rotation.call_rotation(prepared, cfg)
+                if rot_used_net:
+                    db.increment_ai_calls()
                 rotation_ms = int(rotation_elapsed * 1000)
                 degrees = rotation["rotate_cw_degrees"]
                 if not rotation["upright"] and degrees != 0:
@@ -285,6 +297,13 @@ def run(
             continue
 
     ui.run_summary(new_pulled, queued_count + approved_count, dict(rejected_by))
+
+    usage = get_run_usage()
+    if usage:
+        total, _ = compute_cost(usage)
+        cur = pricing_currency()
+        cost_line = f"est_cost={total} {cur}"
+        logger.info("AI usage — %s", format_usage_log(usage, cost_line=cost_line))
 
     if cfg.group_hamming_threshold > 0:
         pending = db.get_pending()

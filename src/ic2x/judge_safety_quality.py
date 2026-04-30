@@ -75,10 +75,10 @@ def _fail(flag: str) -> dict:
     }
 
 
-def call_safety_quality(image_path: Path, cfg: Config) -> tuple[dict, float]:
+def call_safety_quality(image_path: Path, cfg: Config) -> tuple[dict, float, bool]:
     """Run combined safety + quality check on image_path.
 
-    Returns (result_dict, elapsed_seconds).
+    Returns (result_dict, elapsed_seconds, used_network).
     result_dict always has all 6 keys: safe, flags, interesting,
     description, caption, reason.
     Fails closed: any error returns safe=False, interesting=False.
@@ -87,7 +87,7 @@ def call_safety_quality(image_path: Path, cfg: Config) -> tuple[dict, float]:
     is_ollama = provider_for_model(model) == "ollama"
     max_px = cfg.ollama_image_max_px if is_ollama else cfg.judge_image_max_px
 
-    parsed, elapsed, ok = call_vision_judge(
+    parsed, elapsed, ok, used_network = call_vision_judge(
         model_string=cfg.judge_model,
         ollama_base_url=cfg.ollama_base_url,
         call=JudgeCall(
@@ -101,14 +101,14 @@ def call_safety_quality(image_path: Path, cfg: Config) -> tuple[dict, float]:
     )
 
     if not ok:
-        return parsed, elapsed   # fail/refused already in expected shape
+        return parsed, elapsed, used_network
 
     if "safe" not in parsed or "interesting" not in parsed:
         logger.warning(
             "judge: unexpected response shape for %s: %s",
             image_path.name, str(parsed)[:200],
         )
-        return _fail("error:bad_shape"), elapsed
+        return _fail("error:bad_shape"), elapsed, used_network
 
     caption = parsed.get("caption") or ""
     if len(caption) > 100:
@@ -120,4 +120,4 @@ def call_safety_quality(image_path: Path, cfg: Config) -> tuple[dict, float]:
     parsed.setdefault("flags", [])
     parsed.setdefault("description", "")
     parsed.setdefault("reason", "")
-    return parsed, elapsed
+    return parsed, elapsed, used_network
