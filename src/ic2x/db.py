@@ -1,21 +1,45 @@
 """
 All SQLite access lives here. Nothing else touches the DB directly.
+
+Two tables drive the bot:
+  • asset_index — one row per still-image iCloud asset (synced from metadata).
+    `seen` is the single source of truth for "the bot has already decided on
+    this asset" (winner, loser, screenshot, or error) — it is what stops a
+    burst from ever being re-assembled. `attempts` is the poison-burst breaker.
+  • images — detailed record for assets that reached the judge as a winner
+    candidate (keyed by sha256, since only winners are downloaded full-res).
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from ic2x.status import Status
 
 
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS asset_index (
+    asset_id      TEXT PRIMARY KEY,
+    created       TEXT NOT NULL,          -- ISO8601 UTC capture date
+    filename      TEXT,
+    is_screenshot INTEGER DEFAULT 0,
+    is_live       INTEGER DEFAULT 0,
+    seen          INTEGER DEFAULT 0,      -- 1 once the bot has decided on it
+    attempts      INTEGER DEFAULT 0,      -- pre-commit failures (poison-burst breaker)
+    width         INTEGER,
+    height        INTEGER,
+    indexed_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_asset_created ON asset_index(created);
+CREATE INDEX IF NOT EXISTS idx_asset_seen ON asset_index(seen);
+
 CREATE TABLE IF NOT EXISTS images (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset_id        TEXT,
     sha256          TEXT UNIQUE NOT NULL,
     phash           TEXT,
     source_filename TEXT,
@@ -26,14 +50,15 @@ CREATE TABLE IF NOT EXISTS images (
     quality_raw     TEXT,
     caption         TEXT,
     tweet_id        TEXT,
+    post_attempts   INTEGER DEFAULT 0,
     processed_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     posted_at       TIMESTAMP
 );
+CREATE INDEX IF NOT EXISTS idx_images_asset ON images(asset_id);
 
 CREATE TABLE IF NOT EXISTS run_stats (
     date            TEXT PRIMARY KEY,
     ai_calls        INTEGER DEFAULT 0,
-    images_pulled   INTEGER DEFAULT 0,
     images_posted   INTEGER DEFAULT 0
 );
 
@@ -49,52 +74,130 @@ class DB:
         self._path = str(path)
         self._conn = sqlite3.connect(self._path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
-        # One-time migration: rename legacy gemini_calls column to ai_calls.
-        # OperationalError covers both expected cases (table doesn't exist on
-        # fresh DBs; column already renamed on migrated ones). Anything else
-        # — disk-full, locked DB, corruption — must surface, not be swallowed.
-        try:
-            self._conn.execute(
-                "ALTER TABLE run_stats RENAME COLUMN gemini_calls TO ai_calls"
-            )
-            self._conn.commit()
-        except sqlite3.OperationalError:
-            pass
+        self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
 
     def close(self) -> None:
         self._conn.close()
 
-    # ── Image lookups ─────────────────────────────────────────────────────────
+    # ── Asset index (synced from iCloud metadata) ──────────────────────────────
+
+    def upsert_asset(
+        self, asset_id: str, created: datetime | str, filename: str,
+        *, is_live: bool = False, width: int | None = None, height: int | None = None,
+    ) -> bool:
+        """Insert a still-image asset if new. Returns True if it was new.
+        Immutable fields (created/filename/dims) are not overwritten on resync."""
+        created_iso = created.isoformat() if isinstance(created, datetime) else str(created)
+        cur = self._conn.execute(
+            "INSERT OR IGNORE INTO asset_index "
+            "(asset_id, created, filename, is_live, width, height) VALUES (?, ?, ?, ?, ?, ?)",
+            (asset_id, created_iso, filename, int(is_live), width, height),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def asset_indexed(self, asset_id: str) -> bool:
+        return self._conn.execute(
+            "SELECT 1 FROM asset_index WHERE asset_id = ?", (asset_id,)
+        ).fetchone() is not None
+
+    def asset_index_count(self) -> int:
+        return self._conn.execute("SELECT COUNT(*) FROM asset_index").fetchone()[0]
+
+    def mark_screenshots(self, asset_ids: Sequence[str]) -> int:
+        """Flag the given asset_ids as screenshots (Apple's Screenshots album)."""
+        if not asset_ids:
+            return 0
+        ph = ",".join("?" * len(asset_ids))
+        cur = self._conn.execute(
+            f"UPDATE asset_index SET is_screenshot = 1 WHERE asset_id IN ({ph})",
+            list(asset_ids),
+        )
+        self._conn.commit()
+        return cur.rowcount
+
+    def next_unseen_assets(self, limit: int) -> list[sqlite3.Row]:
+        """The newest `limit` not-yet-decided assets, newest capture first.
+        Drives 'prefer new, else walk back' purely via the `seen` flag."""
+        return self._conn.execute(
+            "SELECT * FROM asset_index WHERE seen = 0 ORDER BY created DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+
+    def has_unseen_assets(self) -> bool:
+        return self._conn.execute(
+            "SELECT 1 FROM asset_index WHERE seen = 0 LIMIT 1"
+        ).fetchone() is not None
+
+    def incr_asset_attempts(self, asset_id: str) -> int:
+        """Bump and return the pre-commit attempt count for a burst-head asset."""
+        self._conn.execute(
+            "UPDATE asset_index SET attempts = attempts + 1 WHERE asset_id = ?", (asset_id,)
+        )
+        self._conn.commit()
+        row = self._conn.execute(
+            "SELECT attempts FROM asset_index WHERE asset_id = ?", (asset_id,)
+        ).fetchone()
+        return row["attempts"] if row else 0
+
+    # ── Burst commit (atomic) ──────────────────────────────────────────────────
+
+    def commit_burst(
+        self, seen_asset_ids: Sequence[str], winner: dict[str, Any] | None = None
+    ) -> None:
+        """Atomically mark every burst member decided, and (optionally) insert the
+        winner's images row. A crash before this leaves zero state → the identical
+        burst re-assembles cleanly; a crash after → flush_pending finishes the post.
+
+        winner keys: asset_id, sha256, phash, filename, status (Status|str),
+        caption, reject_stage, reject_reason.
+        """
+        try:
+            self._conn.execute("BEGIN")
+            if seen_asset_ids:
+                ph = ",".join("?" * len(seen_asset_ids))
+                self._conn.execute(
+                    f"UPDATE asset_index SET seen = 1 WHERE asset_id IN ({ph})",
+                    list(seen_asset_ids),
+                )
+            if winner is not None:
+                status = winner["status"]
+                status_value = status.value if isinstance(status, Status) else status
+                reason = winner.get("reject_reason")
+                if isinstance(reason, (dict, list)):
+                    reason = json.dumps(reason)
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO images "
+                    "(asset_id, sha256, phash, source_filename, status, caption, "
+                    " reject_stage, reject_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        winner.get("asset_id"), winner["sha256"], winner.get("phash"),
+                        winner.get("filename"), status_value, winner.get("caption"),
+                        winner.get("reject_stage"), reason,
+                    ),
+                )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    # ── Image lookups / dedup ──────────────────────────────────────────────────
 
     def seen_sha256(self, sha256: str) -> bool:
-        row = self._conn.execute(
+        return self._conn.execute(
             "SELECT 1 FROM images WHERE sha256 = ?", (sha256,)
+        ).fetchone() is not None
+
+    def get_image_by_sha(self, sha256: str) -> sqlite3.Row | None:
+        return self._conn.execute(
+            "SELECT * FROM images WHERE sha256 = ?", (sha256,)
         ).fetchone()
-        return row is not None
-
-    def filenames_processed(self, filenames: set[str]) -> set[str]:
-        """Return the subset of filenames that already have a completed DB record.
-
-        'Completed' means status beyond `Status.SEEN` (queued, approved, posted,
-        rejected). Used by pull.py to skip already-processed files before any
-        pipeline step.
-        """
-        if not filenames:
-            return set()
-        placeholders = ",".join("?" * len(filenames))
-        rows = self._conn.execute(
-            f"SELECT source_filename FROM images "
-            f"WHERE source_filename IN ({placeholders}) AND status != ?",
-            list(filenames) + [Status.SEEN.value],
-        ).fetchall()
-        return {row["source_filename"] for row in rows}
 
     def seen_phash_similar(self, phash: str, threshold: int) -> bool:
-        # Note: O(N) full table scan + Python-side Hamming compare per call,
-        # so a `run` over K new images is O(K·N). Currently fine; will need a
-        # bk-tree (or precomputed buckets) past a few thousand kept rows.
+        """True if any non-rejected kept image is within Hamming `threshold`.
+        O(N) scan; fine for the modest number of kept/posted rows this bot makes."""
         import imagehash
         target = imagehash.hex_to_hash(phash)
         rows = self._conn.execute(
@@ -103,30 +206,19 @@ class DB:
         ).fetchall()
         for row in rows:
             try:
-                candidate = imagehash.hex_to_hash(row["phash"])
-                if (target - candidate) <= threshold:
+                if (target - imagehash.hex_to_hash(row["phash"])) <= threshold:
                     return True
             except Exception:
                 continue
         return False
 
-    def insert_seen(self, sha256: str, phash: str, filename: str) -> int:
-        cur = self._conn.execute(
-            "INSERT OR IGNORE INTO images (sha256, phash, source_filename, status) "
-            "VALUES (?, ?, ?, ?)",
-            (sha256, phash, filename, Status.SEEN.value),
-        )
-        self._conn.commit()
-        return cur.lastrowid
-
     def set_status(self, sha256: str, status: Status | str, **kwargs: Any) -> None:
         status_value = status.value if isinstance(status, Status) else status
         allowed = {
             "reject_stage", "reject_reason", "safety_raw", "quality_raw",
-            "caption", "tweet_id", "posted_at", "phash",
+            "caption", "tweet_id", "posted_at", "phash", "asset_id", "post_attempts",
         }
         updates = {k: v for k, v in kwargs.items() if k in allowed}
-        # Serialise dicts/lists to JSON
         for k, v in updates.items():
             if isinstance(v, (dict, list)):
                 updates[k] = json.dumps(v)
@@ -140,18 +232,28 @@ class DB:
             )
         else:
             self._conn.execute(
-                "UPDATE images SET status = ? WHERE sha256 = ?",
-                (status_value, sha256),
+                "UPDATE images SET status = ? WHERE sha256 = ?", (status_value, sha256),
             )
         self._conn.commit()
 
+    def incr_post_attempts(self, sha256: str) -> int:
+        self._conn.execute(
+            "UPDATE images SET post_attempts = post_attempts + 1 WHERE sha256 = ?", (sha256,)
+        )
+        self._conn.commit()
+        row = self._conn.execute(
+            "SELECT post_attempts FROM images WHERE sha256 = ?", (sha256,)
+        ).fetchone()
+        return row["post_attempts"] if row else 0
+
+    # ── Posting recovery ───────────────────────────────────────────────────────
+
     def get_stuck_posting(self) -> list[sqlite3.Row]:
         return self._conn.execute(
-            "SELECT * FROM images WHERE status = ?", (Status.POSTING.value,),
+            "SELECT * FROM images WHERE status = ?", (Status.POSTING.value,)
         ).fetchall()
 
     def reset_stuck_posting(self) -> int:
-        """Reset all rows stuck in `posting` back to `approved`. Returns count updated."""
         cur = self._conn.execute(
             "UPDATE images SET status = ? WHERE status = ?",
             (Status.APPROVED.value, Status.POSTING.value),
@@ -161,37 +263,19 @@ class DB:
 
     def get_approved(self) -> list[sqlite3.Row]:
         return self._conn.execute(
-            "SELECT * FROM images WHERE status = ?", (Status.APPROVED.value,),
+            "SELECT * FROM images WHERE status = ? ORDER BY id ASC", (Status.APPROVED.value,)
         ).fetchall()
 
-    def get_pending(self) -> list[sqlite3.Row]:
-        """Return all queued and approved rows — images that could still be posted."""
-        return self._conn.execute(
-            "SELECT * FROM images WHERE status IN (?, ?)",
-            (Status.QUEUED.value, Status.APPROVED.value),
-        ).fetchall()
-
-    def get_sha_for_phash(self, phash: str) -> str | None:
-        """Look up the most recent image SHA-256 for a given pHash."""
-        row = self._conn.execute(
-            "SELECT sha256 FROM images WHERE phash = ? ORDER BY id DESC LIMIT 1",
-            (phash,),
-        ).fetchone()
-        return row["sha256"] if row else None
-
-    # ── AI call budget ────────────────────────────────────────────────────────
+    # ── AI call budget + post cap ──────────────────────────────────────────────
 
     def _today(self) -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     def _ensure_today_stats(self) -> None:
-        self._conn.execute(
-            "INSERT OR IGNORE INTO run_stats (date) VALUES (?)", (self._today(),)
-        )
+        self._conn.execute("INSERT OR IGNORE INTO run_stats (date) VALUES (?)", (self._today(),))
         self._conn.commit()
 
     def check_daily_ai_limit(self, limit: int) -> bool:
-        """Return True if the daily AI call limit has been reached."""
         self._ensure_today_stats()
         row = self._conn.execute(
             "SELECT ai_calls FROM run_stats WHERE date = ?", (self._today(),)
@@ -201,16 +285,7 @@ class DB:
     def increment_ai_calls(self, n: int = 1) -> None:
         self._ensure_today_stats()
         self._conn.execute(
-            "UPDATE run_stats SET ai_calls = ai_calls + ? WHERE date = ?",
-            (n, self._today()),
-        )
-        self._conn.commit()
-
-    def increment_images_pulled(self, n: int = 1) -> None:
-        self._ensure_today_stats()
-        self._conn.execute(
-            "UPDATE run_stats SET images_pulled = images_pulled + ? WHERE date = ?",
-            (n, self._today()),
+            "UPDATE run_stats SET ai_calls = ai_calls + ? WHERE date = ?", (n, self._today())
         )
         self._conn.commit()
 
@@ -222,96 +297,60 @@ class DB:
         )
         self._conn.commit()
 
-    # ── Run state ─────────────────────────────────────────────────────────────
-
-    def get_last_asset_date(self) -> datetime | None:
+    def count_posts_rolling_24h(self) -> int:
+        """Posts in the last 24h — a timezone-stable cap (the prod box is UTC+8)."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
         row = self._conn.execute(
-            "SELECT value FROM run_state WHERE key = 'last_asset_date'"
+            "SELECT COUNT(*) FROM images WHERE status = ? AND posted_at >= ?",
+            (Status.POSTED.value, cutoff),
         ).fetchone()
-        if not row or not row["value"]:
-            return None
-        try:
-            return datetime.fromisoformat(row["value"])
-        except ValueError:
-            return None
+        return row[0] if row else 0
 
-    def set_last_asset_date(self, dt: datetime) -> None:
+    # ── Run state (generic key/value) ──────────────────────────────────────────
+
+    def get_state(self, key: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT value FROM run_state WHERE key = ?", (key,)
+        ).fetchone()
+        return row["value"] if row and row["value"] is not None else None
+
+    def set_state(self, key: str, value: str) -> None:
         self._conn.execute(
-            "INSERT OR REPLACE INTO run_state (key, value) VALUES ('last_asset_date', ?)",
-            (dt.isoformat(),),
+            "INSERT OR REPLACE INTO run_state (key, value) VALUES (?, ?)", (key, value)
         )
         self._conn.commit()
 
     def get_last_posted_at(self) -> datetime | None:
-        row = self._conn.execute(
-            "SELECT value FROM run_state WHERE key = 'last_posted_at'"
-        ).fetchone()
-        if not row or not row["value"]:
+        raw = self.get_state("last_posted_at")
+        if not raw:
             return None
         try:
-            return datetime.fromisoformat(row["value"])
+            return datetime.fromisoformat(raw)
         except ValueError:
             return None
 
     def set_last_posted_at(self, dt: datetime) -> None:
-        self._conn.execute(
-            "INSERT OR REPLACE INTO run_state (key, value) VALUES ('last_posted_at', ?)",
-            (dt.isoformat(),),
-        )
-        self._conn.commit()
+        self.set_state("last_posted_at", dt.isoformat())
 
-    def get_lookback_depth(self) -> int:
-        row = self._conn.execute(
-            "SELECT value FROM run_state WHERE key = 'icloud_lookback_depth'"
-        ).fetchone()
-        if not row or not row["value"]:
-            return 0
-        try:
-            return int(row["value"])
-        except (ValueError, TypeError):
-            return 0
-
-    def set_lookback_depth(self, n: int) -> None:
-        self._conn.execute(
-            "INSERT OR REPLACE INTO run_state (key, value) VALUES ('icloud_lookback_depth', ?)",
-            (str(n),),
-        )
-        self._conn.commit()
-
-    # ── Clean pipeline ────────────────────────────────────────────────────────
+    # ── Clean ──────────────────────────────────────────────────────────────────
 
     _CLEANABLE_STATUSES = (Status.QUEUED, Status.APPROVED, Status.SEEN)
-
-    def get_cleanable_filenames(self) -> list[str]:
-        placeholders = ",".join("?" * len(self._CLEANABLE_STATUSES))
-        rows = self._conn.execute(
-            f"SELECT source_filename FROM images WHERE status IN ({placeholders})",
-            [s.value for s in self._CLEANABLE_STATUSES],
-        ).fetchall()
-        return [r["source_filename"] for r in rows if r["source_filename"]]
 
     def get_cleanable_counts(self) -> dict[str, int]:
         result: dict[str, int] = {}
         for status in self._CLEANABLE_STATUSES:
             row = self._conn.execute(
-                "SELECT COUNT(*) FROM images WHERE status = ?", (status.value,),
+                "SELECT COUNT(*) FROM images WHERE status = ?", (status.value,)
             ).fetchone()
             result[status.value] = row[0]
         return result
 
     def clean_pipeline(self) -> int:
-        """Delete all non-posted image records. Returns count deleted."""
-        placeholders = ",".join("?" * len(self._CLEANABLE_STATUSES))
+        """Delete non-posted image records (keeps posted history). Returns count."""
+        ph = ",".join("?" * len(self._CLEANABLE_STATUSES))
         cur = self._conn.execute(
-            f"DELETE FROM images WHERE status IN ({placeholders})",
+            f"DELETE FROM images WHERE status IN ({ph})",
             [s.value for s in self._CLEANABLE_STATUSES],
         )
         self._conn.commit()
         return cur.rowcount
-
-    # ── Image lookup by SHA ───────────────────────────────────────────────────
-
-    def get_image_by_sha(self, sha256: str) -> "sqlite3.Row | None":
-        return self._conn.execute(
-            "SELECT * FROM images WHERE sha256 = ?", (sha256,)
-        ).fetchone()

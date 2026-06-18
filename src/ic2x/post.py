@@ -1,23 +1,14 @@
 """
-Post approved images to X (Twitter).
+Post an approved image to X (Twitter).
 
-Uses tweepy v1.1 API for media upload (v2 doesn't support it) and
-tweepy v2 Client for tweet creation.
+tweepy v1.1 uploads the media (v2 can't); tweepy v2 creates the tweet.
 
-Ported from XBot-3/nodes/publish.py, adapted for photos instead of video.
+Idempotency: db.set_status(sha, "posting") is written BEFORE create_tweet and
+"posted" after. A row stuck in "posting" means the process died between the two
+writes — the bot's reset_stuck_posting() recovers it to "approved" at cycle start.
 
-Idempotency pattern:
-  db.set_status(sha256, "posting")     # written BEFORE the API call
-  create_tweet(...)
-  db.set_status(sha256, "posted", ...) # written AFTER the API call
-
-Any row stuck in "posting" on startup means the process was killed between
-these two writes — run.py checks for this and exits with a warning.
-
-Multi-image posts:
-  When GROUP_HAMMING_THRESHOLD > 0, approved images whose pHash Hamming
-  distance is ≤ the threshold are bundled into a single tweet (up to 4 images).
-  All members are set to "posting" before the tweet and "posted" after.
+In X_DRY_RUN the state machine still advances (image → posted, tweet_id="DRYRUN",
+last_posted_at set) so a burn-in exercises the full loop without a real tweet.
 """
 
 from __future__ import annotations
@@ -29,8 +20,7 @@ from pathlib import Path
 
 import tweepy
 
-from ic2x.config import Config, load_config, ensure_dirs
-from ic2x.group import cluster_by_phash
+from ic2x.config import Config
 from ic2x.db import DB
 from ic2x.status import Status
 from ic2x.utils import ui
@@ -56,123 +46,11 @@ def _build_clients(cfg: Config):
     return api_v1, client_v2
 
 
-def _group_approved(approved: list, threshold: int) -> list[list]:
-    return cluster_by_phash(approved, threshold)
-
-
-def post() -> None:
-    cfg = load_config()
-    ensure_dirs(cfg)
-
-    from ic2x.utils.logging_setup import setup_logging
-    setup_logging(cfg.logs_dir)
-
-    db = DB(cfg.db_path)
-    approved = db.get_approved()
-
-    if not approved:
-        ui.info("No approved images to post.")
-        db.close()
-        return
-
-    groups = _group_approved(approved, cfg.group_hamming_threshold)
-    ui.post_section_banner(len(approved), cfg.x_dry_run)
-
-    if not cfg.x_dry_run:
-        api_v1, client_v2 = _build_clients(cfg)
-    else:
-        api_v1 = client_v2 = None
-
-    posted_count = 0
-
-    for group in groups:
-        if len(group) == 1:
-            # ── Single-image path (unchanged) ────────────────────────────────
-            row      = group[0]
-            sha256   = row["sha256"]
-            phash    = row["phash"] or ""
-            caption  = row["caption"] or ""
-            filename = phash + ".jpg"
-            img_path = cfg.approved_dir / filename
-
-            if not img_path.exists():
-                ui.warn(f"Approved file not found on disk: {filename} — skipping")
-                continue
-
-            ui.post_banner(filename, caption, cfg.x_dry_run)
-
-            if cfg.x_dry_run:
-                ui.post_dry(filename, caption)
-                posted_count += 1
-                continue
-
-            _post_succeeded = False
-            try:
-                tweet_id, tweet_url = _post_image(
-                    img_path, caption, sha256, db, cfg, api_v1, client_v2
-                )
-                _post_succeeded = True
-                ui.post_ok(tweet_url)
-                shutil.move(str(img_path), cfg.posted_dir / filename)
-                json_src = cfg.approved_dir / (phash + ".json")
-                if json_src.exists():
-                    shutil.move(str(json_src), cfg.posted_dir / json_src.name)
-                db.increment_images_posted()
-                posted_count += 1
-            except Exception as exc:
-                logger.error("Failed to post %s: %s", filename, exc, exc_info=True)
-                ui.err(f"Failed to post {filename}: {exc}")
-            finally:
-                if not _post_succeeded:
-                    db.set_status(sha256, Status.APPROVED)
-                    ui.info("Status reset to 'approved' — will retry on next `ic2x post`.")
-
-        else:
-            # ── Multi-image path ─────────────────────────────────────────────
-            shas      = [r["sha256"] for r in group]
-            caption   = group[0]["caption"] or ""
-            filenames = [(r["phash"] or "") + ".jpg" for r in group]
-            img_paths = [cfg.approved_dir / fn for fn in filenames]
-
-            missing = [p.name for p in img_paths if not p.exists()]
-            if missing:
-                ui.warn(f"Group missing file(s) on disk: {missing} — skipping group")
-                continue
-
-            ui.post_banner(f"{len(group)} images", caption, cfg.x_dry_run)
-
-            if cfg.x_dry_run:
-                for fn in filenames:
-                    ui.post_dry(fn, caption)
-                posted_count += len(group)
-                continue
-
-            _post_succeeded = False
-            try:
-                tweet_id, tweet_url = _post_group(
-                    img_paths, caption, shas, db, api_v1, client_v2
-                )
-                _post_succeeded = True
-                ui.post_ok(tweet_url)
-                for member, img_path in zip(group, img_paths):
-                    phash = member["phash"] or ""
-                    shutil.move(str(img_path), cfg.posted_dir / img_path.name)
-                    json_src = cfg.approved_dir / (phash + ".json")
-                    if json_src.exists():
-                        shutil.move(str(json_src), cfg.posted_dir / json_src.name)
-                    db.increment_images_posted()
-                posted_count += len(group)
-            except Exception as exc:
-                logger.error("Failed to post group %s: %s", filenames, exc, exc_info=True)
-                ui.err(f"Failed to post group: {exc}")
-            finally:
-                if not _post_succeeded:
-                    for sha in shas:
-                        db.set_status(sha, Status.APPROVED)
-                    ui.info("Group status reset to 'approved' — will retry on next `ic2x post`.")
-
-    ui.post_summary(posted_count, cfg.x_dry_run)
-    db.close()
+def make_clients(cfg: Config):
+    """Return (api_v1, client_v2), or (None, None) in dry-run."""
+    if cfg.x_dry_run:
+        return None, None
+    return _build_clients(cfg)
 
 
 @with_retry(max_attempts=4, base_delay=10.0, backoff=2.0, label="upload_image")
@@ -186,54 +64,68 @@ def _upload_image(api_v1, path: Path) -> int:
 @with_retry(max_attempts=6, base_delay=15.0, backoff=2.0, label="create_tweet")
 def _create_tweet_api(client_v2, text: str, media_ids: list[int]) -> tuple[str, str]:
     response = client_v2.create_tweet(text=text, media_ids=media_ids)
-    tweet_id  = str(response.data["id"])
+    tweet_id = str(response.data["id"])
     tweet_url = f"https://x.com/i/web/status/{tweet_id}"
     logger.info("post: tweet posted → %s", tweet_url)
     return tweet_id, tweet_url
 
 
-def _post_image(
-    path: Path,
-    caption: str,
-    sha256: str,
-    db: DB,
-    cfg: Config,
-    api_v1,
-    client_v2,
-) -> tuple[str, str]:
+def _post_image(path: Path, caption: str, sha256: str, db: DB, api_v1, client_v2) -> tuple[str, str]:
     media_id = _upload_image(api_v1, path)
-
-    db.set_status(sha256, Status.POSTING)   # idempotency anchor — written BEFORE tweet
-
+    db.set_status(sha256, Status.POSTING)   # idempotency anchor — BEFORE the tweet
     tweet_id, tweet_url = _create_tweet_api(client_v2, caption, [media_id])
-
     db.set_status(
         sha256, Status.POSTED,
-        tweet_id=tweet_id,
-        posted_at=datetime.now(timezone.utc).isoformat(),
+        tweet_id=tweet_id, posted_at=datetime.now(timezone.utc).isoformat(),
     )
     db.set_last_posted_at(datetime.now(timezone.utc))
     return tweet_id, tweet_url
 
 
-def _post_group(
-    paths: list[Path],
-    caption: str,
-    sha256s: list[str],
-    db: DB,
-    api_v1,
-    client_v2,
-) -> tuple[str, str]:
-    media_ids = [_upload_image(api_v1, p) for p in paths]
+def post_one(row, cfg: Config, db: DB, api_v1, client_v2) -> bool:
+    """Post one APPROVED row (file at approved_dir/{phash}.jpg). Returns True on
+    success. On failure: bumps post_attempts; once >= cfg.post_max_attempts marks
+    REJECTED(post_failed), else resets to APPROVED for the next flush."""
+    sha256 = row["sha256"]
+    phash = row["phash"] or ""
+    caption = row["caption"] or ""
+    filename = f"{phash}.jpg"
+    img_path = cfg.approved_dir / filename
 
-    # Idempotency anchor: mark ALL group members before the tweet
-    for sha in sha256s:
-        db.set_status(sha, Status.POSTING)
+    if not img_path.exists():
+        logger.warning("post_one: approved file missing on disk: %s", filename)
+        db.set_status(sha256, Status.REJECTED, reject_stage="post_failed",
+                      reject_reason="approved file missing on disk")
+        return False
 
-    tweet_id, tweet_url = _create_tweet_api(client_v2, caption, media_ids)
+    try:
+        if cfg.x_dry_run:
+            ui.post_dry(filename, caption)
+            db.set_status(
+                sha256, Status.POSTED, tweet_id="DRYRUN", caption=caption,
+                posted_at=datetime.now(timezone.utc).isoformat(),
+            )
+            db.set_last_posted_at(datetime.now(timezone.utc))
+        else:
+            _, tweet_url = _post_image(img_path, caption, sha256, db, api_v1, client_v2)
+            ui.post_ok(tweet_url)
 
-    posted_at = datetime.now(timezone.utc).isoformat()
-    for sha in sha256s:
-        db.set_status(sha, Status.POSTED, tweet_id=tweet_id, posted_at=posted_at)
-    db.set_last_posted_at(datetime.now(timezone.utc))
-    return tweet_id, tweet_url
+        dest = cfg.posted_dir / filename
+        try:
+            shutil.move(str(img_path), str(dest))
+        except Exception as exc:  # noqa: BLE001 — file housekeeping, not fatal
+            logger.warning("post_one: could not move %s to posted/: %s", filename, exc)
+        db.increment_images_posted()
+        return True
+
+    except Exception as exc:  # noqa: BLE001
+        logger.error("post_one: failed to post %s: %s", filename, exc, exc_info=True)
+        attempts = db.incr_post_attempts(sha256)
+        if attempts >= cfg.post_max_attempts:
+            db.set_status(sha256, Status.REJECTED, reject_stage="post_failed",
+                          reject_reason=str(exc)[:200])
+            ui.err(f"post failed permanently after {attempts} attempts: {filename}")
+        else:
+            db.set_status(sha256, Status.APPROVED)
+            ui.warn(f"post failed (attempt {attempts}/{cfg.post_max_attempts}): {filename}")
+        return False

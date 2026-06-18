@@ -7,7 +7,8 @@ name = "ic2x"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
-  "icloudpd",
+  "pyicloud==2.6.5",   # pinned: reverse-engineered, can break on Apple changes
+  "requests>=2.32",
   "pillow",
   "pillow-heif",
   "imagehash",

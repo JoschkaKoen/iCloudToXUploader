@@ -25,7 +25,7 @@ def startup_banner(cfg) -> None:
     judge_str = f"{judge_model} [{judge_effort or 'default'}]"
     rows = [
         ("👤", "iCloud user",   cfg.icloud_username),
-        ("🔢", "Recent count",  str(cfg.icloud_recent_count)),
+        ("⏱", "Post interval", f"{cfg.post_interval_hours}h"),
         ("🤖", "Judge model",   judge_str),
         ("✨", "Enhance",       enhance),
         ("🐦", "Dry run",       dry),

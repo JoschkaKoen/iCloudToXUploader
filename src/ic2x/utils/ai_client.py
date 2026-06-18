@@ -718,6 +718,121 @@ def call_vision_judge(
         return call.fail_value, _elapsed(), False, used_network
 
 
+@dataclass
+class MultiJudgeCall:
+    image_paths: list[Path]
+    prompt: str
+    max_px: int | None
+    fail_value: dict
+    refused_value: dict | None = None
+    label: str = "burst_judge"
+
+
+def call_vision_judge_multi(
+    *,
+    model_string: str,
+    ollama_base_url: str,
+    call: MultiJudgeCall,
+) -> tuple[dict, float, bool, bool]:
+    """Like call_vision_judge but sends N images in ONE call, each labeled
+    'Image index i:'. Returns (result_dict, elapsed_seconds, ok, used_network).
+
+    One VLM call for the whole burst keeps the per-cycle cost low. Cloud
+    providers only (the bot defaults to gemini/qwen); Ollama is unsupported here.
+    """
+    from ic2x.utils.image_utils import encode_image_b64
+
+    t0 = time.monotonic()
+    refused = call.refused_value if call.refused_value is not None else call.fail_value
+    used_network = False
+    rep = call.image_paths[0] if call.image_paths else Path("burst")
+
+    def _elapsed() -> float:
+        return time.monotonic() - t0
+
+    if not call.image_paths:
+        return call.fail_value, _elapsed(), False, False
+
+    try:
+        result = make_ai_client(model_string, ollama_base_url=ollama_base_url)
+        if result is None:
+            detail = why_no_ai_client(model_string) or "check API key / model id"
+            logger.warning("%s: no AI client — %s", call.label, detail)
+            return call.fail_value, _elapsed(), False, False
+
+        client, model, provider, effort = result
+        if provider == "ollama":
+            logger.warning("%s: multi-image burst judge requires a cloud model, got %s",
+                           call.label, model)
+            return call.fail_value, _elapsed(), False, False
+
+        use_stream, extra_kwargs = build_thinking_kwargs(provider, effort)
+        b64s = [encode_image_b64(p, max_px=call.max_px) for p in call.image_paths]
+
+        cache_on = response_cache_enabled()
+        ckey: str | None = None
+        if cache_on:
+            ckey = vision_cache_key(
+                model=model, user_prompt=call.prompt, image_b64="||".join(b64s)
+            )
+            hit = cache_get(ckey)
+            if hit and isinstance(hit.get("response"), str):
+                parsed = parse_json_safe(hit["response"])
+                if parsed is not None:
+                    return parsed, _elapsed(), True, False
+
+        content: list[dict] = [{"type": "text", "text": call.prompt}]
+        for i, b64 in enumerate(b64s):
+            content.append({"type": "text", "text": f"Image index {i}:"})
+            content.append({"type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+        messages = [{"role": "user", "content": content}]
+
+        audit_path = None
+        log_base = audit_base_path()
+        if log_base is not None:
+            audit_path = build_audit_prompt_path(log_base, rep, call.label, model)
+            save_prompt(audit_path, model=model, messages=messages)
+
+        used_network = True
+
+        def _cloud_once() -> str:
+            if use_stream:
+                stream = client.chat.completions.create(
+                    model=model, messages=messages, stream=True, **extra_kwargs
+                )
+                return collect_streamed_response(stream)
+            resp = client.chat.completions.create(
+                model=model, messages=messages, stream=False,
+                response_format={"type": "json_object"}, **extra_kwargs,
+            )
+            if resp.choices[0].finish_reason == "content_filter":
+                raise ContentFilterRefusal("content_filter")
+            return resp.choices[0].message.content or ""
+
+        raw = retry_api_call(_cloud_once, label=f"{call.label}:chat")
+        save_response(audit_path, raw)
+
+        parsed = parse_json_safe(raw)
+        if parsed is None:
+            excerpt = raw[:240].replace("\n", " ") + ("…" if len(raw) > 240 else "")
+            logger.warning("%s: JSON parse failed (%d imgs) — %s",
+                           call.label, len(b64s), excerpt)
+            return call.fail_value, _elapsed(), False, used_network
+
+        if cache_on and ckey is not None and used_network:
+            cache_put(ckey, model=model, response=raw)
+
+        return parsed, _elapsed(), True, used_network
+
+    except ContentFilterRefusal:
+        logger.info("%s: model refused burst of %d", call.label, len(call.image_paths))
+        return refused, _elapsed(), False, used_network
+    except Exception as exc:
+        logger.warning("%s: error on burst of %d: %s", call.label, len(call.image_paths), exc)
+        return call.fail_value, _elapsed(), False, used_network
+
+
 __all__ = [
     "JudgeCall",
     "build_thinking_kwargs",

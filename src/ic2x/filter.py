@@ -1,14 +1,14 @@
 """
-Screenshot detection filter.
+Screenshot / non-camera detection filter.
 
-Format filtering is intentionally omitted: icloudpd with --skip-videos only
-delivers photos, and any PIL open failure (e.g. RAW files) is caught by the
-per-file try/except in run.py.
+Secondary screenshot gate, run on the winner's full-res ORIGINAL (the primary
+gate is Apple's Screenshots smart-album membership, applied to thumbnails during
+burst assembly). The original retains the camera's Make/Model EXIF; screenshots
+and images saved from other apps never have these tags, so their absence rejects
+a file as non-camera.
 
-Every real photo pulled from iCloud carries Make/Model EXIF written by the
-camera.  Screenshots and images saved from other apps never have these tags.
-Absence of Make/Model EXIF is therefore sufficient to reject an image as a
-non-camera file — no resolution allowlist needed.
+Fail-closed: because this guards an autonomous public post, any inspection error
+is treated as "reject" rather than waved through.
 """
 
 from __future__ import annotations
@@ -39,5 +39,5 @@ def is_screenshot(path: Path) -> tuple[bool, str]:
             return False, ""
         return True, "no camera EXIF (Make/Model absent)"
     except Exception as exc:
-        logger.debug("filter: could not inspect %s: %s", path.name, exc)
-        return False, ""
+        logger.warning("filter: could not inspect %s: %s — rejecting (fail-closed)", path.name, exc)
+        return True, f"exif inspection failed: {exc}"

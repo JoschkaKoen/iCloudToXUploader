@@ -21,20 +21,9 @@ from ic2x.utils.ai_client import (
 
 logger = logging.getLogger("ic2x.judge_safety_quality")
 
-JUDGE_PROMPT = """You are a content reviewer for a personal photo account on X (Twitter).
-Analyze this image and return ONLY valid JSON — no markdown, no explanation.
-
-Schema:
-{
-  "safe": bool,
-  "flags": [],
-  "interesting": bool,
-  "description": "one factual sentence about what is shown",
-  "caption": "casual tweet caption, ≤100 chars, no hashtags",
-  "reason": "brief explanation of the quality decision"
-}
-
-── SAFETY ─────────────────────────────────────────────────────────────────────────────
+# Shared criteria — imported by judge_burst.py so single- and multi-image
+# judging apply identical safety/quality rules. Keep these the single source.
+SAFETY_BLOCK = """── SAFETY ─────────────────────────────────────────────────────────────────────────────
 Flag any that apply (include the string in the "flags" array):
 - "nudity_sexual"    — nudity, underwear-only, sexualized content, sexual acts
 - "minor_primary"    — person appearing under 18 is the primary subject
@@ -46,10 +35,9 @@ Flag any that apply (include the string in the "flags" array):
 - "privacy_closeup"  — single unrecognised individual, close-up, clearly invasive
 - "obscene_other"    — anything grossly offensive not covered above
 
-Set "safe": false if any flag applies. Be strict — when in doubt, flag.
-If safe=false: set interesting=false, description="", caption="", reason="unsafe".
+Set "safe": false if any flag applies. Be strict — when in doubt, flag."""
 
-── QUALITY (only if safe=true) ───────────────────────────────────────────────────────────────────────────
+QUALITY_BLOCK = """── QUALITY (only if safe=true) ───────────────────────────────────────────────────────────────────────────
 Would this image be worth posting on a personal photo account on X?
 
 Accept: interesting composition, travel scenes with character, striking light
@@ -63,7 +51,25 @@ Reject as NOT interesting:
 - food photos with no distinctive context
 - duplicates of extremely common scenes (generic latte art, standard sunset)
 - screenshots or screencasts
-- nothing visually engaging after 2 seconds of looking
+- nothing visually engaging after 2 seconds of looking"""
+
+JUDGE_PROMPT = f"""You are a content reviewer for a personal photo account on X (Twitter).
+Analyze this image and return ONLY valid JSON — no markdown, no explanation.
+
+Schema:
+{{
+  "safe": bool,
+  "flags": [],
+  "interesting": bool,
+  "description": "one factual sentence about what is shown",
+  "caption": "casual tweet caption, ≤100 chars, no hashtags",
+  "reason": "brief explanation of the quality decision"
+}}
+
+{SAFETY_BLOCK}
+If safe=false: set interesting=false, description="", caption="", reason="unsafe".
+
+{QUALITY_BLOCK}
 
 JSON only."""
 
