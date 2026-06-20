@@ -138,11 +138,22 @@ class ICloudPhotos:
         except Exception as exc:  # noqa: BLE001
             raise _classify(exc) from exc
 
+    def _recent_album(self) -> Any:
+        """Album iterating newest-ADDED first (genuinely new photos, taken or
+        imported, sort first — unlike `.all`, which yields oldest capture date).
+        Falls back to `.all` if the library accessor is unavailable."""
+        photos = self._photos
+        lib = getattr(photos, "_root_library", None)
+        if lib is not None and hasattr(lib, "recently_added"):
+            return lib.recently_added()
+        return photos.all
+
     def iter_image_assets(self) -> Iterator[tuple[AssetMeta, Any]]:
-        """Yield (metadata, live PhotoAsset) newest-capture-first, still images only.
-        Videos and movies are excluded by item_type. Metadata-only — no downloads."""
+        """Yield (metadata, live PhotoAsset) newest-ADDED-first, still images only.
+        Videos/movies excluded by item_type. Metadata + a live downloadable asset;
+        the asset is downloaded directly (never re-resolved by id — that hangs)."""
         try:
-            for asset in self._photos.all:
+            for asset in self._recent_album():
                 try:
                     if asset.item_type != "image":
                         continue

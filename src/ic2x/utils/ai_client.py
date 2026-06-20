@@ -262,10 +262,12 @@ def provider_for_model(model: str) -> str:
 
 
 def parse_model_effort(value: str) -> tuple[str, str | None]:
+    """Split "model, effort". effort ∈ {off, low, high} or, for qwen, a digit
+    string = an explicit thinking-token budget (e.g. "qwen3.5-flash, 3000")."""
     if "," in value:
         model_part, effort_part = value.split(",", 1)
         effort = effort_part.strip().lower() or None
-        if effort not in ("off", "low", "high"):
+        if effort is not None and effort not in ("off", "low", "high") and not effort.isdigit():
             effort = None
         return model_part.strip(), effort
     return value.strip(), None
@@ -282,6 +284,9 @@ def build_thinking_kwargs(provider: str, effort: str | None) -> tuple[bool, dict
     if provider == "qwen":
         if effort == "off":
             return False, {"extra_body": {"enable_thinking": False}}
+        if effort and effort.isdigit():
+            # capped reasoning: DashScope caps thinking tokens at thinking_budget
+            return True, {"extra_body": {"enable_thinking": True, "thinking_budget": int(effort)}}
         return True, {"extra_body": {"enable_thinking": True}}
 
     if provider == "kimi":
@@ -535,6 +540,25 @@ def collect_streamed_response(stream: Any) -> str:
     return "".join(parts).strip()
 
 
+def collect_streamed_with_usage(stream: Any) -> tuple[str, dict]:
+    """Like collect_streamed_response but also returns {input, output} token
+    counts from the final usage chunk — for per-call cost attribution when
+    many calls run concurrently and the global accumulator can't separate them."""
+    parts: list[str] = []
+    usage = {"input": 0, "output": 0}
+    for chunk in stream:
+        u = getattr(chunk, "usage", None)
+        if u is not None:
+            usage = {"input": getattr(u, "prompt_tokens", 0) or 0,
+                     "output": getattr(u, "completion_tokens", 0) or 0}
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta
+        if delta.content:
+            parts.append(delta.content)
+    return "".join(parts).strip(), usage
+
+
 def print_streamed_response(
     stream: Any,
     *,
@@ -733,9 +757,14 @@ def call_vision_judge_multi(
     model_string: str,
     ollama_base_url: str,
     call: MultiJudgeCall,
+    usage_out: dict | None = None,
 ) -> tuple[dict, float, bool, bool]:
     """Like call_vision_judge but sends N images in ONE call, each labeled
     'Image index i:'. Returns (result_dict, elapsed_seconds, ok, used_network).
+
+    If usage_out is provided, this call's {input, output} token counts are written
+    into it — lets callers attribute cost per call when running many concurrently
+    (the global accumulator keys by base model name and can't separate them).
 
     One VLM call for the whole burst keeps the per-cycle cost low. Cloud
     providers only (the bot defaults to gemini/qwen); Ollama is unsupported here.
@@ -795,22 +824,31 @@ def call_vision_judge_multi(
             save_prompt(audit_path, model=model, messages=messages)
 
         used_network = True
+        _usage = {"input": 0, "output": 0}
 
         def _cloud_once() -> str:
             if use_stream:
                 stream = client.chat.completions.create(
                     model=model, messages=messages, stream=True, **extra_kwargs
                 )
-                return collect_streamed_response(stream)
+                content, u = collect_streamed_with_usage(stream)
+                _usage.update(u)
+                return content
             resp = client.chat.completions.create(
                 model=model, messages=messages, stream=False,
                 response_format={"type": "json_object"}, **extra_kwargs,
             )
             if resp.choices[0].finish_reason == "content_filter":
                 raise ContentFilterRefusal("content_filter")
+            ru = getattr(resp, "usage", None)
+            if ru is not None:
+                _usage.update(input=getattr(ru, "prompt_tokens", 0) or 0,
+                              output=getattr(ru, "completion_tokens", 0) or 0)
             return resp.choices[0].message.content or ""
 
         raw = retry_api_call(_cloud_once, label=f"{call.label}:chat")
+        if usage_out is not None:
+            usage_out.update(_usage)
         save_response(audit_path, raw)
 
         parsed = parse_json_safe(raw)

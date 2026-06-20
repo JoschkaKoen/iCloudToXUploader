@@ -44,9 +44,12 @@ class Config:
     queue_dir: Path
     approved_dir: Path
     posted_dir: Path
-    rejected_dir: Path
     db_path: Path
     logs_dir: Path
+
+    # Observability
+    keep_reviewed: bool             # save each judged thumbnail to reviewed_dir
+    reviewed_dir: Path              # browseable feed of decisions (named by outcome)
 
     # Proxy
     proxy_http: str
@@ -161,9 +164,12 @@ def load_config() -> Config:
         queue_dir=_resolve(os.getenv("QUEUE_DIR", "./queue")),
         approved_dir=_resolve(os.getenv("APPROVED_DIR", "./approved")),
         posted_dir=_resolve(os.getenv("POSTED_DIR", "./posted")),
-        rejected_dir=_resolve(os.getenv("REJECTED_DIR", "./rejected")),
         db_path=_resolve(os.getenv("DB_PATH", "./state.db")),
         logs_dir=_resolve(os.getenv("LOGS_DIR", "./logs")),
+
+        # Observability
+        keep_reviewed=_bool_env("KEEP_REVIEWED", default=True),
+        reviewed_dir=_resolve(os.getenv("REVIEWED_DIR", "./reviewed")),
 
         # Proxy
         proxy_http=os.getenv("IC2X_HTTP_PROXY", ""),
@@ -220,11 +226,8 @@ def ensure_dirs(cfg: Config) -> None:
         cfg.queue_dir,
         cfg.approved_dir,
         cfg.posted_dir,
-        cfg.rejected_dir / "duplicate",
-        cfg.rejected_dir / "screenshot",
-        cfg.rejected_dir / "safety",
-        cfg.rejected_dir / "quality",
         cfg.logs_dir,
+        cfg.reviewed_dir,
         cfg.icloud_cookie_dir,
     ]
     for d in dirs:

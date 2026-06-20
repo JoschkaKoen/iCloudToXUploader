@@ -54,13 +54,15 @@ def _fail(flag: str) -> dict:
 
 
 def judge_burst(
-    thumb_paths: list[Path], cfg: Config, model_string: str | None = None
+    thumb_paths: list[Path], cfg: Config, model_string: str | None = None,
+    usage_out: dict | None = None,
 ) -> tuple[dict, float, bool]:
     """Run the burst judge over thumb_paths (index order == list order).
 
     Returns (result_dict, elapsed_seconds, used_network). result_dict always has
     best_index (validated into range), safe, flags, interesting, caption (≤100),
-    reason. Fails closed.
+    reason. Fails closed. If usage_out is given, the call's {input, output} token
+    counts are written into it (per-call cost attribution for parallel runs).
     """
     if not thumb_paths:
         return _fail("error:empty"), 0.0, False
@@ -82,6 +84,7 @@ def judge_burst(
             refused_value=_fail("model_refused"),
             label="burst",
         ),
+        usage_out=usage_out,
     )
     if not ok:
         return parsed, elapsed, used_network

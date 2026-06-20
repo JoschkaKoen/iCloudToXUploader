@@ -1,12 +1,12 @@
 """
 Offline correctness tests for burst assembly — no iCloud, no network.
 
-Proves the properties the redesign hinges on: newest-first by capture time, the
-seen-set as single source of truth (no gap-drop across distinct scenes), burst
-grouping by pHash, capped-burst tail consumption, screenshot dropping, and
-undecodable-asset handling.
+Proves: the seen-set stops re-assembly, two distinct scenes are both reachable
+(no gap-drop), pHash grouping, capped-burst tail consumption, screenshot
+dropping, and undecodable-asset handling. The bot now assembles from a live
+(meta, asset) stream, so these drive `assemble_burst` with a fake stream + ic.
 
-Run: .venv/bin/python tests/test_burst.py   (also works under pytest)
+Run: .venv/bin/python tests/test_burst.py
 """
 
 from __future__ import annotations
@@ -14,7 +14,6 @@ from __future__ import annotations
 import shutil
 import sys
 import tempfile
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,58 +21,52 @@ from PIL import Image, ImageDraw
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from ic2x.bot import find_next_burst  # noqa: E402
+from ic2x.bot import _Stream, assemble_burst  # noqa: E402
 from ic2x.db import DB  # noqa: E402
 
 _TMP = Path(tempfile.mkdtemp(prefix="ic2x_burst_test_"))
-_FIXTURES = _TMP / "fixtures"
-_FIXTURES.mkdir(parents=True, exist_ok=True)
+_FIX = _TMP / "fix"; _FIX.mkdir(parents=True, exist_ok=True)
+_DB_SEQ = 0
 
 
 def _make_scene(path: Path, scene: int, variant: int = 0) -> None:
-    """Big distinct shapes per scene → far pHash; a single stray pixel per variant
-    → negligible change → near-identical pHash within a scene."""
     img = Image.new("RGB", (256, 256), "black")
     d = ImageDraw.Draw(img)
     if scene == 0:
-        d.rectangle([0, 0, 128, 256], fill="white")        # left half
+        d.rectangle([0, 0, 128, 256], fill="white")
     elif scene == 1:
-        d.rectangle([0, 0, 256, 128], fill="white")        # top half
+        d.rectangle([0, 0, 256, 128], fill="white")
     elif scene == 2:
-        d.ellipse([48, 48, 208, 208], fill="white")        # centre disc
+        d.ellipse([48, 48, 208, 208], fill="white")
     else:
-        d.rectangle([160, 0, 256, 256], fill="white")      # right strip
+        d.rectangle([160, 0, 256, 256], fill="white")
     if variant:
         d.point([(variant % 256, (variant * 7) % 256)], fill="gray")
     img.save(path, "JPEG", quality=92)
 
 
-class FakeSource:
-    """Maps asset_id → a fixture image. Returns a disposable copy each call so the
-    assembler's _unlink() never destroys the fixture. ids in `dead` → None."""
+class _FakeAsset:
+    def __init__(self, aid: str, path: Path | None) -> None:
+        self.id = aid
+        self._path = path  # None → unavailable/undecodable
 
-    def __init__(self, mapping: dict[str, Path], dead: set[str] | None = None) -> None:
-        self._map = mapping
-        self._dead = dead or set()
-        self._n = 0
 
-    def download_thumb(self, asset_id: str) -> Path | None:
-        if asset_id in self._dead or asset_id not in self._map:
-            return None
-        self._n += 1
-        dst = _TMP / f"thumb_{self._n}.jpg"
-        shutil.copy(self._map[asset_id], dst)
-        return dst
+class FakeIC:
+    """Stands in for ICloudPhotos: download copies the fixture (or raises)."""
 
-    def download_original(self, asset_id: str) -> Path | None:
-        return self._map.get(asset_id)
+    def download(self, asset, version, dest: Path):
+        if asset._path is None:
+            raise RuntimeError("unavailable")
+        shutil.copy(asset._path, dest)
+        return dest
 
 
 def _cfg(max_size: int = 3, ham: int = 8):
-    return SimpleNamespace(burst_max_size=max_size, burst_hamming_threshold=ham)
+    return SimpleNamespace(burst_max_size=max_size, burst_hamming_threshold=ham,
+                           thumb_version="thumb", work_dir=_TMP / "work")
 
 
-_DB_SEQ = 0
+(_TMP / "work").mkdir(exist_ok=True)
 
 
 def _fresh_db() -> DB:
@@ -82,103 +75,84 @@ def _fresh_db() -> DB:
     return DB(_TMP / f"db_{_DB_SEQ}.db")
 
 
-def _add(db: DB, source_map: dict, asset_id: str, scene: int, variant: int,
-         when: datetime, *, screenshot: bool = False, dead: bool = False) -> None:
-    if not dead:
-        p = _FIXTURES / f"{asset_id}.jpg"
-        _make_scene(p, scene, variant)
-        source_map[asset_id] = p
-    db.upsert_asset(asset_id, when, f"{asset_id}.HEIC")
-    if screenshot:
-        db.mark_screenshots([asset_id])
+def _asset(aid: str, scene: int, variant: int = 0, *, dead: bool = False):
+    """Return (id, fixture_path|None) for the stream."""
+    if dead:
+        return (aid, None)
+    p = _FIX / f"{aid}_{scene}_{variant}.jpg"
+    _make_scene(p, scene, variant)
+    return (aid, p)
 
 
-_BASE = datetime(2026, 1, 1, tzinfo=timezone.utc)
+def _stream(db: DB, items):
+    def gen():
+        for aid, path in items:
+            yield SimpleNamespace(id=aid), _FakeAsset(aid, path)
+    return _Stream(gen(), db)
+
+
+def _burst(db, items, cfg, screenshots=()):
+    return assemble_burst(_stream(db, items), cfg, FakeIC(), set(screenshots))
 
 
 # ── tests ───────────────────────────────────────────────────────────────────────
 
 def test_empty_returns_none():
-    db = _fresh_db()
-    assert find_next_burst(db, FakeSource({}), _cfg(), set()) is None
+    assert _burst(_fresh_db(), [], _cfg()) is None
 
 
 def test_all_seen_returns_none():
-    db = _fresh_db(); m = {}
-    _add(db, m, "a", 0, 1, _BASE)
+    db = _fresh_db()
     db.commit_burst(["a"], None)  # mark seen
-    assert find_next_burst(db, FakeSource(m), _cfg(), set()) is None
+    assert _burst(db, [_asset("a", 0, 1)], _cfg()) is None
 
 
 def test_single_asset_burst():
-    db = _fresh_db(); m = {}
-    _add(db, m, "a", 0, 1, _BASE)
-    b = find_next_burst(db, FakeSource(m), _cfg(), set())
-    assert b is not None and [x.asset_id for x in b.members] == ["a"] and not b.aux_seen
-
-
-def test_newest_first_by_created():
-    db = _fresh_db(); m = {}
-    # insert out of capture order; b is newest by `created`
-    _add(db, m, "old", 0, 1, _BASE)
-    _add(db, m, "new", 1, 1, _BASE + timedelta(hours=5))
-    b = find_next_burst(db, FakeSource(m), _cfg(), set())
-    assert b.head == "new" and b.members[0].asset_id == "new"
+    b = _burst(_fresh_db(), [_asset("a", 0, 1)], _cfg())
+    assert b is not None and [m.asset_id for m in b.members] == ["a"] and not b.aux_seen
 
 
 def test_two_distinct_scenes_no_gap_drop():
-    """The bug the old date-cursor had: two different scenes must BOTH be reachable."""
-    db = _fresh_db(); m = {}
-    _add(db, m, "A", 0, 1, _BASE + timedelta(hours=2))   # newest, scene 0
-    _add(db, m, "B", 2, 1, _BASE + timedelta(hours=1))   # older, scene 2 (far pHash)
-    b1 = find_next_burst(db, FakeSource(m), _cfg(), set())
-    assert [x.asset_id for x in b1.members] == ["A"]
-    db.commit_burst(["A"], None)                          # decide burst 1
-    b2 = find_next_burst(db, FakeSource(m), _cfg(), set())
-    assert [x.asset_id for x in b2.members] == ["B"]      # the older scene is NOT dropped
+    """Both scenes must be reachable as the shared stream advances (no drop)."""
+    db = _fresh_db()
+    stream = _stream(db, [_asset("A", 0, 1), _asset("B", 2, 1)])  # far pHash
+    b1 = assemble_burst(stream, _cfg(), FakeIC(), set())
+    assert [m.asset_id for m in b1.members] == ["A"]
+    db.commit_burst(["A"], None)
+    b2 = assemble_burst(stream, _cfg(), FakeIC(), set())   # SAME stream continues
+    assert [m.asset_id for m in b2.members] == ["B"]
+
+
+def test_fresh_stream_skips_seen():
+    db = _fresh_db()
+    db.commit_burst(["A"], None)  # A already decided
+    b = _burst(db, [_asset("A", 0, 1), _asset("B", 2, 1)], _cfg())
+    assert [m.asset_id for m in b.members] == ["B"]  # seen A skipped, B assembled
 
 
 def test_similar_run_groups():
-    db = _fresh_db(); m = {}
-    for i, aid in enumerate(["a", "b", "c"]):            # same scene, near-identical
-        _add(db, m, aid, 0, i + 1, _BASE + timedelta(minutes=30 - i))
-    b = find_next_burst(db, FakeSource(m), _cfg(max_size=5), set())
-    assert sorted(x.asset_id for x in b.members) == ["a", "b", "c"]
+    items = [_asset(a, 0, i + 1) for i, a in enumerate(["a", "b", "c"])]
+    b = _burst(_fresh_db(), items, _cfg(max_size=5))
+    assert sorted(m.asset_id for m in b.members) == ["a", "b", "c"]
 
 
 def test_cap_consumes_tail():
-    db = _fresh_db(); m = {}
-    ids = [f"s{i}" for i in range(6)]                    # 6 near-identical, cap=3
-    for i, aid in enumerate(ids):
-        _add(db, m, aid, 1, i + 1, _BASE + timedelta(minutes=60 - i))
-    b = find_next_burst(db, FakeSource(m), _cfg(max_size=3), set())
+    ids = [f"s{i}" for i in range(6)]
+    items = [_asset(a, 1, i + 1) for i, a in enumerate(ids)]
+    b = _burst(_fresh_db(), items, _cfg(max_size=3))
     assert len(b.members) == 3
-    seen = {x.asset_id for x in b.members} | set(b.aux_seen)
-    assert seen == set(ids)                              # whole scene consumed, no fragment left
+    assert {m.asset_id for m in b.members} | set(b.aux_seen) == set(ids)
 
 
 def test_screenshot_dropped_to_aux():
-    db = _fresh_db(); m = {}
-    _add(db, m, "shot", 0, 1, _BASE + timedelta(hours=2), screenshot=True)
-    _add(db, m, "real", 2, 1, _BASE + timedelta(hours=1))
-    b = find_next_burst(db, FakeSource(m), _cfg(), set())
-    assert "shot" in b.aux_seen and [x.asset_id for x in b.members] == ["real"]
+    b = _burst(_fresh_db(), [_asset("shot", 0, 1), _asset("real", 2, 1)], _cfg(),
+               screenshots={"shot"})
+    assert "shot" in b.aux_seen and [m.asset_id for m in b.members] == ["real"]
 
 
 def test_undecodable_to_aux():
-    db = _fresh_db(); m = {}
-    _add(db, m, "bad", 0, 1, _BASE + timedelta(hours=2), dead=True)  # source returns None
-    _add(db, m, "good", 2, 1, _BASE + timedelta(hours=1))
-    b = find_next_burst(db, FakeSource(m, dead={"bad"}), _cfg(), set())
-    assert "bad" in b.aux_seen and [x.asset_id for x in b.members] == ["good"]
-
-
-def test_exclude_skips_burst():
-    db = _fresh_db(); m = {}
-    _add(db, m, "A", 0, 1, _BASE + timedelta(hours=2))
-    _add(db, m, "B", 2, 1, _BASE + timedelta(hours=1))
-    b = find_next_burst(db, FakeSource(m), _cfg(), exclude={"A"})
-    assert [x.asset_id for x in b.members] == ["B"]      # excluded head skipped this cycle
+    b = _burst(_fresh_db(), [_asset("bad", 0, dead=True), _asset("good", 2, 1)], _cfg())
+    assert "bad" in b.aux_seen and [m.asset_id for m in b.members] == ["good"]
 
 
 def _main() -> int:
@@ -186,13 +160,10 @@ def _main() -> int:
     failed = 0
     for t in tests:
         try:
-            t()
-            print(f"PASS {t.__name__}")
+            t(); print(f"PASS {t.__name__}")
         except Exception as exc:  # noqa: BLE001
             failed += 1
-            import traceback
-            print(f"FAIL {t.__name__}: {exc}")
-            traceback.print_exc()
+            import traceback; print(f"FAIL {t.__name__}: {exc}"); traceback.print_exc()
     print(f"\n{len(tests) - failed}/{len(tests)} passed")
     return 1 if failed else 0
 

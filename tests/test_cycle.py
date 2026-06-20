@@ -1,10 +1,10 @@
 """
 Offline integration test for run_one_cycle — the orchestration heart.
 
-Stubs the VLM judge and the EXIF screenshot gate; everything else (burst
-assembly, dedup, prepare, atomic commit, dry-run post, seen-set advance) runs for
-real. Proves walk-back-until-postable: a boring newest burst is rejected and the
-bot falls through to an older interesting one and posts it.
+Stubs the VLM judge and the EXIF screenshot gate; burst assembly, dedup, prepare,
+atomic commit, dry-run post, and the seen-set advance run for real. Proves
+walk-back-until-postable: a boring newest burst is rejected and the bot falls
+through to an older interesting one and posts it.
 
 Run: .venv/bin/python tests/test_cycle.py
 """
@@ -14,7 +14,6 @@ from __future__ import annotations
 import shutil
 import sys
 import tempfile
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -40,24 +39,31 @@ def _img(path: Path, scene: int) -> None:
     im.save(path, "JPEG", quality=92)
 
 
-class FakeSource:
-    def __init__(self, mapping):
-        self._map = mapping; self._n = 0
+class _FakeAsset:
+    def __init__(self, aid, path): self.id = aid; self._path = path
 
-    def download_thumb(self, asset_id):
-        self._n += 1
-        dst = _TMP / f"t_{self._n}.jpg"; shutil.copy(self._map[asset_id], dst); return dst
 
-    def download_original(self, asset_id):
-        self._n += 1
-        dst = _TMP / f"o_{self._n}.jpg"; shutil.copy(self._map[asset_id], dst); return dst
+class FakeIC:
+    def __init__(self, assets):  # assets: [(id, fixture_path)] newest-first
+        self._assets = assets
+
+    def iter_image_assets(self):
+        for aid, path in self._assets:
+            yield SimpleNamespace(id=aid), _FakeAsset(aid, path)
+
+    def download(self, asset, version, dest):
+        shutil.copy(asset._path, dest); return dest
+
+    def screenshot_ids(self):
+        return set()
 
 
 def _cfg():
     c = SimpleNamespace(
         burst_max_size=5, burst_hamming_threshold=8, burst_max_attempts=3,
         daily_ai_calls=200, hamming_threshold=12, rotation_enabled=False,
-        x_dry_run=True, post_max_attempts=3, max_posts_per_day=6,
+        x_dry_run=True, post_max_attempts=3, max_posts_per_day=6, thumb_version="thumb",
+        keep_reviewed=False, reviewed_dir=_TMP / "reviewed",
         work_dir=_TMP / "work", queue_dir=_TMP / "queue",
         approved_dir=_TMP / "approved", posted_dir=_TMP / "posted", logs_dir=_TMP / "logs",
         judge_model="stub",
@@ -70,15 +76,12 @@ def _cfg():
 def test_walk_back_until_postable_then_post():
     cfg = _cfg()
     db = DB(_TMP / "cycle.db")
-    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    # newest = "boring" (scene 0); older = "good" (scene 1, far pHash so a separate burst)
-    src_map = {}
-    for aid, scene, when in [("boring", 0, base + timedelta(hours=2)),
-                             ("good", 1, base + timedelta(hours=1))]:
-        p = _FIX / f"{aid}.jpg"; _img(p, scene); src_map[aid] = p
-        db.upsert_asset(aid, when, f"{aid}.HEIC")
+    # newest = "boring" (scene 0); older = "good" (scene 1, far pHash → separate burst)
+    src = {}
+    for aid, scene in [("boring", 0), ("good", 1)]:
+        p = _FIX / f"{aid}.jpg"; _img(p, scene); src[aid] = p
+    ic = FakeIC([("boring", src["boring"]), ("good", src["good"])])
 
-    # judge: first burst (boring) → not interesting; second (good) → interesting, best 0
     calls = {"n": 0}
 
     def fake_judge(thumbs, cfg_, model_string=None):
@@ -91,21 +94,20 @@ def test_walk_back_until_postable_then_post():
 
     orig_judge, orig_ss = bot.judge_burst, bot.is_screenshot
     bot.judge_burst = fake_judge
-    bot.is_screenshot = lambda p: (False, "")  # camera photo (fixtures carry no EXIF)
+    bot.is_screenshot = lambda p: (False, "")  # fixtures carry no EXIF
     try:
-        outcome = bot.run_one_cycle(db, cfg, FakeSource(src_map), (None, None))
+        outcome = bot.run_one_cycle(db, cfg, ic, (None, None))
     finally:
         bot.judge_burst, bot.is_screenshot = orig_judge, orig_ss
 
     assert outcome == "posted", outcome
-    # the GOOD one was posted; the BORING one was decided-seen, not posted
-    good = [r for r in db._conn.execute("SELECT * FROM images").fetchall()
-            if r["asset_id"] == "good"]
-    assert good and good[0]["status"] == Status.POSTED.value
+    good = db.get_image_by_sha(
+        db._conn.execute("SELECT sha256 FROM images WHERE asset_id='good'").fetchone()["sha256"]
+    )
+    assert good["status"] == Status.POSTED.value
     assert db.count_posts_rolling_24h() == 1
-    # both assets are now seen → none re-assembled
-    assert not db.has_unseen_assets()
-    assert calls["n"] == 2  # judged boring, then good
+    assert db.seen_asset_id("boring") and db.seen_asset_id("good")
+    assert calls["n"] == 2  # judged boring (rejected), then good (posted)
 
 
 def _main() -> int:

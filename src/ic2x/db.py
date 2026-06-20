@@ -22,20 +22,14 @@ from ic2x.status import Status
 
 
 _SCHEMA = """
+-- Decided-asset tracker (the seen-set). Rows are created on-demand when a burst
+-- is committed; ordering comes from live recently_added() iteration, not here.
 CREATE TABLE IF NOT EXISTS asset_index (
-    asset_id      TEXT PRIMARY KEY,
-    created       TEXT NOT NULL,          -- ISO8601 UTC capture date
-    filename      TEXT,
-    is_screenshot INTEGER DEFAULT 0,
-    is_live       INTEGER DEFAULT 0,
-    seen          INTEGER DEFAULT 0,      -- 1 once the bot has decided on it
-    attempts      INTEGER DEFAULT 0,      -- pre-commit failures (poison-burst breaker)
-    width         INTEGER,
-    height        INTEGER,
-    indexed_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    asset_id    TEXT PRIMARY KEY,
+    seen        INTEGER DEFAULT 0,      -- 1 once the bot has decided on it
+    attempts    INTEGER DEFAULT 0,      -- pre-commit failures (poison-burst breaker)
+    decided_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
-CREATE INDEX IF NOT EXISTS idx_asset_created ON asset_index(created);
-CREATE INDEX IF NOT EXISTS idx_asset_seen ON asset_index(seen);
 
 CREATE TABLE IF NOT EXISTS images (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,60 +75,20 @@ class DB:
     def close(self) -> None:
         self._conn.close()
 
-    # ── Asset index (synced from iCloud metadata) ──────────────────────────────
+    # ── Seen-set (asset-level "decided") ───────────────────────────────────────
 
-    def upsert_asset(
-        self, asset_id: str, created: datetime | str, filename: str,
-        *, is_live: bool = False, width: int | None = None, height: int | None = None,
-    ) -> bool:
-        """Insert a still-image asset if new. Returns True if it was new.
-        Immutable fields (created/filename/dims) are not overwritten on resync."""
-        created_iso = created.isoformat() if isinstance(created, datetime) else str(created)
-        cur = self._conn.execute(
-            "INSERT OR IGNORE INTO asset_index "
-            "(asset_id, created, filename, is_live, width, height) VALUES (?, ?, ?, ?, ?, ?)",
-            (asset_id, created_iso, filename, int(is_live), width, height),
-        )
-        self._conn.commit()
-        return cur.rowcount > 0
-
-    def asset_indexed(self, asset_id: str) -> bool:
+    def seen_asset_id(self, asset_id: str) -> bool:
+        """True if the bot has already decided on this asset (any verdict)."""
         return self._conn.execute(
-            "SELECT 1 FROM asset_index WHERE asset_id = ?", (asset_id,)
-        ).fetchone() is not None
-
-    def asset_index_count(self) -> int:
-        return self._conn.execute("SELECT COUNT(*) FROM asset_index").fetchone()[0]
-
-    def mark_screenshots(self, asset_ids: Sequence[str]) -> int:
-        """Flag the given asset_ids as screenshots (Apple's Screenshots album)."""
-        if not asset_ids:
-            return 0
-        ph = ",".join("?" * len(asset_ids))
-        cur = self._conn.execute(
-            f"UPDATE asset_index SET is_screenshot = 1 WHERE asset_id IN ({ph})",
-            list(asset_ids),
-        )
-        self._conn.commit()
-        return cur.rowcount
-
-    def next_unseen_assets(self, limit: int) -> list[sqlite3.Row]:
-        """The newest `limit` not-yet-decided assets, newest capture first.
-        Drives 'prefer new, else walk back' purely via the `seen` flag."""
-        return self._conn.execute(
-            "SELECT * FROM asset_index WHERE seen = 0 ORDER BY created DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
-
-    def has_unseen_assets(self) -> bool:
-        return self._conn.execute(
-            "SELECT 1 FROM asset_index WHERE seen = 0 LIMIT 1"
+            "SELECT 1 FROM asset_index WHERE asset_id = ? AND seen = 1", (asset_id,)
         ).fetchone() is not None
 
     def incr_asset_attempts(self, asset_id: str) -> int:
-        """Bump and return the pre-commit attempt count for a burst-head asset."""
+        """Bump and return the pre-commit attempt count for a burst-head asset
+        (upserts the row, since assets are only tracked on decision)."""
         self._conn.execute(
-            "UPDATE asset_index SET attempts = attempts + 1 WHERE asset_id = ?", (asset_id,)
+            "INSERT INTO asset_index (asset_id, attempts) VALUES (?, 1) "
+            "ON CONFLICT(asset_id) DO UPDATE SET attempts = attempts + 1", (asset_id,)
         )
         self._conn.commit()
         row = self._conn.execute(
@@ -147,20 +101,20 @@ class DB:
     def commit_burst(
         self, seen_asset_ids: Sequence[str], winner: dict[str, Any] | None = None
     ) -> None:
-        """Atomically mark every burst member decided, and (optionally) insert the
-        winner's images row. A crash before this leaves zero state → the identical
-        burst re-assembles cleanly; a crash after → flush_pending finishes the post.
+        """Atomically mark every burst member decided (upsert seen=1), and
+        optionally insert the winner's images row. A crash before this leaves zero
+        state → the identical burst re-assembles; a crash after → flush_pending
+        finishes the post.
 
         winner keys: asset_id, sha256, phash, filename, status (Status|str),
         caption, reject_stage, reject_reason.
         """
         try:
             self._conn.execute("BEGIN")
-            if seen_asset_ids:
-                ph = ",".join("?" * len(seen_asset_ids))
+            for aid in seen_asset_ids:
                 self._conn.execute(
-                    f"UPDATE asset_index SET seen = 1 WHERE asset_id IN ({ph})",
-                    list(seen_asset_ids),
+                    "INSERT INTO asset_index (asset_id, seen) VALUES (?, 1) "
+                    "ON CONFLICT(asset_id) DO UPDATE SET seen = 1", (aid,)
                 )
             if winner is not None:
                 status = winner["status"]

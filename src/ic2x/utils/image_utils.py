@@ -6,6 +6,16 @@ from pathlib import Path
 
 from PIL import Image, ImageOps
 
+# pyicloud serves true HEIC originals; register the opener once, globally, so
+# every PIL.Image.open (dedup, filter, prepare) can decode them. Without this,
+# HEIC winners fail with UnidentifiedImageError.
+try:
+    from pillow_heif import register_heif_opener
+
+    register_heif_opener()
+except Exception:  # noqa: BLE001 — pillow-heif always present, but never crash on import
+    pass
+
 
 _HEIF_OPS = {
     2: Image.FLIP_LEFT_RIGHT,
