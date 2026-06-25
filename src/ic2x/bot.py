@@ -5,6 +5,7 @@ it, and post it. Walks back through history until something is postable.
 
   ic2x bot            run the loop
   ic2x bot --once     run a single cycle and exit (for testing)
+  ic2x bot --test     fast dry-run soak into test_run/<timestamp>/ (for testing)
 
 Key reliability rules:
   • Photos come from recently_added() and bursts are assembled straight from the
@@ -25,6 +26,8 @@ import hashlib
 import logging
 import signal
 import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -33,7 +36,7 @@ from typing import Any, Iterator
 import imagehash
 
 from ic2x import dedup, prepare
-from ic2x.config import Config, ensure_dirs, load_config
+from ic2x.config import Config, _PROJECT_ROOT, ensure_dirs, load_config
 from ic2x.db import DB
 from ic2x.filter import is_screenshot
 from ic2x.icloud_photos import ICloudPhotos, PyiCloudThrottled, ReauthRequired
@@ -41,7 +44,12 @@ from ic2x.judge_burst import judge_burst
 from ic2x.post import make_clients, post_one
 from ic2x.status import Status
 from ic2x.utils import ui
-from ic2x.utils.ai_client import require_vision_api_credentials
+from ic2x.utils.ai_client import (
+    get_run_usage, require_vision_api_credentials, reset_run_usage,
+)
+from ic2x.utils.cost_report import (
+    compute_cost, format_total_cost_line, format_usage_log, pricing_currency,
+)
 from ic2x.utils.decision_log import log_decision
 
 logger = logging.getLogger("ic2x.bot")
@@ -67,28 +75,35 @@ def _unlink(p: Path | None) -> None:
 
 
 def _keep_reviewed(cfg: Config, outcome: str, burst: "Burst", best_index: int, label: str) -> None:
-    """Save EVERY thumbnail of a judged burst to reviewed/<date>/, so the grouping
-    is visible: a 3-shot burst writes 3 files sharing an `n3__<head>` prefix, with
-    the chosen one marked `_WIN`. Browseable during burn-in."""
+    """Persist a judged burst so the grouping is browsable under reviewed/<date>/:
+    a MULTI-shot burst becomes its OWN folder (every member inside, the chosen
+    shot suffixed `_WIN`); a SINGLE-shot burst is a loose `…_WIN.jpg` file in the
+    day folder. Folder/file names carry the time + outcome + reason/caption, so
+    the results read at a glance. Browseable during burn-in."""
     if not cfg.keep_reviewed or not burst.members:
         return
     import shutil
     try:
-        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        d = cfg.reviewed_dir / day
-        d.mkdir(parents=True, exist_ok=True)
-        safe = "".join(c if (c.isalnum() or c in " -") else "_" for c in (label or "")).strip()
-        safe = "-".join(safe.split())[:40] or "na"
-        n = len(burst.members)
-        head = (burst.head or "x")[:8]
-        # Common `b<head>_n<N>` prefix so a burst's members sort together; only
-        # the chosen member carries the outcome (the siblings were NOT posted).
-        for j, m in enumerate(burst.members):
-            if j == best_index:
-                role = f"WIN-{outcome}" + (f"__{safe}" if safe != "na" else "")
-            else:
-                role = "sibling"
-            shutil.copy(str(m.thumb), str(d / f"b{head}_n{n}__{j}__{role}.jpg"))
+        now = datetime.now(timezone.utc)
+        day = cfg.reviewed_dir / now.strftime("%Y-%m-%d")
+        day.mkdir(parents=True, exist_ok=True)
+        lab = "".join(c if (c.isalnum() or c in " -") else "_" for c in (label or "")).strip()
+        lab = "-".join(lab.split())[:30]
+        tag = "__".join(p for p in (now.strftime("%H%M%S"), outcome, lab) if p)
+
+        def _stem(m, j: int) -> str:
+            base = (getattr(m, "filename", "") or m.asset_id or f"img{j}").rsplit(".", 1)[0]
+            return ("".join(c if (c.isalnum() or c in "-_") else "_" for c in base)[:40]) or f"img{j}"
+
+        if len(burst.members) == 1:  # singleton → loose file in the day folder
+            m = burst.members[0]
+            shutil.copy(str(m.thumb), str(day / f"{tag}__{_stem(m, 0)}_WIN.jpg"))
+        else:                         # group → its own folder, winner marked _WIN
+            grp = day / tag
+            grp.mkdir(parents=True, exist_ok=True)
+            for j, m in enumerate(burst.members):
+                win = "_WIN" if j == best_index else ""
+                shutil.copy(str(m.thumb), str(grp / f"{j:02d}_{_stem(m, j)}{win}.jpg"))
     except Exception as exc:  # noqa: BLE001 — observability must never crash a cycle
         logger.warning("keep_reviewed: %s", exc)
 
@@ -105,36 +120,97 @@ def _download(ic: ICloudPhotos, asset: Any, version: str, dest: Path) -> Path | 
         return None
 
 
-# ── Live, peekable, seen-skipping stream ───────────────────────────────────────
+# ── Live, peekable, seen-skipping, prefetching stream ───────────────────────────
 
-_UNSET = object()
+@dataclass
+class _Ready:
+    """A burst candidate whose thumbnail has been prefetched + hashed."""
+    meta: Any
+    asset: Any
+    thumb: Path | None       # downloaded thumbnail, or None (screenshot / failed)
+    phash: str | None        # perceptual hash, or None
+    is_screenshot: bool
 
 
 class _Stream:
-    """Peekable (meta, live-asset) stream that skips already-decided assets.
-    One per cycle; assemble_burst consumes forward through it."""
+    """Peekable, seen-skipping stream of prefetched burst candidates (one per
+    cycle). Each batch's thumbnails are downloaded + hashed CONCURRENTLY in a
+    bounded pool but surfaced in capture order, so assemble_burst's sequential
+    logic is unchanged while the per-download network round-trip is hidden.
+    `concurrency` is also the batch size; keep it modest (~4–8) so parallel GETs
+    don't trip iCloud throttling. A worker's Reauth/Throttled propagates out."""
 
-    def __init__(self, it: Iterator[tuple[Any, Any]], db: DB) -> None:
+    def __init__(self, it: Iterator[tuple[Any, Any]], db: DB, cfg: Config,
+                 ic: ICloudPhotos, screenshot_ids: set[str], *, concurrency: int = 6) -> None:
         self._it = it
         self._db = db
-        self._buf: Any = _UNSET
+        self._cfg = cfg
+        self._ic = ic
+        self._ss = screenshot_ids
+        self._n = max(1, concurrency)
+        self._buf: deque[_Ready] = deque()
+        self._exhausted = False
 
-    def _advance(self):
+    def _raw_next(self):
         for meta, asset in self._it:
             if self._db.seen_asset_id(meta.id):
                 continue
             return (meta, asset)
         return None
 
-    def peek(self):
-        if self._buf is _UNSET:
-            self._buf = self._advance()
-        return self._buf
+    def _prepare(self, meta: Any, asset: Any) -> _Ready:
+        """Download + hash one candidate (runs in a worker thread). Screenshots
+        are flagged without downloading. Reauth/Throttled propagate."""
+        if meta.id in self._ss:
+            return _Ready(meta, asset, None, None, True)
+        dest = self._cfg.work_dir / f"thumb_{_safe_name(meta.id)}.jpg"
+        thumb = _download(self._ic, asset, self._cfg.thumb_version, dest)
+        ph: str | None = None
+        if thumb is not None:
+            try:
+                ph = dedup.phash_of(thumb)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("burst: pHash failed for %s: %s", meta.id, exc)
+                _unlink(thumb)
+                thumb = None
+        return _Ready(meta, asset, thumb, ph, False)
 
-    def take(self):
+    def _fill(self) -> None:
+        raw: list[tuple[Any, Any]] = []
+        for _ in range(self._n):
+            nxt = self._raw_next()
+            if nxt is None:
+                self._exhausted = True
+                break
+            raw.append(nxt)
+        if not raw:
+            return
+        if len(raw) == 1:
+            self._buf.append(self._prepare(*raw[0]))
+            return
+        # Download + hash the batch concurrently; ex.map keeps capture order and
+        # re-raises a worker's Reauth/Throttled in order.
+        with ThreadPoolExecutor(max_workers=min(self._n, len(raw))) as ex:
+            for ready in ex.map(lambda ma: self._prepare(ma[0], ma[1]), raw):
+                self._buf.append(ready)
+
+    def peek(self) -> "_Ready | None":
+        if not self._buf and not self._exhausted:
+            self._fill()
+        return self._buf[0] if self._buf else None
+
+    def take(self) -> "_Ready | None":
         v = self.peek()
-        self._buf = _UNSET
+        if self._buf:
+            self._buf.popleft()
         return v
+
+    def close(self) -> None:
+        """Unlink prefetched-but-unconsumed thumbnails so work/ doesn't leak."""
+        while self._buf:
+            r = self._buf.popleft()
+            if r.thumb is not None:
+                _unlink(r.thumb)
 
 
 # ── Burst assembly ─────────────────────────────────────────────────────────────
@@ -145,6 +221,7 @@ class BurstMember:
     thumb: Path
     phash: str
     asset: Any  # live PhotoAsset — used to download the winner's full-res original
+    filename: str = ""  # original iCloud filename (e.g. IMG_7795.HEIC), for readable archives
 
 
 @dataclass
@@ -154,49 +231,63 @@ class Burst:
     head: str | None = None
 
 
-def assemble_burst(stream: _Stream, cfg: Config, ic: ICloudPhotos, screenshot_ids: set[str]) -> Burst | None:
-    """The newest run of consecutive, visually-similar, not-yet-decided still
-    images. Screenshots and undecodable assets go to aux_seen rather than judged.
-    Returns None only when the stream is exhausted with nothing left."""
+def _ai_same_scene(candidate_thumb: Path, head_thumb: Path, cfg: Config, db: "DB") -> bool:
+    """Cheap VLM: is `candidate_thumb` the SAME scene/object as the burst's head
+    shot (just a different orientation / crop / angle)? Used to MERGE pHash-split
+    variants — pHash can't tell portrait-vs-landscape of one scene from a new
+    scene. Fails CLOSED (→ "new scene") so any error just keeps plain pHash behavior."""
+    try:
+        from ic2x import judge_scene_dedup
+        dup, used = judge_scene_dedup.call_scene_dedup(
+            candidate_thumb, [head_thumb], cfg, model_string=cfg.scene_dedup_model)
+        if used:
+            db.increment_ai_calls()
+        return dup is not None
+    except Exception as exc:  # noqa: BLE001 — grouping aid, never crash assembly
+        logger.warning("scene_group: check failed (%s) — treating as new scene", exc)
+        return False
+
+
+def assemble_burst(stream: _Stream, cfg: Config, ic: ICloudPhotos, screenshot_ids: set[str],
+                   db: "DB | None" = None) -> Burst | None:
+    """The newest run of consecutive, not-yet-decided still images forming ONE
+    scene, from the stream's prefetched candidates. Grouping is pHash by default;
+    when `cfg.scene_group_enabled` and `db` are set, a pHash boundary is double-
+    checked by a cheap VLM ("same scene shot differently?") so portrait/landscape/
+    angle variants stay in one burst. Screenshots/undecodable go to aux_seen.
+    Returns None only when the stream is exhausted. (`ic`/`screenshot_ids` retained
+    for back-compat; the stream owns download + screenshot-skip.)"""
     members: list[BurstMember] = []
     aux_seen: list[str] = []
     prev: str | None = None
+    grouping = bool(getattr(cfg, "scene_group_enabled", False)) and db is not None
 
     while True:
-        item = stream.peek()
-        if item is None:
+        r = stream.peek()
+        if r is None:
             break
-        meta, asset = item
-        if meta.id in screenshot_ids:
-            aux_seen.append(meta.id)
+        if r.is_screenshot or r.thumb is None or r.phash is None:
+            aux_seen.append(r.meta.id)  # screenshot / undecodable / hash-failed
             stream.take()
             continue
-        dest = cfg.work_dir / f"thumb_{_safe_name(meta.id)}.jpg"
-        thumb = _download(ic, asset, cfg.thumb_version, dest)  # propagates Reauth/Throttled
-        if thumb is None:
-            aux_seen.append(meta.id)
-            stream.take()
-            continue
-        try:
-            ph = dedup.phash_of(thumb)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("burst: pHash failed for %s: %s", meta.id, exc)
-            aux_seen.append(meta.id)
-            stream.take()
-            _unlink(thumb)
-            continue
-        if prev is not None and _hamming(ph, prev) > cfg.burst_hamming_threshold:
-            _unlink(thumb)
-            break  # next scene → starts the next burst (left peeked)
+        ph = r.phash
+        same_scene = prev is None or _hamming(ph, prev) <= cfg.burst_hamming_threshold
+        if not same_scene and grouping and members:
+            # pHash says NEW scene, but it can't see a crop/rotation as the same
+            # scene — ask the cheap VLM before splitting the burst.
+            same_scene = _ai_same_scene(r.thumb, members[0].thumb, cfg, db)
+            if same_scene:
+                ui.info(f"scene-group: merged {getattr(r.meta, 'filename', None) or 'a shot'}"
+                        " into this scene (same scene, reframed/rotated)")
+        if not same_scene:
+            break  # genuinely a new scene → starts the next burst (left peeked)
         if len(members) >= cfg.burst_max_size:
-            if prev is not None and _hamming(ph, prev) <= cfg.burst_hamming_threshold:
-                aux_seen.append(meta.id)  # consume the near-dup tail past the cap
-                stream.take()
-                _unlink(thumb)
-                continue
-            _unlink(thumb)
-            break
-        members.append(BurstMember(meta.id, dest, ph, asset))
+            aux_seen.append(r.meta.id)   # scene continues past the cap → consume as seen
+            stream.take()
+            _unlink(r.thumb)
+            continue
+        members.append(BurstMember(r.meta.id, r.thumb, ph, r.asset,
+                                   getattr(r.meta, "filename", "")))
         prev = ph
         stream.take()
 
@@ -245,6 +336,16 @@ def _prepare_winner(db: DB, cfg: Config, ic: ICloudPhotos, winner: BurstMember, 
                 "status": Status.REJECTED, "reject_stage": "duplicate",
                 "reject_reason": "sha/phash near-duplicate of a kept image", "caption": "",
             }
+        # Location stamp from the original's GPS EXIF — read HERE, before prepare()
+        # and rotation strip EXIF from the posted JPEG (we share the city as text,
+        # never the exact coordinates). Best-effort: None if no GPS / geocode fails.
+        location = None
+        try:
+            from ic2x import geo
+            location = geo.location_line(orig, cfg)
+        except Exception as exc:  # noqa: BLE001 — optional; never block the post
+            logger.warning("location: skipped (%s)", exc)
+
         prepared = prepare.prepare(orig, cfg.queue_dir, ph)
         if cfg.rotation_enabled:
             try:
@@ -256,10 +357,36 @@ def _prepare_winner(db: DB, cfg: Config, ic: ICloudPhotos, winner: BurstMember, 
                     _apply_rotation(prepared, rot["rotate_cw_degrees"])
             except Exception as exc:  # noqa: BLE001 — optional; never block the post
                 logger.warning("rotation: skipped (%s)", exc)
+        # Auto color enhancement (Aliyun VIAPI EnhanceImageColor) on the posted image.
+        # Fail-open: any failure logs and posts the un-enhanced JPEG. The flat per-call
+        # cost flows into the daily cost tracker so `ic2x cost` shows total spend.
+        if getattr(cfg, "color_enhance_enabled", False):
+            try:
+                from ic2x.utils import aliyun_viapi
+                if aliyun_viapi.enhance_post_image(
+                        prepared, prepared, mode=cfg.color_enhance_mode,
+                        max_edge=cfg.color_enhance_max_edge):
+                    # first N calls/month are free (Aliyun); only charge beyond that.
+                    month_n = db.increment_color_calls()
+                    free = getattr(cfg, "color_enhance_free_quota", 100)
+                    cost = 0.0 if month_n <= free else getattr(cfg, "color_enhance_cost_rmb", 0.02)
+                    if cost:
+                        db.add_run_cost(cost)            # persist to the day's total
+                    from ic2x.utils.ai_client import add_run_flat_cost
+                    add_run_flat_cost(                   # run total + live cost line
+                        cost, f"color-enhance {cfg.color_enhance_mode} [{month_n}/{free}/mo]")
+            except Exception as exc:  # noqa: BLE001 — enhancement must never block a post
+                logger.warning("color enhance: skipped (%s)", exc)
         shutil.move(str(prepared), str(cfg.approved_dir / prepared.name))
+        # Cap to X's 280-char limit, trimming the caption — never the 📍 line.
+        if location:
+            room = max(0, 280 - len(location) - 1)
+            final_caption = f"{caption[:room].rstrip()}\n{location}"
+        else:
+            final_caption = caption[:280]
         return "approved", {
             "asset_id": winner.asset_id, "sha256": sha, "phash": ph,
-            "filename": winner.asset_id, "status": Status.APPROVED, "caption": caption,
+            "filename": winner.asset_id, "status": Status.APPROVED, "caption": final_caption,
         }
     except (ReauthRequired, PyiCloudThrottled):
         raise
@@ -275,12 +402,14 @@ def _prepare_winner(db: DB, cfg: Config, ic: ICloudPhotos, winner: BurstMember, 
 def run_one_cycle(db: DB, cfg: Config, ic: ICloudPhotos, clients) -> str:
     """Assemble bursts newest-first, judging each, until one posts (or the daily
     AI cap is hit / the library is exhausted). Posts at most one image."""
+    reset_run_usage()  # isolate this cycle's AI usage for cost accounting
     screenshot_ids = ic.screenshot_ids()
-    stream = _Stream(ic.iter_image_assets(), db)
+    stream = _Stream(ic.iter_image_assets(), db, cfg, ic, screenshot_ids,
+                     concurrency=cfg.prefetch_concurrency)
     thumbs: list[Path] = []
     try:
         while not db.check_daily_ai_limit(cfg.daily_ai_calls):
-            burst = assemble_burst(stream, cfg, ic, screenshot_ids)
+            burst = assemble_burst(stream, cfg, ic, screenshot_ids, db)
             if burst is None:
                 db.set_state("backward_exhausted", "1")
                 return "exhausted"
@@ -291,6 +420,8 @@ def run_one_cycle(db: DB, cfg: Config, ic: ICloudPhotos, clients) -> str:
                 db.commit_burst(seen_ids, None)  # all screenshots/undecodable
                 continue
 
+            n = len(burst.members)
+            ui.info(f"judging burst — {n} shot{'s' if n != 1 else ''} …")
             verdict, _el, used_net = judge_burst([m.thumb for m in burst.members], cfg)
             if used_net:
                 db.increment_ai_calls()
@@ -303,9 +434,37 @@ def run_one_cycle(db: DB, cfg: Config, ic: ICloudPhotos, clients) -> str:
                                      "flags": verdict.get("flags")})
                 _keep_reviewed(cfg, "unsafe" if not verdict.get("safe") else "boring",
                                burst, verdict["best_index"], reason)
+                if not verdict.get("safe"):
+                    ui.warn(f"   ↳ skipped — UNSAFE [{','.join(verdict.get('flags') or []) or 'flagged'}]")
+                else:
+                    ui.info(f"   ↳ skipped — not interesting: {reason} (walking back)")
                 continue
 
             winner = burst.members[verdict["best_index"]]
+
+            # Same-scene gate (cheap VLM): reject re-posting the SAME scene/object
+            # as a recent post — orientation/crop/angle differences that pHash
+            # misses. On the thumb, BEFORE the full-res download. Fails open.
+            if cfg.scene_dedup_enabled:
+                recent = [(ph, cfg.scene_thumbs_dir / f"{ph}.jpg")
+                          for ph in db.recent_posted_phashes(cfg.scene_dedup_recent_n)]
+                recent = [(ph, p) for ph, p in recent if p.exists()]
+                if recent:
+                    from ic2x import judge_scene_dedup
+                    dup, used = judge_scene_dedup.call_scene_dedup(
+                        winner.thumb, [p for _, p in recent], cfg)
+                    if used:
+                        db.increment_ai_calls()
+                    if dup is not None:
+                        db.commit_burst(seen_ids, None)
+                        log_decision(cfg.logs_dir, outcome="duplicate_scene",
+                                     asset_id=winner.asset_id,
+                                     detail={"n": len(burst.members), "same_as": recent[dup][0]})
+                        _keep_reviewed(cfg, "dup_scene", burst, verdict["best_index"],
+                                       f"same scene as {recent[dup][0]}")
+                        ui.info("   ↳ skipped — same scene as a recent post (walking back)")
+                        continue
+
             kind, payload = _prepare_winner(db, cfg, ic, winner, verdict.get("caption", ""))
 
             if kind == "transient":
@@ -325,9 +484,14 @@ def run_one_cycle(db: DB, cfg: Config, ic: ICloudPhotos, clients) -> str:
                              detail={"stage": payload.get("reject_stage")})
                 _keep_reviewed(cfg, payload.get("reject_stage") or "rejected", burst,
                                verdict["best_index"], payload.get("reject_stage") or "")
+                ui.info(f"   ↳ skipped — winner {payload.get('reject_stage') or 'rejected'} (walking back)")
                 continue
 
             db.commit_burst(seen_ids, payload)  # APPROVED — atomic, then post
+            ui.ok(f"   ↳ chose best shot #{verdict['best_index']} of {len(burst.members)} — posting …")
+            _cap = (payload.get("caption") or "").replace("\n", "  ")
+            if _cap:
+                ui.info(f"      “{_cap}”")
             row = {"sha256": payload["sha256"], "phash": payload["phash"],
                    "caption": payload.get("caption", "")}
             posted = post_one(row, cfg, db, *clients)
@@ -340,8 +504,17 @@ def run_one_cycle(db: DB, cfg: Config, ic: ICloudPhotos, clients) -> str:
             return "posted" if posted else "post_failed"
         return "ai_cap"
     finally:
+        # persist this cycle's token spend to the day's total (the live per-call cost
+        # lines are shown by the meter; this just keeps `ic2x cost` accurate).
+        usage = get_run_usage()
+        cost, _bd = compute_cost(usage)
+        if cost:
+            db.add_run_cost(cost)
+            logger.info("cost: %s",
+                        format_usage_log(usage, cost_line=format_total_cost_line(cost)))
         for t in thumbs:
             _unlink(t)
+        stream.close()  # drop any prefetched-but-unconsumed thumbnails
 
 
 def flush_pending(db: DB, cfg: Config, clients) -> bool:
@@ -380,17 +553,56 @@ def _due_to_post(db: DB, cfg: Config) -> bool:
     return datetime.now(timezone.utc) - last >= timedelta(hours=cfg.post_interval_hours)
 
 
-def bot(once: bool = False) -> None:
+def bot(once: bool = False, test: bool = False, test_cycles: int = 20,
+        post: bool = False) -> None:
     global _stop
     cfg = load_config()
+
+    # ── fast test-run mode: no waits + bypass the post interval / daily cap ──
+    # By default --test does NOT post to X: it redirects ALL state/output under a fresh
+    # test_run/<timestamp>/ folder — re-runnable and non-destructive. Adding --post makes
+    # it a LIVE speed-run (posts to X for REAL) and keeps the REAL state.db / paths so
+    # posts are tracked, preventing duplicate re-posts across runs. Test-mode posting is
+    # controlled by --post (NOT X_DRY_RUN). MUST run before ensure_dirs/setup_logging/
+    # make_clients/DB. icloud_cookie_dir (the 2FA session) is never redirected.
+    if test or cfg.test_mode:
+        cfg.test_mode = True
+        cfg.x_dry_run = not post        # default: no X posting (dry); --post → live posts
+        cfg.keep_reviewed = True        # always write the reviewed/ grouping+dedup artifacts
+        if cfg.x_dry_run:               # dry → isolated throwaway state; live → real state
+            root = _PROJECT_ROOT / "test_run" / datetime.now().strftime("%Y-%m-%d_%H%M%S")
+            cfg.db_path = root / "state.db"
+            cfg.work_dir = root / "work"
+            cfg.queue_dir = root / "queue"
+            cfg.approved_dir = root / "approved"
+            cfg.posted_dir = root / "posted"
+            cfg.scene_thumbs_dir = root / "scene_thumbs"
+            cfg.reviewed_dir = root / "reviewed"
+            cfg.logs_dir = root / "logs"
+
     ensure_dirs(cfg)
 
     from ic2x.utils.logging_setup import setup_logging
     setup_logging(cfg.logs_dir)
     ui.startup_banner(cfg)
+    if cfg.test_mode:
+        if cfg.x_dry_run:
+            ui.warn(f"🧪 TEST MODE (dry) · no waits · output → "
+                    f"{cfg.logs_dir.parent.relative_to(_PROJECT_ROOT)}/ · real state untouched; "
+                    "iCloud + AI calls are REAL")
+        else:
+            ui.warn("🧪 TEST MODE (LIVE POSTS) · no waits · posting to X for REAL on the real "
+                    "state.db · iCloud + AI + posts all REAL")
 
     # ── preflight: fail fast ──
     require_vision_api_credentials(cfg.judge_model, cfg.rotation_model)
+    if cfg.color_enhance_enabled:
+        from ic2x.utils.aliyun_viapi import ViapiError, check_credentials
+        try:
+            check_credentials()
+        except ViapiError as exc:
+            ui.err(str(exc))
+            return
     clients = make_clients(cfg)
     ic = ICloudPhotos(cfg)
     try:
@@ -399,6 +611,18 @@ def bot(once: bool = False) -> None:
         _notify_reauth(cfg, exc)
         return
     db = DB(cfg.db_path)
+
+    # live per-call cost meter: every priced AI call (and the flat color-enhance cost)
+    # prints its cost with the running run-total right-aligned.
+    from ic2x.utils.ai_client import reset_run_cost, set_call_cost_hook
+    reset_run_cost()
+    _csym = "¥" if pricing_currency() == "RMB" else ""
+
+    def _on_call_cost(label: str, call_cost: float, run_total: float) -> None:
+        amount = "free" if not call_cost else f"{_csym}{call_cost:.4f}"
+        ui.cost_line(f"{label} · {amount}", f"run {_csym}{run_total:.4f}")
+
+    set_call_cost_hook(_on_call_cost)
 
     # ── single-cycle test mode: force one cycle (ignore interval + daily cap) ──
     if once:
@@ -420,17 +644,49 @@ def bot(once: bool = False) -> None:
 
     signal.signal(signal.SIGINT, lambda *_: globals().__setitem__("_stop", True))
     signal.signal(signal.SIGTERM, lambda *_: globals().__setitem__("_stop", True))
-    ui.info(f"bot started — posting every {cfg.post_interval_hours}h "
-            f"(dry_run={cfg.x_dry_run}). Ctrl-C to stop.")
+    if cfg.test_mode:
+        _mode = "dry-run" if cfg.x_dry_run else "LIVE posts to X"
+        ui.info(f"🧪 test soak started — {_mode}, cycling fast"
+                f"{f' (max {test_cycles} cycles)' if test_cycles else ''}. Ctrl-C to stop.")
+    else:
+        ui.info(f"bot started — posting every {cfg.post_interval_hours}h "
+                f"(dry_run={cfg.x_dry_run}). Ctrl-C to stop.")
+
+    _today = db.get_today_stats()
+    if _today["cost_rmb"] or _today["ai_calls"]:
+        _sym = "¥" if pricing_currency() == "RMB" else ""
+        ui.info(f"today so far: {_today['ai_calls']} AI calls · {_sym}{_today['cost_rmb']:.4f}")
 
     throttles = 0
+    cycles = posts = 0
+    reason = "interrupted"
     while not _stop:
         try:
             db.reset_stuck_posting()
             flush_pending(db, cfg, clients)
-            if _due_to_post(db, cfg) and db.count_posts_rolling_24h() < cfg.max_posts_per_day:
+            if cfg.test_mode or (_due_to_post(db, cfg)
+                                 and db.count_posts_rolling_24h() < cfg.max_posts_per_day):
                 outcome = run_one_cycle(db, cfg, ic, clients)
                 logger.info("cycle: %s", outcome)
+                if cfg.test_mode:
+                    if outcome in ("exhausted", "ai_cap"):
+                        reason = ("library exhausted" if outcome == "exhausted"
+                                  else "daily AI cap reached")
+                        break
+                    if outcome == "posted":
+                        posts += 1
+                    cycles += 1
+                    if test_cycles and cycles >= test_cycles:
+                        reason = f"{cycles} cycles done"
+                        break
+                    ui.info(f"⏱  [TEST {cycles}{('/' + str(test_cycles)) if test_cycles else ''}] "
+                            f"~{cfg.post_interval_hours}h wait skipped → next cycle now")
+                elif outcome == "posted":
+                    ui.ok(f"cycle complete — next post in ~{cfg.post_interval_hours}h "
+                          "(idle; Ctrl-C to stop)")
+                else:
+                    ui.info(f"cycle complete ({outcome}) — checking again in "
+                            f"{cfg.daemon_check_interval // 60} min")
             throttles = 0
         except ReauthRequired as exc:
             _notify_reauth(cfg, exc)
@@ -444,7 +700,12 @@ def bot(once: bool = False) -> None:
         except Exception as exc:  # noqa: BLE001 — one bad cycle must not kill the bot
             logger.error("cycle error: %s", exc, exc_info=True)
 
-        _sleep_interruptible(cfg.daemon_check_interval)
+        _sleep_interruptible(0 if cfg.test_mode else cfg.daemon_check_interval)
 
     db.close()
-    ui.info("bot stopped.")
+    if cfg.test_mode:
+        _label = "dry-posts" if cfg.x_dry_run else "LIVE posts"
+        ui.ok(f"🧪 test run: {cycles} cycles · {posts} {_label} · stop: {reason}. "
+              f"Review → {cfg.reviewed_dir}/ · logs → {cfg.logs_dir}/")
+    else:
+        ui.info("bot stopped.")

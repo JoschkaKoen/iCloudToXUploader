@@ -85,6 +85,54 @@ def record_usage(
         e["input"] += input_tokens
         e["output"] += output_tokens
         e["thinking"] += thinking_tokens
+    _meter_call(model, input_tokens, output_tokens, thinking_tokens)
+
+
+# ── Per-call cost meter: a running run-total + an optional live display hook ────
+_run_cost_total: float = 0.0
+_call_cost_hook = None  # callable(label, call_cost_rmb, run_total_rmb) | None
+
+
+def set_call_cost_hook(fn) -> None:
+    """Register fn(label, call_cost, run_total) — fired after each priced call AND each
+    flat cost, for live per-call cost display. None (default) disables it; the one-shot
+    test commands leave it unset and print their own totals."""
+    global _call_cost_hook
+    _call_cost_hook = fn
+
+
+def reset_run_cost() -> None:
+    global _run_cost_total
+    with _usage_lock:
+        _run_cost_total = 0.0
+
+
+def get_run_cost() -> float:
+    with _usage_lock:
+        return _run_cost_total
+
+
+def _meter_call(model: str, in_tok: int, out_tok: int, think_tok: int) -> None:
+    from ic2x.utils.cost_report import compute_cost
+    call_cost, _ = compute_cost({model: {"input": in_tok, "output": out_tok, "thinking": think_tok}})
+    global _run_cost_total
+    with _usage_lock:
+        _run_cost_total += call_cost
+        total = _run_cost_total
+    if _call_cost_hook:
+        _call_cost_hook(model, call_cost, total)
+
+
+def add_run_flat_cost(rmb: float, label: str = "viapi") -> float:
+    """Add a non-token flat cost (e.g. VIAPI color enhance; rmb may be 0 when free) to
+    the run total and fire the display hook. Returns the new run total."""
+    global _run_cost_total
+    with _usage_lock:
+        _run_cost_total += rmb
+        total = _run_cost_total
+    if _call_cost_hook:
+        _call_cost_hook(label, rmb, total)
+    return total
 
 
 def _extract_reasoning_tokens(u: Any) -> int:
@@ -261,19 +309,39 @@ def provider_for_model(model: str) -> str:
     return "gemini"
 
 
+def parse_model_spec(value: str) -> tuple[str, str | None, int | None]:
+    """Split "model[, thinking][, max_output_tokens]" (eXercise 3-position format).
+    thinking ∈ {off, low, high} or a digit string = qwen thinking-token budget.
+    max_output_tokens = a digit string capping TOTAL output tokens (cost ceiling).
+    e.g. "qwen3.7-plus, 1000, 2000"."""
+    parts = [p.strip() for p in (value or "").split(",")]
+    model = parts[0] if parts else ""
+    effort: str | None = None
+    max_tokens: int | None = None
+    if len(parts) >= 2 and parts[1]:
+        t = parts[1].lower()
+        if t in ("off", "low", "high") or t.isdigit():
+            effort = t
+    if len(parts) >= 3 and parts[2].isdigit():
+        max_tokens = int(parts[2])
+    return model, effort, max_tokens
+
+
 def parse_model_effort(value: str) -> tuple[str, str | None]:
-    """Split "model, effort". effort ∈ {off, low, high} or, for qwen, a digit
-    string = an explicit thinking-token budget (e.g. "qwen3.5-flash, 3000")."""
-    if "," in value:
-        model_part, effort_part = value.split(",", 1)
-        effort = effort_part.strip().lower() or None
-        if effort is not None and effort not in ("off", "low", "high") and not effort.isdigit():
-            effort = None
-        return model_part.strip(), effort
-    return value.strip(), None
+    """Back-compat: (model, thinking). See parse_model_spec for the full form."""
+    model, effort, _ = parse_model_spec(value)
+    return model, effort
 
 
-def build_thinking_kwargs(provider: str, effort: str | None) -> tuple[bool, dict]:
+def build_thinking_kwargs(provider: str, effort: str | None, max_tokens: int | None = None
+                          ) -> tuple[bool, dict]:
+    use_stream, kwargs = _provider_thinking(provider, effort)
+    if max_tokens:
+        kwargs["max_tokens"] = max_tokens
+    return use_stream, kwargs
+
+
+def _provider_thinking(provider: str, effort: str | None) -> tuple[bool, dict]:
     if provider == "gemini":
         if effort == "off":
             return False, {"reasoning_effort": "none"}
@@ -398,13 +466,13 @@ def make_ai_client(
     *,
     ollama_base_url: str | None = None,
     deterministic: bool = True,
-) -> tuple[Any, str, str, str | None] | None:
+) -> tuple[Any, str, str, str | None, int | None] | None:
     try:
         from openai import OpenAI
     except ImportError:
         return None
 
-    model, effort = parse_model_effort(model_string or _DEFAULT_MODEL)
+    model, effort, max_tokens = parse_model_spec(model_string or _DEFAULT_MODEL)
     provider = provider_for_model(model)
     pdef = next((p for p in _PROVIDER_REGISTRY if p.name == provider), _PROVIDER_REGISTRY[0])
 
@@ -431,7 +499,7 @@ def make_ai_client(
         return None
 
     client: Any = _TrackedOpenAIClient(raw_client, model, deterministic=deterministic)
-    return client, model, provider, effort
+    return client, model, provider, effort, max_tokens
 
 
 def warmup_ollama(base_url: str, model: str, max_wait: float = 90.0) -> None:
@@ -636,8 +704,8 @@ def call_vision_judge(
             logger.warning("%s: no AI client — %s", call.label, detail)
             return call.fail_value, _elapsed(), False, False
 
-        client, model, provider, effort = result
-        use_stream, extra_kwargs = build_thinking_kwargs(provider, effort)
+        client, model, provider, effort, max_tokens = result
+        use_stream, extra_kwargs = build_thinking_kwargs(provider, effort, max_tokens)
         img_b64 = encode_image_b64(call.image_path, max_px=call.max_px)
 
         cache_on = response_cache_enabled()
@@ -789,13 +857,13 @@ def call_vision_judge_multi(
             logger.warning("%s: no AI client — %s", call.label, detail)
             return call.fail_value, _elapsed(), False, False
 
-        client, model, provider, effort = result
+        client, model, provider, effort, max_tokens = result
         if provider == "ollama":
             logger.warning("%s: multi-image burst judge requires a cloud model, got %s",
                            call.label, model)
             return call.fail_value, _elapsed(), False, False
 
-        use_stream, extra_kwargs = build_thinking_kwargs(provider, effort)
+        use_stream, extra_kwargs = build_thinking_kwargs(provider, effort, max_tokens)
         b64s = [encode_image_b64(p, max_px=call.max_px) for p in call.image_paths]
 
         cache_on = response_cache_enabled()

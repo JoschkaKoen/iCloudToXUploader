@@ -41,7 +41,8 @@ def compare(models: list[str], n_bursts: int = 5, keep: bool = False) -> None:
 
     ui.info(f"Assembling {n_bursts} recent burst(s) …")
     screenshot_ids = ic.screenshot_ids()
-    stream = _Stream(ic.iter_image_assets(), db)
+    stream = _Stream(ic.iter_image_assets(), db, cfg, ic, screenshot_ids,
+                     concurrency=cfg.prefetch_concurrency)
     bursts = []
     while len(bursts) < n_bursts:
         b = assemble_burst(stream, cfg, ic, screenshot_ids)
@@ -71,7 +72,7 @@ def compare(models: list[str], n_bursts: int = 5, keep: bool = False) -> None:
                                    model_string=models[mi], usage_out=usage)
         return mi, bi, v, usage
 
-    with ThreadPoolExecutor(max_workers=min(16, len(tasks))) as ex:
+    with ThreadPoolExecutor(max_workers=max(1, len(tasks))) as ex:
         outs = list(ex.map(_run, tasks))
 
     results: dict[str, dict] = {}
@@ -96,6 +97,7 @@ def compare(models: list[str], n_bursts: int = 5, keep: bool = False) -> None:
     for b in bursts:
         for m in b.members:
             _unlink(m.thumb)
+    stream.close()  # drop prefetched-but-unconsumed thumbnails
     db.close()
     _unlink(tmp_path)
 

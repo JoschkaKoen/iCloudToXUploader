@@ -5,9 +5,13 @@ state.db-wal
 state.db-shm
 inbox/
 work/
+test_run/
 compare_out/
 classify_out/
 rotate_out/
+enhance_out/
+polish_out/
+scene_thumbs/
 queue/
 approved/
 posted/

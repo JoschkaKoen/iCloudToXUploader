@@ -63,6 +63,7 @@ def _cfg():
         burst_max_size=5, burst_hamming_threshold=8, burst_max_attempts=3,
         daily_ai_calls=200, hamming_threshold=12, rotation_enabled=False,
         x_dry_run=True, post_max_attempts=3, max_posts_per_day=6, thumb_version="thumb",
+        prefetch_concurrency=4, scene_dedup_enabled=False,
         keep_reviewed=False, reviewed_dir=_TMP / "reviewed",
         work_dir=_TMP / "work", queue_dir=_TMP / "queue",
         approved_dir=_TMP / "approved", posted_dir=_TMP / "posted", logs_dir=_TMP / "logs",

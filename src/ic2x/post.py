@@ -82,6 +82,27 @@ def _post_image(path: Path, caption: str, sha256: str, db: DB, api_v1, client_v2
     return tweet_id, tweet_url
 
 
+def _save_scene_thumb(src: Path, phash: str, cfg: Config) -> None:
+    """Write a small scene_thumbs/{phash}.jpg for the same-scene dedup set.
+    Best-effort — never raises, never blocks a post."""
+    if not phash:
+        return
+    try:
+        from PIL import Image
+
+        from ic2x.utils.image_utils import oriented
+        max_px = cfg.scene_dedup_image_max_px or 384
+        cfg.scene_thumbs_dir.mkdir(parents=True, exist_ok=True)
+        with Image.open(src) as im:
+            im = oriented(im)
+            if im.mode != "RGB":
+                im = im.convert("RGB")
+            im.thumbnail((max_px, max_px))
+            im.save(cfg.scene_thumbs_dir / f"{phash}.jpg", "JPEG", quality=85)
+    except Exception as exc:  # noqa: BLE001 — dedup aid, never fatal
+        logger.warning("scene_thumb: could not save %s: %s", phash, exc)
+
+
 def post_one(row, cfg: Config, db: DB, api_v1, client_v2) -> bool:
     """Post one APPROVED row (file at approved_dir/{phash}.jpg). Returns True on
     success. On failure: bumps post_attempts; once >= cfg.post_max_attempts marks
@@ -110,6 +131,7 @@ def post_one(row, cfg: Config, db: DB, api_v1, client_v2) -> bool:
             _, tweet_url = _post_image(img_path, caption, sha256, db, api_v1, client_v2)
             ui.post_ok(tweet_url)
 
+        _save_scene_thumb(img_path, phash, cfg)  # small thumb for same-scene dedup
         dest = cfg.posted_dir / filename
         try:
             shutil.move(str(img_path), str(dest))

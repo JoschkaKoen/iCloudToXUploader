@@ -17,6 +17,10 @@ dependencies = [
   "pyyaml",       # used by enhance.py subprocess (InstructIR model config)
   "python-dotenv",
   "rich>=13",
+  # Alibaba Cloud VIAPI imageenhan — image super-resolution / color enhancement (AccessKey auth)
+  "alibabacloud_imageenhan20190930",
+  "alibabacloud_tea_openapi",
+  "alibabacloud_tea_util",
 ]
 
 [project.scripts]

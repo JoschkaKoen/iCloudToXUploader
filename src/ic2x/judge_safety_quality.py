@@ -37,21 +37,44 @@ Flag any that apply (include the string in the "flags" array):
 
 Set "safe": false if any flag applies. Be strict — when in doubt, flag."""
 
-QUALITY_BLOCK = """── QUALITY (only if safe=true) ───────────────────────────────────────────────────────────────────────────
-Would this image be worth posting on a personal photo account on X?
+QUALITY_BLOCK = """── QUALITY (only if safe=true) ───────────────────────────────────────────────
+Would this be a reasonable post on a CASUAL personal photo feed (travel, food,
+daily life)? The bar is "nice enough to share," NOT "portfolio-worthy." An
+ordinary photo with a clear subject or a pleasant scene IS interesting — it does
+not need to be striking or unusual.
 
-Accept: interesting composition, travel scenes with character, striking light
-        or colour, unusual subjects, moments with a visible story, humor,
-        nature, architecture.
+POST (interesting=true) — everyday is fine:
+- food and meals: dishes, restaurants, street food, drinks (ordinary meals count)
+- scenery: rivers, lakes, water reflections, sunsets, golden hour, sky, nature, parks
+- places & street scenes with something to look at: shops, night/city views,
+  architecture, a sign that is part of a scene, a moment with character or humor
 
-Reject as NOT interesting:
-- selfies or images where the photographer's face/body is the main subject
-- blurry, dark, or accidentally triggered shots
-- plain sky, plain wall, empty table, unmade bed
-- food photos with no distinctive context
-- duplicates of extremely common scenes (generic latte art, standard sunset)
-- screenshots or screencasts
-- nothing visually engaging after 2 seconds of looking"""
+SKIP (interesting=false) — only when GENUINELY weak:
+- no clear subject: empty, cluttered, or "vibes" frames with nothing to look at
+- a bare logo, plain signboard, or storefront with no surrounding scene
+- generic indoor shots with nothing of interest
+- blurry, dark, or accidental shots; plain wall / sky / empty table; unmade bed
+- a selfie where the photographer is the main subject
+- low-information images a stranger would instantly scroll past
+
+When unsure about an ordinary-but-pleasant photo that has a clear subject, POST it.
+Reserve interesting=false for photos that are clearly weak or have nothing to show."""
+
+CAPTION_BLOCK = """── CAPTION (only if interesting=true) ────────────────────────────────────────
+Write for an INTERNATIONAL audience — viewers OUTSIDE China who do NOT know
+Chinese food, places, or customs. The caption should make them SEE the photo.
+
+- Describe what is actually visible in plain, vivid words: the dish and its main
+  components, or the scene and its mood — what the eye sees, not a bare label.
+- Assume ZERO knowledge of Chinese terms. If something has no common English
+  name (e.g. zongzi, baozi, jianbing, youtiao), DESCRIBE it instead of naming it
+  — e.g. not "zongzi" but "sticky rice dumplings wrapped in bamboo leaves". A
+  local name may follow in parentheses, AFTER the description.
+- One casual, warm sentence, like a person sharing their day. ≤200 chars, no hashtags.
+- Include at least ONE emoji that MATCHES the real subject (🍜 noodles, 🥢 meal,
+  🍲 stew, 🫓 flatbread, 🍳 eggs, 🌅 sunset, 🌊 river, 🏞 landscape, 🏮 lanterns,
+  🌃 night city, 🛕 temple, 🍵 tea). Pick it from the photo and VARY it shot to
+  shot. NEVER default to the 🇨🇳 flag — use a flag only if a flag is the subject."""
 
 JUDGE_PROMPT = f"""You are a content reviewer for a personal photo account on X (Twitter).
 Analyze this image and return ONLY valid JSON — no markdown, no explanation.
@@ -62,7 +85,7 @@ Schema:
   "flags": [],
   "interesting": bool,
   "description": "one factual sentence about what is shown",
-  "caption": "casual tweet caption, ≤100 chars, no hashtags",
+  "caption": "descriptive caption for an international audience — see CAPTION rules; ≤200 chars, no hashtags, ≥1 topic-matching emoji",
   "reason": "brief explanation of the quality decision"
 }}
 
@@ -70,6 +93,8 @@ Schema:
 If safe=false: set interesting=false, description="", caption="", reason="unsafe".
 
 {QUALITY_BLOCK}
+
+{CAPTION_BLOCK}
 
 JSON only."""
 
@@ -117,12 +142,12 @@ def call_safety_quality(image_path: Path, cfg: Config) -> tuple[dict, float, boo
         return _fail("error:bad_shape"), elapsed, used_network
 
     caption = parsed.get("caption") or ""
-    if len(caption) > 100:
+    if len(caption) > 200:
         logger.info(
-            "judge: truncated caption from %d to 100 chars for %s",
+            "judge: truncated caption from %d to 200 chars for %s",
             len(caption), image_path.name,
         )
-    parsed["caption"] = caption[:100]
+    parsed["caption"] = caption[:200]
     parsed.setdefault("flags", [])
     parsed.setdefault("description", "")
     parsed.setdefault("reason", "")

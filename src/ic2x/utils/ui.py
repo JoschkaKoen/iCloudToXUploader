@@ -1,8 +1,12 @@
 """
 Console UI helpers — pretty terminal output for ic2x.
-All functions use rich Console directly so they never appear in log files.
+Each message is ALSO mirrored as plain text to the `ic2x.console` logger (a
+file-only handler configured in logging_setup), so a background run's activity
+is captured in logs/<date>.log alongside the logger.* diagnostics — without ANSI.
 Ported and adapted from XBot-3/utils/ui.py.
 """
+
+import logging
 
 from rich import box
 from rich.console import Console
@@ -12,6 +16,7 @@ from rich.table import Table
 
 console = Console()               # stdout — all UI output
 err_console = Console(stderr=True)  # stderr — only ui.err()
+_clog = logging.getLogger("ic2x.console")  # file-only mirror of console activity
 
 
 # ── Startup ───────────────────────────────────────────────────────────────────
@@ -43,6 +48,8 @@ def startup_banner(cfg) -> None:
         box=box.DOUBLE,
     ))
     console.print()
+    _clog.info("IC2X start — user=%s  interval=%sh  judge=%s  dry_run=%s",
+               cfg.icloud_username, cfg.post_interval_hours, judge_str, cfg.x_dry_run)
 
 
 # ── Section headers ───────────────────────────────────────────────────────────
@@ -87,18 +94,33 @@ def stage_banner(step: int, total: int, name: str) -> None:
 
 def ok(msg: str) -> None:
     console.print(f"  [green]✅  {escape(msg)}[/]")
+    _clog.info("OK  %s", msg)
 
 
 def info(msg: str) -> None:
     console.print(f"  [dim]ℹ   {escape(msg)}[/]")
+    _clog.info("%s", msg)
 
 
 def warn(msg: str) -> None:
     console.print(f"  [yellow]⚠   {escape(msg)}[/]")
+    _clog.warning("%s", msg)
 
 
 def err(msg: str) -> None:
     err_console.print(f"  [red]✖   {escape(msg)}[/]")
+    _clog.error("%s", msg)
+
+
+def cost_line(left: str, right: str) -> None:
+    """A per-call cost line: `left` (the call + its cost) on the left, `right` (the
+    running run-total) right-aligned to the terminal width."""
+    t = Table.grid(expand=True)
+    t.add_column(justify="left", ratio=1)
+    t.add_column(justify="right")
+    t.add_row(f"  [dim]💰 {escape(left)}[/]", f"[dim]{escape(right)}[/]")
+    console.print(t)
+    _clog.info("%s    %s", left, right)
 
 
 # ── Decision outputs ──────────────────────────────────────────────────────────
@@ -179,12 +201,14 @@ def post_banner(filename: str, caption: str, dry_run: bool) -> None:
 
 def post_ok(tweet_url: str) -> None:
     console.print(f"  [green]✅  Posted → {escape(tweet_url)}[/]")
+    _clog.info("Posted → %s", tweet_url)
 
 
 def post_dry(filename: str, caption: str) -> None:
     console.print(
         f"  [yellow]⚠   [DRY RUN] would post {escape(filename)}: {escape(caption)}[/]"
     )
+    _clog.info("[DRY RUN] would post %s: %s", filename, caption)
 
 
 def post_summary(posted: int, dry_run: bool) -> None:

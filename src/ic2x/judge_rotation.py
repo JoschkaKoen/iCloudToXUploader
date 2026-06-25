@@ -20,34 +20,45 @@ from ic2x.utils.ai_client import (
 
 logger = logging.getLogger("ic2x.judge_rotation")
 
-ROTATION_PROMPT = """Look at this image and determine if it is correctly oriented (right-side up).
-Return ONLY valid JSON — no markdown, no explanation:
-{"upright": true, "rotate_cw_degrees": 0}
+ROTATION_PROMPT = """Decide the clockwise rotation needed to make this photo upright.
 
-rotate_cw_degrees must be one of: 0, 90, 180, 270
-- 0   → already upright, no rotation needed
-- 90  → rotate clockwise 90° to make it upright
-- 180 → rotate 180° (image is upside down)
-- 270 → rotate clockwise 270° to make it upright
+Reason from real-world cues before answering:
+- Sky, ceilings, and light sources are usually at the TOP.
+- People, buildings, trees, bottles, and signs stand VERTICALLY.
+- Faces are right-side up (eyes above mouth).
+- Readable text runs horizontally, left-to-right.
+- Floors, tables, and water surfaces are horizontal, near the BOTTOM.
+
+Then return ONLY valid JSON — no markdown:
+{"upright": <bool>, "rotate_cw_degrees": <0|90|180|270>}
+
+rotate_cw_degrees = the clockwise rotation to APPLY to make it upright:
+- 0   → already upright
+- 90  → currently the top of the scene points LEFT  → rotate 90° clockwise
+- 180 → upside down
+- 270 → currently the top of the scene points RIGHT → rotate 270° clockwise (= 90° counter-clockwise)
 
 JSON only."""
 
 _OK: dict = {"upright": True, "rotate_cw_degrees": 0}
 
 
-def call_rotation(image_path: Path, cfg: Config) -> tuple[dict, float, bool]:
+def call_rotation(image_path: Path, cfg: Config, model_string: str | None = None
+                  ) -> tuple[dict, float, bool]:
     """Check if image_path is correctly oriented.
 
     Returns (result_dict, elapsed_seconds, used_network).
     result_dict always has {"upright": bool, "rotate_cw_degrees": int}.
     Fails open: errors return {"upright": True, "rotate_cw_degrees": 0}.
+    model_string overrides cfg.rotation_model (used by `autorotate` to compare).
     """
-    model, _ = parse_model_effort(cfg.rotation_model)
+    model_str = model_string or cfg.rotation_model
+    model, _ = parse_model_effort(model_str)
     is_ollama = provider_for_model(model) == "ollama"
     max_px = cfg.ollama_image_max_px if is_ollama else cfg.rotation_image_max_px
 
     parsed, elapsed, ok, used_network = call_vision_judge(
-        model_string=cfg.rotation_model,
+        model_string=model_str,
         ollama_base_url=cfg.ollama_base_url,
         call=JudgeCall(
             image_path=image_path,

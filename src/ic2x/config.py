@@ -61,6 +61,11 @@ class Config:
     twitter_access_token: str
     twitter_access_token_secret: str
     x_dry_run: bool
+    test_mode: bool                 # IC2X_TEST_MODE / --test: dry-run + fast loop + isolated test_run/ state
+
+    # Location stamp (GPS EXIF → "📍 City, Country" caption line)
+    location_enabled: bool
+    location_timeout: float
 
     # Limits / dedup
     daily_ai_calls: int             # also bounds walk-back cost per day
@@ -72,6 +77,7 @@ class Config:
     burst_max_attempts: int         # pre-commit failures before SEEN(error) (poison-burst breaker)
     thumb_version: str              # pyicloud rendition for burst eval: thumb | medium
     screenshot_album_refresh_cycles: int  # cycles between Screenshots-album flag refreshes
+    prefetch_concurrency: int       # thumbnails downloaded+hashed in parallel per batch (1 = serial)
 
     # Posting / loop
     post_interval_hours: int
@@ -90,9 +96,26 @@ class Config:
     rotation_model: str             # ROTATION_MODEL or default_model
     rotation_image_max_px: int | None
 
+    # Scene dedup + grouping (cheap VLM "same scene/object" — dedup vs recent posts,
+    # and grouping at burst-assembly to merge orientation/angle variants into 1 scene)
+    scene_dedup_enabled: bool
+    scene_group_enabled: bool
+    scene_dedup_model: str
+    scene_dedup_recent_n: int
+    scene_dedup_image_max_px: int | None
+    scene_thumbs_dir: Path
+
+    # Color enhancement (Aliyun VIAPI EnhanceImageColor on the winner before posting)
+    color_enhance_enabled: bool
+    color_enhance_mode: str          # Rec709 (natural) | ln17_256 (stronger) | LogC
+    color_enhance_max_edge: int      # downscale long edge before sending (API input cap)
+    color_enhance_cost_rmb: float    # per call beyond the free monthly quota (cost tracking)
+    color_enhance_free_quota: int    # free calls per calendar month (Aliyun gives 100)
+
     # AI models / vision
     default_model: str             # AI_DEFAULT_MODEL (with optional ", effort" suffix)
     judge_model: str               # JUDGE_MODEL or default_model
+    judge_extra_rules: str         # owner-specific do-not-post rules appended to the judge prompt
     ollama_base_url: str
     judge_image_max_px: int | None       # cloud providers; None = full-res (rare)
     ollama_image_max_px: int | None      # all Ollama calls (memory-bound)
@@ -181,6 +204,11 @@ def load_config() -> Config:
         twitter_access_token=_require_env("TWITTER_ACCESS_TOKEN"),
         twitter_access_token_secret=_require_env("TWITTER_ACCESS_TOKEN_SECRET"),
         x_dry_run=_bool_env("X_DRY_RUN", default=True),
+        test_mode=_bool_env("IC2X_TEST_MODE", default=False),
+
+        # Location stamp (GPS EXIF → "📍 City, Country")
+        location_enabled=_bool_env("LOCATION_ENABLED", default=True),
+        location_timeout=float(_int_env("LOCATION_TIMEOUT", 10)),
 
         # Limits / dedup
         daily_ai_calls=_int_env("DAILY_AI_CALLS", 200),
@@ -192,6 +220,7 @@ def load_config() -> Config:
         burst_max_attempts=_int_env("BURST_MAX_ATTEMPTS", 3),
         thumb_version=os.getenv("THUMB_VERSION", "").strip() or "thumb",
         screenshot_album_refresh_cycles=_int_env("SCREENSHOT_ALBUM_REFRESH", 20),
+        prefetch_concurrency=_int_env("PREFETCH_CONCURRENCY", 6),
 
         # Posting / loop
         post_interval_hours=_int_env("POST_INTERVAL_HOURS", 5),
@@ -210,9 +239,25 @@ def load_config() -> Config:
         rotation_model=rotation_model,
         rotation_image_max_px=_opt_int_env("ROTATION_IMAGE_MAX_PX", _DEFAULT_JUDGE_MAX_PX),
 
+        # Scene dedup + grouping
+        scene_dedup_enabled=_bool_env("SCENE_DEDUP_ENABLED", default=False),
+        scene_group_enabled=_bool_env("SCENE_GROUP_ENABLED", default=False),
+        scene_dedup_model=os.getenv("SCENE_DEDUP_MODEL", "").strip() or "qwen3-vl-flash",
+        scene_dedup_recent_n=_int_env("SCENE_DEDUP_RECENT_N", 6),
+        scene_dedup_image_max_px=_opt_int_env("SCENE_DEDUP_IMAGE_MAX_PX", 384),
+        scene_thumbs_dir=_resolve(os.getenv("SCENE_THUMBS_DIR", "./scene_thumbs")),
+
+        # Color enhancement (EnhanceImageColor on the winner before posting)
+        color_enhance_enabled=_bool_env("COLOR_ENHANCE_ENABLED", default=False),
+        color_enhance_mode=os.getenv("COLOR_ENHANCE_MODE", "").strip() or "ln17_256",
+        color_enhance_max_edge=_int_env("COLOR_ENHANCE_MAX_EDGE", 1920),
+        color_enhance_cost_rmb=float(os.getenv("COLOR_ENHANCE_COST_RMB", "").strip() or "0.02"),
+        color_enhance_free_quota=_int_env("COLOR_ENHANCE_FREE_QUOTA", 100),
+
         # AI models / vision
         default_model=default_model,
         judge_model=judge_model,
+        judge_extra_rules=os.getenv("JUDGE_EXTRA_RULES", "").strip(),
         ollama_base_url=os.getenv("OLLAMA_BASE_URL", "").strip() or _DEFAULT_OLLAMA_URL,
         judge_image_max_px=_opt_int_env("JUDGE_IMAGE_MAX_PX", _DEFAULT_JUDGE_MAX_PX),
         ollama_image_max_px=_opt_int_env("OLLAMA_IMAGE_MAX_PX", None),
@@ -228,6 +273,7 @@ def ensure_dirs(cfg: Config) -> None:
         cfg.posted_dir,
         cfg.logs_dir,
         cfg.reviewed_dir,
+        cfg.scene_thumbs_dir,
         cfg.icloud_cookie_dir,
     ]
     for d in dirs:

@@ -11,7 +11,7 @@ import logging
 from pathlib import Path
 
 from ic2x.config import Config
-from ic2x.judge_safety_quality import QUALITY_BLOCK, SAFETY_BLOCK
+from ic2x.judge_safety_quality import CAPTION_BLOCK, QUALITY_BLOCK, SAFETY_BLOCK
 from ic2x.utils.ai_client import (
     MultiJudgeCall,
     call_vision_judge_multi,
@@ -21,7 +21,7 @@ from ic2x.utils.ai_client import (
 
 logger = logging.getLogger("ic2x.judge_burst")
 
-BURST_PROMPT = f"""You are choosing ONE photo to post to a personal photo account on X (Twitter),
+_BURST_PROMPT_HEAD = f"""You are choosing ONE photo to post to a personal photo account on X (Twitter),
 from a set of near-identical consecutive shots, and vetting it.
 You are given N images, each preceded by a line "Image index i:" (i from 0).
 Return ONLY valid JSON — no markdown, no explanation.
@@ -32,7 +32,7 @@ Schema:
   "safe": bool,
   "flags": [],
   "interesting": bool,
-  "caption": "casual tweet caption for the chosen shot, ≤100 chars, no hashtags",
+  "caption": "descriptive caption for the chosen shot for an international audience — see CAPTION rules; ≤200 chars, no hashtags, ≥1 topic-matching emoji",
   "reason": "one short sentence: why this index, and the quality/safety call"
 }}
 
@@ -43,7 +43,20 @@ If safe=false: set interesting=false, caption="", reason="unsafe".
 
 {QUALITY_BLOCK}
 
-JSON only."""
+{CAPTION_BLOCK}"""
+
+
+def burst_prompt(cfg: Config) -> str:
+    """The burst judge prompt, with the owner's do-not-post rules appended."""
+    parts = [_BURST_PROMPT_HEAD]
+    extra = (cfg.judge_extra_rules or "").strip()
+    if extra:
+        parts.append(
+            "── OWNER'S DO-NOT-POST RULES (these OVERRIDE the above; obey them) ──\n"
+            + extra
+        )
+    parts.append("JSON only.")
+    return "\n\n".join(parts)
 
 
 def _fail(flag: str) -> dict:
@@ -78,7 +91,7 @@ def judge_burst(
         ollama_base_url=cfg.ollama_base_url,
         call=MultiJudgeCall(
             image_paths=thumb_paths,
-            prompt=BURST_PROMPT,
+            prompt=burst_prompt(cfg),
             max_px=cfg.judge_image_max_px,
             fail_value=_fail("error:no_client"),
             refused_value=_fail("model_refused"),
@@ -101,7 +114,7 @@ def judge_burst(
     parsed["best_index"] = max(0, min(idx, len(thumb_paths) - 1))
 
     caption = parsed.get("caption") or ""
-    parsed["caption"] = caption[:100]
+    parsed["caption"] = caption[:200]
     parsed.setdefault("flags", [])
     parsed.setdefault("reason", "")
     return parsed, elapsed, used_network

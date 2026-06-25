@@ -63,7 +63,8 @@ class FakeIC:
 
 def _cfg(max_size: int = 3, ham: int = 8):
     return SimpleNamespace(burst_max_size=max_size, burst_hamming_threshold=ham,
-                           thumb_version="thumb", work_dir=_TMP / "work")
+                           thumb_version="thumb", work_dir=_TMP / "work",
+                           prefetch_concurrency=4)
 
 
 (_TMP / "work").mkdir(exist_ok=True)
@@ -84,15 +85,16 @@ def _asset(aid: str, scene: int, variant: int = 0, *, dead: bool = False):
     return (aid, p)
 
 
-def _stream(db: DB, items):
+def _stream(db: DB, items, cfg, screenshots=()):
     def gen():
         for aid, path in items:
             yield SimpleNamespace(id=aid), _FakeAsset(aid, path)
-    return _Stream(gen(), db)
+    return _Stream(gen(), db, cfg, FakeIC(), set(screenshots),
+                   concurrency=getattr(cfg, "prefetch_concurrency", 4))
 
 
 def _burst(db, items, cfg, screenshots=()):
-    return assemble_burst(_stream(db, items), cfg, FakeIC(), set(screenshots))
+    return assemble_burst(_stream(db, items, cfg, screenshots), cfg, FakeIC(), set(screenshots))
 
 
 # ── tests ───────────────────────────────────────────────────────────────────────
@@ -115,7 +117,7 @@ def test_single_asset_burst():
 def test_two_distinct_scenes_no_gap_drop():
     """Both scenes must be reachable as the shared stream advances (no drop)."""
     db = _fresh_db()
-    stream = _stream(db, [_asset("A", 0, 1), _asset("B", 2, 1)])  # far pHash
+    stream = _stream(db, [_asset("A", 0, 1), _asset("B", 2, 1)], _cfg())  # far pHash
     b1 = assemble_burst(stream, _cfg(), FakeIC(), set())
     assert [m.asset_id for m in b1.members] == ["A"]
     db.commit_burst(["A"], None)

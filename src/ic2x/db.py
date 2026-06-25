@@ -53,7 +53,9 @@ CREATE INDEX IF NOT EXISTS idx_images_asset ON images(asset_id);
 CREATE TABLE IF NOT EXISTS run_stats (
     date            TEXT PRIMARY KEY,
     ai_calls        INTEGER DEFAULT 0,
-    images_posted   INTEGER DEFAULT 0
+    images_posted   INTEGER DEFAULT 0,
+    cost_rmb        REAL DEFAULT 0,     -- estimated daily AI spend (tokens + any flat API)
+    color_calls     INTEGER DEFAULT 0   -- VIAPI color-enhance calls (for the monthly free quota)
 );
 
 CREATE TABLE IF NOT EXISTS run_state (
@@ -70,7 +72,16 @@ class DB:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Add columns to pre-existing tables (CREATE TABLE IF NOT EXISTS won't)."""
+        for col, ddl in (("cost_rmb", "REAL DEFAULT 0"), ("color_calls", "INTEGER DEFAULT 0")):
+            try:
+                self._conn.execute(f"ALTER TABLE run_stats ADD COLUMN {col} {ddl}")
+            except sqlite3.OperationalError:
+                pass  # column already present
 
     def close(self) -> None:
         self._conn.close()
@@ -251,6 +262,56 @@ class DB:
         )
         self._conn.commit()
 
+    def add_run_cost(self, rmb: float) -> None:
+        """Accumulate today's estimated AI spend (RMB). Source-agnostic sink — token
+        costs (compute_cost) and any flat per-call costs (e.g. VIAPI enhancement) both
+        feed here, so `ic2x cost` shows the bot's true running spend."""
+        if not rmb:
+            return
+        self._ensure_today_stats()
+        self._conn.execute(
+            "UPDATE run_stats SET cost_rmb = COALESCE(cost_rmb, 0) + ? WHERE date = ?",
+            (rmb, self._today()),
+        )
+        self._conn.commit()
+
+    def get_today_stats(self) -> dict[str, float]:
+        self._ensure_today_stats()
+        row = self._conn.execute(
+            "SELECT ai_calls, images_posted, COALESCE(cost_rmb, 0) AS cost_rmb "
+            "FROM run_stats WHERE date = ?", (self._today(),)
+        ).fetchone()
+        return {"ai_calls": row["ai_calls"], "images_posted": row["images_posted"],
+                "cost_rmb": row["cost_rmb"]}
+
+    def recent_stats(self, days: int = 14) -> list[dict]:
+        """Per-day (date, ai_calls, images_posted, cost_rmb), newest first — for `ic2x cost`."""
+        rows = self._conn.execute(
+            "SELECT date, ai_calls, images_posted, COALESCE(cost_rmb, 0) AS cost_rmb "
+            "FROM run_stats ORDER BY date DESC LIMIT ?", (days,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def increment_color_calls(self) -> int:
+        """Bump today's VIAPI color-enhance call count; return this calendar month's
+        running total, so the caller can apply the free-N-per-month quota."""
+        self._ensure_today_stats()
+        self._conn.execute(
+            "UPDATE run_stats SET color_calls = COALESCE(color_calls, 0) + 1 WHERE date = ?",
+            (self._today(),),
+        )
+        self._conn.commit()
+        return self.month_color_calls()
+
+    def month_color_calls(self, month: str | None = None) -> int:
+        """Total VIAPI color-enhance calls in `month` (YYYY-MM, default current month)."""
+        month = month or self._today()[:7]
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(color_calls), 0) AS n FROM run_stats WHERE date LIKE ?",
+            (f"{month}-%",),
+        ).fetchone()
+        return row["n"]
+
     def count_posts_rolling_24h(self) -> int:
         """Posts in the last 24h — a timezone-stable cap (the prod box is UTC+8)."""
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
@@ -259,6 +320,15 @@ class DB:
             (Status.POSTED.value, cutoff),
         ).fetchone()
         return row[0] if row else 0
+
+    def recent_posted_phashes(self, limit: int) -> list[str]:
+        """Phashes of the most recently POSTED images, newest first (scene dedup)."""
+        rows = self._conn.execute(
+            "SELECT phash FROM images WHERE status = ? AND phash IS NOT NULL "
+            "ORDER BY posted_at DESC LIMIT ?",
+            (Status.POSTED.value, limit),
+        ).fetchall()
+        return [r["phash"] for r in rows]
 
     # ── Run state (generic key/value) ──────────────────────────────────────────
 

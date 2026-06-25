@@ -64,12 +64,6 @@ def classify(count: int = 30, rotate: bool = False) -> None:
                 raise
             except Exception:  # noqa: BLE001 — undecodable, skip
                 continue
-            if rotate:
-                from ic2x.rotate import autorotate_thumb
-                try:
-                    autorotate_thumb(dest, cfg)
-                except Exception as exc:  # noqa: BLE001 — never block classification
-                    logger.warning("rotate: skipped %s (%s)", meta.filename, exc)
             items.append((meta, dest))
             if len(items) >= count:
                 break
@@ -80,6 +74,20 @@ def classify(count: int = 30, rotate: bool = False) -> None:
     if not items:
         ui.warn("No non-screenshot photos found.")
         return
+
+    if rotate:
+        from ic2x.rotate import autorotate_thumb
+        ui.info(f"Auto-rotating {len(items)} images with {cfg.rotation_model} (parallel) …")
+
+        def _rot(it):
+            meta, thumb = it
+            try:
+                autorotate_thumb(thumb, cfg)
+            except Exception as exc:  # noqa: BLE001 — never block classification
+                logger.warning("rotate: skipped %s (%s)", meta.filename, exc)
+
+        with ThreadPoolExecutor(max_workers=max(1, len(items))) as ex:
+            list(ex.map(_rot, items))
 
     ui.info(f"Classifying {len(items)} images with {cfg.judge_model} (parallel) …")
 
