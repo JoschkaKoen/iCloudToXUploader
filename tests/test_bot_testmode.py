@@ -60,6 +60,7 @@ class FakeIC:
             yield SimpleNamespace(id=aid, filename=f"{aid}.jpg"), _FakeAsset(aid, path)
 
     def download(self, asset, version, dest):
+        dest.parent.mkdir(parents=True, exist_ok=True)  # real download does this too
         shutil.copy(asset._path, dest)
         return dest
 
@@ -96,6 +97,8 @@ def test_bot_test_mode_isolates_state_and_bounds_cycles():
     cfg.rotation_enabled = False
     cfg.location_enabled = False
     cfg.color_enhance_enabled = False   # keep the soak offline (no Aliyun calls)
+    cfg.caption_pass_enabled = False    # keep the soak offline (no caption VLM call)
+    cfg.reconcile_on_startup = False    # keep the soak offline (no X reads)
     real_cookie = cfg.icloud_cookie_dir
 
     bot._stop = False

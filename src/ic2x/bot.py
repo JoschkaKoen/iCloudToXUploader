@@ -150,10 +150,15 @@ class _Stream:
         self._n = max(1, concurrency)
         self._buf: deque[_Ready] = deque()
         self._exhausted = False
+        self._scanned = 0  # already-reviewed photos skipped this cycle (for progress)
 
     def _raw_next(self):
         for meta, asset in self._it:
             if self._db.seen_asset_id(meta.id):
+                self._scanned += 1
+                if self._scanned % 200 == 0:
+                    ui.info(f"   … {self._scanned} recent photos already reviewed — "
+                            "still scanning for a new one")
                 continue
             return (meta, asset)
         return None
@@ -336,13 +341,13 @@ def _prepare_winner(db: DB, cfg: Config, ic: ICloudPhotos, winner: BurstMember, 
                 "status": Status.REJECTED, "reject_stage": "duplicate",
                 "reject_reason": "sha/phash near-duplicate of a kept image", "caption": "",
             }
-        # Location stamp from the original's GPS EXIF — read HERE, before prepare()
-        # and rotation strip EXIF from the posted JPEG (we share the city as text,
-        # never the exact coordinates). Best-effort: None if no GPS / geocode fails.
-        location = None
+        # Where + when this was shot, from the original's GPS/EXIF — read HERE, before
+        # prepare()/rotation strip EXIF from the posted JPEG. Both feed the caption pass
+        # below and the 📍 line (we share the city as text, never the coordinates).
+        from ic2x import geo
+        place = when = None
         try:
-            from ic2x import geo
-            location = geo.location_line(orig, cfg)
+            place, when = geo.place_and_time(orig, cfg)
         except Exception as exc:  # noqa: BLE001 — optional; never block the post
             logger.warning("location: skipped (%s)", exc)
 
@@ -377,8 +382,24 @@ def _prepare_winner(db: DB, cfg: Config, ic: ICloudPhotos, winner: BurstMember, 
                         cost, f"color-enhance {cfg.color_enhance_mode} [{month_n}/{free}/mo]")
             except Exception as exc:  # noqa: BLE001 — enhancement must never block a post
                 logger.warning("color enhance: skipped (%s)", exc)
+        # Final caption: a dedicated pass on the prepared image that KNOWS the place +
+        # local time, so it ties what's visible to real local knowledge instead of
+        # generic filler. Best-effort — keep the judge's caption if it fails.
+        if getattr(cfg, "caption_pass_enabled", True):
+            try:
+                from ic2x import caption as caption_mod
+                new_cap, used = caption_mod.generate_caption(prepared, place, when, cfg)
+                if used:
+                    db.increment_ai_calls()
+                if new_cap:
+                    caption = new_cap
+            except Exception as exc:  # noqa: BLE001 — never block a post on captioning
+                logger.warning("caption: pass skipped (%s)", exc)
+
+        cfg.approved_dir.mkdir(parents=True, exist_ok=True)
         shutil.move(str(prepared), str(cfg.approved_dir / prepared.name))
         # Cap to X's 280-char limit, trimming the caption — never the 📍 line.
+        location = geo.format_location_line(place, when)
         if location:
             room = max(0, 280 - len(location) - 1)
             final_caption = f"{caption[:room].rstrip()}\n{location}"
@@ -403,6 +424,7 @@ def run_one_cycle(db: DB, cfg: Config, ic: ICloudPhotos, clients) -> str:
     """Assemble bursts newest-first, judging each, until one posts (or the daily
     AI cap is hit / the library is exhausted). Posts at most one image."""
     reset_run_usage()  # isolate this cycle's AI usage for cost accounting
+    ui.info("🔍 scanning iCloud for the newest photo worth posting …")
     screenshot_ids = ic.screenshot_ids()
     stream = _Stream(ic.iter_image_assets(), db, cfg, ic, screenshot_ids,
                      concurrency=cfg.prefetch_concurrency)
@@ -425,6 +447,9 @@ def run_one_cycle(db: DB, cfg: Config, ic: ICloudPhotos, clients) -> str:
             verdict, _el, used_net = judge_burst([m.thumb for m in burst.members], cfg)
             if used_net:
                 db.increment_ai_calls()
+            shows = (verdict.get("shows") or "").strip()
+            if shows:
+                ui.info(f"   ↳ shows: {shows}")
 
             if not verdict.get("safe") or not verdict.get("interesting"):
                 db.commit_burst(seen_ids, None)
@@ -465,6 +490,8 @@ def run_one_cycle(db: DB, cfg: Config, ic: ICloudPhotos, clients) -> str:
                         ui.info("   ↳ skipped — same scene as a recent post (walking back)")
                         continue
 
+            ui.info(f"   ↳ best of {len(burst.members)} is #{verdict['best_index']} — downloading "
+                    f"full-res{' + enhancing' if getattr(cfg, 'color_enhance_enabled', False) else ''} …")
             kind, payload = _prepare_winner(db, cfg, ic, winner, verdict.get("caption", ""))
 
             if kind == "transient":
@@ -488,10 +515,10 @@ def run_one_cycle(db: DB, cfg: Config, ic: ICloudPhotos, clients) -> str:
                 continue
 
             db.commit_burst(seen_ids, payload)  # APPROVED — atomic, then post
-            ui.ok(f"   ↳ chose best shot #{verdict['best_index']} of {len(burst.members)} — posting …")
             _cap = (payload.get("caption") or "").replace("\n", "  ")
             if _cap:
                 ui.info(f"      “{_cap}”")
+            ui.ok("   ↳ posting to X …")
             row = {"sha256": payload["sha256"], "phash": payload["phash"],
                    "caption": payload.get("caption", "")}
             posted = post_one(row, cfg, db, *clients)
@@ -540,10 +567,19 @@ def _notify_reauth(cfg: Config, exc: Exception) -> None:
             logger.warning("reauth_notify_cmd failed: %s", e)
 
 
-def _sleep_interruptible(seconds: float) -> None:
+def _sleep_interruptible(seconds: float, heartbeat=None, heartbeat_every: float = 300.0) -> None:
+    """Sleep up to `seconds`, waking immediately on Ctrl-C. With `heartbeat`, call it
+    now and then every `heartbeat_every`s, so a long wait keeps printing a liveness line
+    instead of looking frozen."""
+    if heartbeat:
+        heartbeat()
     end = time.monotonic() + seconds
+    next_beat = time.monotonic() + heartbeat_every
     while not _stop and time.monotonic() < end:
         time.sleep(1)
+        if heartbeat and time.monotonic() >= next_beat:
+            heartbeat()
+            next_beat += heartbeat_every
 
 
 def _due_to_post(db: DB, cfg: Config) -> bool:
@@ -551,6 +587,40 @@ def _due_to_post(db: DB, cfg: Config) -> bool:
     if last is None:
         return True
     return datetime.now(timezone.utc) - last >= timedelta(hours=cfg.post_interval_hours)
+
+
+def _waiting_status(db: DB, cfg: Config) -> None:
+    """One-line heartbeat while the loop waits, so a normal run always visibly shows it's
+    alive AND what it's waiting on — daily cap, the next-post countdown, or simply no new
+    photo yet. An otherwise-silent 5h gap looks frozen; this never lets it."""
+    posted_today = db.count_posts_rolling_24h()
+    if posted_today >= cfg.max_posts_per_day:
+        ui.info(f"⏳ idle — daily cap reached ({posted_today}/{cfg.max_posts_per_day}); "
+                "waiting for a 24h slot to free. Ctrl-C to stop.")
+        return
+    last = db.get_last_posted_at()
+    if last is not None:
+        secs = (last + timedelta(hours=cfg.post_interval_hours)
+                - datetime.now(timezone.utc)).total_seconds()
+        if secs > 0:
+            ui.info(f"⏳ idle — next post in ~{int(secs // 3600)}h {int(secs % 3600 // 60):02d}m "
+                    f"({posted_today}/{cfg.max_posts_per_day} today). Ctrl-C to stop.")
+            return
+    # Due to post, but nothing new turned up this scan — keep polling iCloud.
+    ui.info(f"⏳ waiting for a new photo to post — re-checking iCloud every "
+            f"{max(1, cfg.daemon_check_interval // 60)} min. Ctrl-C to stop.")
+
+
+def _tidy_empty_dirs(cfg: Config) -> None:
+    """Remove content dirs that ended the run empty — work/queue/approved hold files
+    only transiently, so a run leaves no empty folders behind. rmdir() only removes a
+    dir when it's actually empty, so anything still holding files is left alone."""
+    for d in (cfg.work_dir, cfg.queue_dir, cfg.approved_dir,
+              cfg.posted_dir, cfg.scene_thumbs_dir, cfg.reviewed_dir):
+        try:
+            d.rmdir()
+        except OSError:
+            pass
 
 
 def bot(once: bool = False, test: bool = False, test_cycles: int = 20,
@@ -612,6 +682,16 @@ def bot(once: bool = False, test: bool = False, test_cycles: int = 20,
         return
     db = DB(cfg.db_path)
 
+    # startup reconciliation, at the start of EVERY bot run: sync the DB with what's
+    # live on X — re-queue posts the owner deleted (reads X via the Bearer token). A
+    # --test run has an empty isolated DB, so reconcile is a no-op there.
+    if cfg.reconcile_on_startup:
+        if cfg.twitter_bearer_token:
+            from ic2x.reconcile import make_x_lookup, reconcile_with_x
+            reconcile_with_x(db, cfg, make_x_lookup(cfg))
+        else:
+            ui.warn("reconcile — set TWITTER_BEARER_TOKEN to enable startup DB↔X sync")
+
     # live per-call cost meter: every priced AI call (and the flat color-enhance cost)
     # prints its cost with the running run-total right-aligned.
     from ic2x.utils.ai_client import reset_run_cost, set_call_cost_hook
@@ -639,6 +719,7 @@ def bot(once: bool = False, test: bool = False, test_cycles: int = 20,
         except PyiCloudThrottled as exc:
             ui.err(f"iCloud throttled — try again later: {exc}")
         finally:
+            _tidy_empty_dirs(cfg)
             db.close()
         return
 
@@ -657,15 +738,16 @@ def bot(once: bool = False, test: bool = False, test_cycles: int = 20,
         _sym = "¥" if pricing_currency() == "RMB" else ""
         ui.info(f"today so far: {_today['ai_calls']} AI calls · {_sym}{_today['cost_rmb']:.4f}")
 
-    throttles = 0
+    throttles = errors = 0
+    reauth_notified = False
     cycles = posts = 0
     reason = "interrupted"
     while not _stop:
         try:
             db.reset_stuck_posting()
             flush_pending(db, cfg, clients)
-            if cfg.test_mode or (_due_to_post(db, cfg)
-                                 and db.count_posts_rolling_24h() < cfg.max_posts_per_day):
+            posted_today = db.count_posts_rolling_24h()
+            if cfg.test_mode or (_due_to_post(db, cfg) and posted_today < cfg.max_posts_per_day):
                 outcome = run_one_cycle(db, cfg, ic, clients)
                 logger.info("cycle: %s", outcome)
                 if cfg.test_mode:
@@ -682,15 +764,32 @@ def bot(once: bool = False, test: bool = False, test_cycles: int = 20,
                     ui.info(f"⏱  [TEST {cycles}{('/' + str(test_cycles)) if test_cycles else ''}] "
                             f"~{cfg.post_interval_hours}h wait skipped → next cycle now")
                 elif outcome == "posted":
-                    ui.ok(f"cycle complete — next post in ~{cfg.post_interval_hours}h "
-                          "(idle; Ctrl-C to stop)")
+                    ui.ok(f"posted — holding for the next ~{cfg.post_interval_hours}h slot")
+                elif outcome == "exhausted":
+                    ui.info("no new photo to post right now")
                 else:
-                    ui.info(f"cycle complete ({outcome}) — checking again in "
-                            f"{cfg.daemon_check_interval // 60} min")
-            throttles = 0
+                    ui.info(f"cycle complete — {outcome}")
+            # When NOT due (or capped), the heartbeat below narrates the wait instead.
+            throttles = errors = 0
+            reauth_notified = False
         except ReauthRequired as exc:
-            _notify_reauth(cfg, exc)
-            break
+            # A closed lid or dropped network can invalidate the iCloud session. Rebuild
+            # it from the saved cookies before giving up — this recovers the common
+            # "stale after sleep" case without ever stopping the bot.
+            logger.warning("iCloud session lost (%s) — re-establishing …", exc)
+            try:
+                ic.ensure_session()
+                logger.info("iCloud session re-established; resuming.")
+                throttles = errors = 0
+                reauth_notified = False
+            except ReauthRequired as exc2:
+                # genuinely needs interactive 2FA → notify once, then stay alive and keep
+                # retrying so a later `ic2x login` (fresh cookies on disk) is picked up.
+                if not reauth_notified:
+                    _notify_reauth(cfg, exc2)
+                    reauth_notified = True
+                _sleep_interruptible(min(cfg.daemon_check_interval, 600))
+            continue
         except PyiCloudThrottled as exc:
             throttles += 1
             backoff = min(cfg.daemon_check_interval * (2 ** throttles), 3600)
@@ -698,10 +797,28 @@ def bot(once: bool = False, test: bool = False, test_cycles: int = 20,
             _sleep_interruptible(backoff)
             continue
         except Exception as exc:  # noqa: BLE001 — one bad cycle must not kill the bot
-            logger.error("cycle error: %s", exc, exc_info=True)
+            # Transient failures (e.g. sockets dropped while the lid was closed) recover
+            # fast: short, growing backoff instead of the full poll interval. After a few
+            # in a row, also rebuild the iCloud session in case it went stale.
+            errors += 1
+            backoff = min(30 * (2 ** (errors - 1)), 300)
+            logger.error("cycle error (%d) — retrying in %ds: %s", errors, backoff, exc,
+                         exc_info=True)
+            if errors >= 3:
+                try:
+                    ic.ensure_session()
+                    logger.info("iCloud session refreshed after repeated errors.")
+                except Exception as e2:  # noqa: BLE001
+                    logger.warning("session refresh failed: %s", e2)
+            _sleep_interruptible(backoff)
+            continue
 
-        _sleep_interruptible(0 if cfg.test_mode else cfg.daemon_check_interval)
+        _sleep_interruptible(
+            0 if cfg.test_mode else cfg.daemon_check_interval,
+            heartbeat=None if cfg.test_mode else (lambda: _waiting_status(db, cfg)),
+        )
 
+    _tidy_empty_dirs(cfg)
     db.close()
     if cfg.test_mode:
         _label = "dry-posts" if cfg.x_dry_run else "LIVE posts"

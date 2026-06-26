@@ -101,22 +101,33 @@ def capture_time(image_path: Path) -> str | None:
         return None
 
 
-def location_line(image_path: Path, cfg) -> str | None:
-    """"📍 HH:MM City, Country" for the image (time directly before the city),
-    or None. Time is omitted if unreadable; the line needs a geocoded place.
-    Never raises."""
+def place_and_time(image_path: Path, cfg) -> tuple[str | None, str | None]:
+    """(place, time) for the image — e.g. ("Ningbo, China", "19:50"); either may be
+    None. `place` needs GPS EXIF + a successful geocode; `time` needs EXIF capture
+    time. Both are fed to the caption model so it can ground the caption in WHERE and
+    WHEN, and `place`/`time` also build the 📍 line. Never raises."""
     if not getattr(cfg, "location_enabled", True):
-        return None
+        return None, None
+    place: str | None = None
     try:
         gps = extract_gps(image_path)
-        if not gps:
-            return None
-        place = reverse_geocode(gps[0], gps[1],
-                                timeout=getattr(cfg, "location_timeout", 10.0))
-        if not place:
-            return None
-        when = capture_time(image_path)
-        return f"📍 {when} {place}" if when else f"📍 {place}"
+        if gps:
+            place = reverse_geocode(gps[0], gps[1],
+                                    timeout=getattr(cfg, "location_timeout", 10.0))
     except Exception as exc:  # noqa: BLE001 — never block a post
-        logger.warning("geo: location_line failed: %s", exc)
+        logger.warning("geo: place lookup failed: %s", exc)
+    return place, capture_time(image_path)
+
+
+def format_location_line(place: str | None, when: str | None) -> str | None:
+    """"📍 HH:MM City, Country" (time before the city), or "📍 City, Country" if the
+    time is unreadable, or None when there is no geocoded place."""
+    if not place:
         return None
+    return f"📍 {when} {place}" if when else f"📍 {place}"
+
+
+def location_line(image_path: Path, cfg) -> str | None:
+    """Back-compat convenience: the combined "📍 HH:MM City, Country" line, or None."""
+    place, when = place_and_time(image_path, cfg)
+    return format_location_line(place, when)

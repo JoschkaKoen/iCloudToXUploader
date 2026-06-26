@@ -18,6 +18,7 @@ import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
+import requests
 import tweepy
 
 from ic2x.config import Config
@@ -103,6 +104,34 @@ def _save_scene_thumb(src: Path, phash: str, cfg: Config) -> None:
         logger.warning("scene_thumb: could not save %s: %s", phash, exc)
 
 
+# Connectivity/availability hiccups (X unreachable, DNS/SSL/timeout, 5xx, rate limit)
+# vs. a genuine rejection of THIS photo. The former must NEVER burn the post-attempt
+# budget — the laptop sleeps, the VPN drops, DNS blips; the photo should still post once
+# X is reachable again. (These surface only after _upload_image already retried 4×.)
+_TRANSIENT_TWEEPY = (tweepy.TooManyRequests, tweepy.TwitterServerError)
+_NETWORK_SIGNATURES = (
+    "failed to send request", "max retries exceeded", "connection aborted",
+    "connection reset", "connectionerror", "connecttimeout", "read timed out",
+    "readtimeout", "nameresolution", "name resolution", "sslerror", "timed out",
+    "network is unreachable", "temporary failure in name resolution",
+)
+
+
+def _is_transient_post_error(exc: BaseException) -> bool:
+    """True when posting failed because X was unreachable (network/DNS/SSL/timeout, 5xx,
+    or 429) rather than because this photo was rejected. Transient errors DEFER the post
+    to a later cycle instead of permanently dropping a good photo."""
+    if isinstance(exc, _TRANSIENT_TWEEPY):
+        return True
+    # tweepy re-raises requests' connection errors as TweepyException("Failed to send …"),
+    # chaining the original on __cause__/__context__.
+    for e in (exc, getattr(exc, "__cause__", None), getattr(exc, "__context__", None)):
+        if isinstance(e, requests.exceptions.RequestException):
+            return True
+    msg = str(exc).lower()
+    return any(sig in msg for sig in _NETWORK_SIGNATURES)
+
+
 def post_one(row, cfg: Config, db: DB, api_v1, client_v2) -> bool:
     """Post one APPROVED row (file at approved_dir/{phash}.jpg). Returns True on
     success. On failure: bumps post_attempts; once >= cfg.post_max_attempts marks
@@ -132,6 +161,7 @@ def post_one(row, cfg: Config, db: DB, api_v1, client_v2) -> bool:
             ui.post_ok(tweet_url)
 
         _save_scene_thumb(img_path, phash, cfg)  # small thumb for same-scene dedup
+        cfg.posted_dir.mkdir(parents=True, exist_ok=True)
         dest = cfg.posted_dir / filename
         try:
             shutil.move(str(img_path), str(dest))
@@ -141,11 +171,24 @@ def post_one(row, cfg: Config, db: DB, api_v1, client_v2) -> bool:
         return True
 
     except Exception as exc:  # noqa: BLE001
+        if _is_transient_post_error(exc):
+            # X unreachable (laptop asleep, VPN/DNS/SSL hiccup) — NOT this photo's fault.
+            # Keep it APPROVED so flush_pending retries it next cycle; never let a network
+            # blip burn the attempt budget and permanently drop a good photo.
+            db.set_status(sha256, Status.APPROVED)
+            logger.warning("post_one: X unreachable for %s — deferring: %s",
+                           filename, str(exc)[:160])
+            ui.warn(f"post deferred — X unreachable, will retry next cycle: {filename}")
+            return False
         logger.error("post_one: failed to post %s: %s", filename, exc, exc_info=True)
         attempts = db.incr_post_attempts(sha256)
         if attempts >= cfg.post_max_attempts:
             db.set_status(sha256, Status.REJECTED, reject_stage="post_failed",
                           reject_reason=str(exc)[:200])
+            try:
+                img_path.unlink(missing_ok=True)  # don't leave the prepared file as approved/ clutter
+            except OSError as err:
+                logger.warning("post_one: could not remove rejected %s: %s", filename, err)
             ui.err(f"post failed permanently after {attempts} attempts: {filename}")
         else:
             db.set_status(sha256, Status.APPROVED)

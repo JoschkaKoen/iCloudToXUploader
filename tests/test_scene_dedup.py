@@ -73,6 +73,7 @@ def _cfg():
         work_dir=base / "work", queue_dir=base / "queue",
         approved_dir=base / "approved", posted_dir=base / "posted", logs_dir=base / "logs",
         judge_model="stub", ollama_base_url="http://localhost:11434/v1",
+        caption_pass_enabled=False, location_enabled=False,
     )
     for d in (c.work_dir, c.queue_dir, c.approved_dir, c.posted_dir, c.logs_dir, c.scene_thumbs_dir):
         d.mkdir(parents=True, exist_ok=True)

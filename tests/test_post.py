@@ -15,11 +15,15 @@ import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
+import requests
+import tweepy
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
+import ic2x.post as postmod  # noqa: E402
 from ic2x.bot import flush_pending  # noqa: E402
 from ic2x.db import DB  # noqa: E402
-from ic2x.post import post_one  # noqa: E402
+from ic2x.post import _is_transient_post_error, post_one  # noqa: E402
 from ic2x.status import Status  # noqa: E402
 
 _TMP = Path(tempfile.mkdtemp(prefix="ic2x_post_test_"))
@@ -90,6 +94,69 @@ def test_flush_posts_one_and_respects_cap():
     # rolling cap (1) now reached → flush refuses the second
     assert flush_pending(db, cfg, (None, None)) is False
     assert len(db.get_approved()) == 1
+
+
+def _raise(exc):
+    def _f(*a, **k):
+        raise exc
+    return _f
+
+
+def test_transient_network_error_defers_keeps_approved():
+    """A network blip (X unreachable) must DEFER the post — keep it APPROVED, never
+    burn the attempt budget, never drop the file. This is the lid-close / VPN-drop
+    case that was permanently rejecting good photos."""
+    db = _fresh_db(); cfg = _cfg(); cfg.x_dry_run = False
+    row = _stage_winner(db, cfg, "sha_t", "ph_t", aid="t")
+    boom = tweepy.TweepyException(
+        "Failed to send request: HTTPSConnectionPool(host='upload.twitter.com', "
+        "port=443): Max retries exceeded (Caused by ConnectTimeoutError())")
+    orig = postmod._post_image
+    postmod._post_image = _raise(boom)
+    try:
+        for _ in range(5):                 # hammer well past post_max_attempts (3)
+            assert post_one(row, cfg, db, object(), object()) is False
+    finally:
+        postmod._post_image = orig
+    img = db.get_image_by_sha("sha_t")
+    assert img["status"] == Status.APPROVED.value, "network blip must NOT reject a good photo"
+    assert img["post_attempts"] == 0, "transient errors must not burn the attempt budget"
+    assert (cfg.approved_dir / "ph_t.jpg").exists(), "deferred photo's file must stay for retry"
+
+
+def test_permanent_error_rejects_and_cleans_file():
+    """A genuine rejection (not a network error) still rejects after the cap — and now
+    cleans up the leftover approved/ file instead of orphaning it."""
+    db = _fresh_db(); cfg = _cfg(); cfg.x_dry_run = False; cfg.post_max_attempts = 1
+    row = _stage_winner(db, cfg, "sha_p", "ph_p", aid="p")
+    orig = postmod._post_image
+    postmod._post_image = _raise(ValueError("duplicate content not allowed"))
+    try:
+        assert post_one(row, cfg, db, object(), object()) is False
+    finally:
+        postmod._post_image = orig
+    img = db.get_image_by_sha("sha_p")
+    assert img["status"] == Status.REJECTED.value and img["reject_stage"] == "post_failed"
+    assert not (cfg.approved_dir / "ph_p.jpg").exists(), "rejected photo's file must be cleaned up"
+
+
+def test_is_transient_classifier():
+    # the three real-world signatures we actually observed on upload.twitter.com
+    for m in ("Failed to send request: ... Max retries exceeded (Caused by ConnectTimeoutError)",
+              "Failed to send request: ... (Caused by NameResolutionError)",
+              "Failed to send request: ... (Caused by SSLError)"):
+        assert _is_transient_post_error(tweepy.TweepyException(m)) is True
+    # a wrapped requests connection error (chained on __cause__) is transient
+    try:
+        try:
+            raise requests.exceptions.ConnectionError("boom")
+        except requests.exceptions.ConnectionError as e:
+            raise tweepy.TweepyException("wrapped") from e
+    except tweepy.TweepyException as e:
+        assert _is_transient_post_error(e) is True
+    # genuine rejections are NOT transient
+    assert _is_transient_post_error(ValueError("duplicate content not allowed")) is False
+    assert _is_transient_post_error(ValueError("media type unsupported")) is False
 
 
 def _main() -> int:

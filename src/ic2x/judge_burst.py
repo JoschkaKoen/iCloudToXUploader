@@ -31,6 +31,7 @@ Schema:
   "best_index": <int 0..N-1 — the single best shot: sharpest, best framed and exposed>,
   "safe": bool,
   "flags": [],
+  "shows": "one phrase — what an outsider sees or learns about China here, and why it is worth posting (or 'little of interest' if empty/generic). Decide interesting AFTER this.",
   "interesting": bool,
   "caption": "descriptive caption for the chosen shot for an international audience — see CAPTION rules; ≤200 chars, no hashtags, ≥1 topic-matching emoji",
   "reason": "one short sentence: why this index, and the quality/safety call"

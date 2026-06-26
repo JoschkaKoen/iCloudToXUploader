@@ -26,6 +26,7 @@ def prepare(src_path: Path, dest_dir: Path, phash: str) -> Path:
     Returns the path of the prepared file in dest_dir.
     """
     out = dest_dir / f"{phash}.jpg"
+    out.parent.mkdir(parents=True, exist_ok=True)
     with Image.open(src_path) as img:
         img = oriented(img)
         if img.mode not in ("RGB", "L"):

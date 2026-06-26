@@ -330,6 +330,37 @@ class DB:
         ).fetchall()
         return [r["phash"] for r in rows]
 
+    # ── X reconciliation ───────────────────────────────────────────────────────
+
+    def posted_for_reconcile(self, limit: int) -> list[sqlite3.Row]:
+        """The most-recent POSTED rows with a real tweet_id (newest first) — the
+        candidates whose existence on X is checked by id at startup."""
+        return self._conn.execute(
+            "SELECT id, asset_id, sha256, tweet_id, phash, caption, posted_at "
+            "FROM images WHERE status = ? AND tweet_id IS NOT NULL AND tweet_id != 'DRYRUN' "
+            "ORDER BY posted_at DESC LIMIT ?",
+            (Status.POSTED.value, limit),
+        ).fetchall()
+
+    def requeue_deleted(self, image_id: int, asset_id: str | None) -> None:
+        """A post was deleted on X → drop its images row and clear the iCloud asset
+        from the seen-set, so the bot reconsiders and re-posts it. Atomic."""
+        try:
+            self._conn.execute("BEGIN")
+            self._conn.execute("DELETE FROM images WHERE id = ?", (image_id,))
+            if asset_id:
+                self._conn.execute(
+                    "UPDATE asset_index SET seen = 0 WHERE asset_id = ?", (asset_id,))
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def update_caption(self, image_id: int, caption: str) -> None:
+        """Fill/refresh a posted row's caption (used to sync from X)."""
+        self._conn.execute("UPDATE images SET caption = ? WHERE id = ?", (caption, image_id))
+        self._conn.commit()
+
     # ── Run state (generic key/value) ──────────────────────────────────────────
 
     def get_state(self, key: str) -> str | None:

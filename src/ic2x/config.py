@@ -60,12 +60,14 @@ class Config:
     twitter_consumer_secret: str
     twitter_access_token: str
     twitter_access_token_secret: str
+    twitter_bearer_token: str        # app-only auth — the only one that reads tweets (get_tweets)
     x_dry_run: bool
     test_mode: bool                 # IC2X_TEST_MODE / --test: dry-run + fast loop + isolated test_run/ state
 
     # Location stamp (GPS EXIF → "📍 City, Country" caption line)
     location_enabled: bool
     location_timeout: float
+    caption_pass_enabled: bool      # location/time-grounded caption pass on the winner
 
     # Limits / dedup
     daily_ai_calls: int             # also bounds walk-back cost per day
@@ -111,6 +113,11 @@ class Config:
     color_enhance_max_edge: int      # downscale long edge before sending (API input cap)
     color_enhance_cost_rmb: float    # per call beyond the free monthly quota (cost tracking)
     color_enhance_free_quota: int    # free calls per calendar month (Aliyun gives 100)
+
+    # Startup reconciliation (sync DB with X; re-queue posts deleted on X)
+    reconcile_on_startup: bool
+    reconcile_recent_n: int          # how many recent X posts to fetch
+    reconcile_max_requeue_per_run: int  # sanity cap — skip if more look deleted
 
     # AI models / vision
     default_model: str             # AI_DEFAULT_MODEL (with optional ", effort" suffix)
@@ -203,12 +210,14 @@ def load_config() -> Config:
         twitter_consumer_secret=_require_env("TWITTER_CONSUMER_SECRET"),
         twitter_access_token=_require_env("TWITTER_ACCESS_TOKEN"),
         twitter_access_token_secret=_require_env("TWITTER_ACCESS_TOKEN_SECRET"),
+        twitter_bearer_token=os.getenv("TWITTER_BEARER_TOKEN", "").strip(),
         x_dry_run=_bool_env("X_DRY_RUN", default=True),
         test_mode=_bool_env("IC2X_TEST_MODE", default=False),
 
         # Location stamp (GPS EXIF → "📍 City, Country")
         location_enabled=_bool_env("LOCATION_ENABLED", default=True),
         location_timeout=float(_int_env("LOCATION_TIMEOUT", 10)),
+        caption_pass_enabled=_bool_env("CAPTION_PASS_ENABLED", default=True),
 
         # Limits / dedup
         daily_ai_calls=_int_env("DAILY_AI_CALLS", 200),
@@ -254,6 +263,11 @@ def load_config() -> Config:
         color_enhance_cost_rmb=float(os.getenv("COLOR_ENHANCE_COST_RMB", "").strip() or "0.02"),
         color_enhance_free_quota=_int_env("COLOR_ENHANCE_FREE_QUOTA", 100),
 
+        # Startup reconciliation
+        reconcile_on_startup=_bool_env("RECONCILE_ON_STARTUP", default=True),
+        reconcile_recent_n=_int_env("RECONCILE_RECENT_N", 50),
+        reconcile_max_requeue_per_run=_int_env("RECONCILE_MAX_REQUEUE_PER_RUN", 20),
+
         # AI models / vision
         default_model=default_model,
         judge_model=judge_model,
@@ -265,16 +279,8 @@ def load_config() -> Config:
 
 
 def ensure_dirs(cfg: Config) -> None:
-    """Create all required directories if they don't exist."""
-    dirs = [
-        cfg.work_dir,
-        cfg.queue_dir,
-        cfg.approved_dir,
-        cfg.posted_dir,
-        cfg.logs_dir,
-        cfg.reviewed_dir,
-        cfg.scene_thumbs_dir,
-        cfg.icloud_cookie_dir,
-    ]
-    for d in dirs:
+    """Create only the always-needed dirs: logs + the iCloud cookie/session dir. The
+    content dirs (work, queue, approved, posted, scene_thumbs, reviewed) are created
+    lazily by their writers, so a run never leaves empty folders behind."""
+    for d in (cfg.logs_dir, cfg.icloud_cookie_dir):
         d.mkdir(parents=True, exist_ok=True)
