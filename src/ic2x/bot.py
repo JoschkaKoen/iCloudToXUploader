@@ -36,7 +36,7 @@ from typing import Any, Iterator
 import imagehash
 
 from ic2x import dedup, prepare
-from ic2x.config import Config, _PROJECT_ROOT, ensure_dirs, load_config
+from ic2x.config import Config, _PROJECT_ROOT, ensure_dirs, load_config, require_credentials
 from ic2x.db import DB
 from ic2x.filter import is_screenshot
 from ic2x.icloud_photos import ICloudPhotos, PyiCloudThrottled, ReauthRequired
@@ -311,6 +311,19 @@ def _apply_rotation(path: Path, cw_degrees: int) -> None:
     logger.info("rotation: applied %d° CW to %s", cw_degrees, path.name)
 
 
+def _apply_polish(path: Path, cfg: Config) -> None:
+    """Bake the free, local adaptive polish into the prepared JPEG in place. The
+    polish is itself fail-open and adaptive (a well-exposed photo comes out nearly
+    unchanged), so this only re-encodes when polish is enabled."""
+    from PIL import Image
+
+    from ic2x import polish as polish_mod
+    with Image.open(path) as img:
+        out = polish_mod.polish(img, cfg)
+        out.save(path, "JPEG", quality=92, exif=b"")
+    logger.info("polish: applied %s to %s", getattr(cfg, "polish_intensity", "natural"), path.name)
+
+
 def _prepare_winner(db: DB, cfg: Config, ic: ICloudPhotos, winner: BurstMember, caption: str
                     ) -> tuple[str, dict | None]:
     """Download the winner full-res (from its live asset), run the EXIF screenshot
@@ -362,6 +375,13 @@ def _prepare_winner(db: DB, cfg: Config, ic: ICloudPhotos, winner: BurstMember, 
                     _apply_rotation(prepared, rot["rotate_cw_degrees"])
             except Exception as exc:  # noqa: BLE001 — optional; never block the post
                 logger.warning("rotation: skipped (%s)", exc)
+        # Free local adaptive polish (CPU-only). Runs BEFORE the paid color enhance, so
+        # it can stand alone (color enhance off) or feed into it. Fail-open by design.
+        if getattr(cfg, "polish_enabled", False):
+            try:
+                _apply_polish(prepared, cfg)
+            except Exception as exc:  # noqa: BLE001 — optional; never block the post
+                logger.warning("polish: skipped (%s)", exc)
         # Auto color enhancement (Aliyun VIAPI EnhanceImageColor) on the posted image.
         # Fail-open: any failure logs and posts the un-enhanced JPEG. The flat per-call
         # cost flows into the daily cost tracker so `ic2x cost` shows total spend.
@@ -398,13 +418,20 @@ def _prepare_winner(db: DB, cfg: Config, ic: ICloudPhotos, winner: BurstMember, 
 
         cfg.approved_dir.mkdir(parents=True, exist_ok=True)
         shutil.move(str(prepared), str(cfg.approved_dir / prepared.name))
-        # Cap to X's 280-char limit, trimming the caption — never the 📍 line.
+        # Cap to X's 280-char limit by WEIGHTED length (emoji/CJK count as 2), trimming
+        # the caption — never the 📍 line. Plain len() would let a caption with a couple
+        # of emoji + the location line slip over 280 weighted and 403 at post time.
+        from ic2x.utils.tweet_text import truncate_weighted, weighted_len
         location = geo.format_location_line(place, when)
+        caption = (caption or "").strip()
         if location:
-            room = max(0, 280 - len(location) - 1)
-            final_caption = f"{caption[:room].rstrip()}\n{location}"
+            room = max(0, 280 - weighted_len(location) - 1)  # -1 for the "\n"
+            body = truncate_weighted(caption, room).rstrip()
+            # Don't emit a leading blank line when the caption is empty — post just
+            # the 📍 line in that case.
+            final_caption = f"{body}\n{location}" if body else location
         else:
-            final_caption = caption[:280]
+            final_caption = truncate_weighted(caption, 280)
         return "approved", {
             "asset_id": winner.asset_id, "sha256": sha, "phash": ph,
             "filename": winner.asset_id, "status": Status.APPROVED, "caption": final_caption,
@@ -425,7 +452,12 @@ def run_one_cycle(db: DB, cfg: Config, ic: ICloudPhotos, clients) -> str:
     AI cap is hit / the library is exhausted). Posts at most one image."""
     reset_run_usage()  # isolate this cycle's AI usage for cost accounting
     ui.info("🔍 scanning iCloud for the newest photo worth posting …")
-    screenshot_ids = ic.screenshot_ids()
+    # Cached Screenshots-album membership (refreshed every N cycles) so we don't
+    # re-iterate the whole smart album from iCloud every cycle. getattr keeps the
+    # lightweight test fakes (which only define screenshot_ids) working.
+    _ss_cached = getattr(ic, "screenshot_ids_cached", None)
+    screenshot_ids = (_ss_cached(cfg.screenshot_album_refresh_cycles)
+                      if _ss_cached else ic.screenshot_ids())
     stream = _Stream(ic.iter_image_assets(), db, cfg, ic, screenshot_ids,
                      concurrency=cfg.prefetch_concurrency)
     thumbs: list[Path] = []
@@ -665,6 +697,9 @@ def bot(once: bool = False, test: bool = False, test_cycles: int = 20,
                     "state.db · iCloud + AI + posts all REAL")
 
     # ── preflight: fail fast ──
+    # iCloud is always needed to fetch photos; X creds only for REAL posts (a dry-run
+    # burn-in needs no Twitter keys). Validated here so the failure is one clear line.
+    require_credentials(cfg, icloud=True, x=not cfg.x_dry_run)
     require_vision_api_credentials(cfg.judge_model, cfg.rotation_model)
     if cfg.color_enhance_enabled:
         from ic2x.utils.aliyun_viapi import ViapiError, check_credentials

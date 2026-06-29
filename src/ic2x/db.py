@@ -68,6 +68,11 @@ CREATE TABLE IF NOT EXISTS run_state (
 class DB:
     def __init__(self, path: str | Path) -> None:
         self._path = str(path)
+        # Create the parent dir so opening a DB under a not-yet-created content dir
+        # (e.g. `ic2x compare`'s throwaway work/compare_tmp.db before the bot has ever
+        # created work/) doesn't fail with "unable to open database file".
+        if self._path != ":memory:":
+            Path(self._path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(self._path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -283,6 +288,22 @@ class DB:
         ).fetchone()
         return {"ai_calls": row["ai_calls"], "images_posted": row["images_posted"],
                 "cost_rmb": row["cost_rmb"]}
+
+    def overview(self) -> dict[str, int]:
+        """Lifetime counts for `ic2x status` — posted / approved-pending / rejected
+        image rows, plus the asset_index seen-set size. One cheap snapshot query set."""
+        c = self._conn
+        def _n(sql: str, *params: Any) -> int:
+            row = c.execute(sql, params).fetchone()
+            return row[0] if row else 0
+        return {
+            "posted": _n("SELECT COUNT(*) FROM images WHERE status = ?", Status.POSTED.value),
+            "approved_pending": _n("SELECT COUNT(*) FROM images WHERE status = ?",
+                                   Status.APPROVED.value),
+            "rejected": _n("SELECT COUNT(*) FROM images WHERE status = ?", Status.REJECTED.value),
+            "indexed": _n("SELECT COUNT(*) FROM asset_index"),
+            "seen": _n("SELECT COUNT(*) FROM asset_index WHERE seen = 1"),
+        }
 
     def recent_stats(self, days: int = 14) -> list[dict]:
         """Per-day (date, ai_calls, images_posted, cost_rmb), newest first — for `ic2x cost`."""

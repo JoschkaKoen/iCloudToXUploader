@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import ic2x.post as postmod  # noqa: E402
 from ic2x.bot import flush_pending  # noqa: E402
 from ic2x.db import DB  # noqa: E402
-from ic2x.post import _is_transient_post_error, post_one  # noqa: E402
+from ic2x.post import _is_transient_post_error, _prune_scene_thumbs, post_one  # noqa: E402
 from ic2x.status import Status  # noqa: E402
 
 _TMP = Path(tempfile.mkdtemp(prefix="ic2x_post_test_"))
@@ -157,6 +157,20 @@ def test_is_transient_classifier():
     # genuine rejections are NOT transient
     assert _is_transient_post_error(ValueError("duplicate content not allowed")) is False
     assert _is_transient_post_error(ValueError("media type unsupported")) is False
+
+
+def test_prune_scene_thumbs_keeps_newest():
+    import os
+
+    d = _TMP / "scene_thumbs_prune"
+    d.mkdir(parents=True, exist_ok=True)
+    for i in range(20):
+        f = d / f"thumb{i:02d}.jpg"
+        f.write_bytes(b"x")
+        os.utime(f, (1_000_000 + i, 1_000_000 + i))  # increasing mtime: higher i = newer
+    _prune_scene_thumbs(d, keep=5)
+    remaining = sorted(p.name for p in d.glob("*.jpg"))
+    assert remaining == [f"thumb{i:02d}.jpg" for i in range(15, 20)], remaining
 
 
 def _main() -> int:

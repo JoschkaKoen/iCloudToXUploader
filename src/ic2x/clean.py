@@ -9,7 +9,7 @@ from ic2x.status import Status
 from ic2x.utils import ui
 
 
-def clean() -> None:
+def clean(assume_yes: bool = False) -> None:
     cfg = load_config()
     ensure_dirs(cfg)
 
@@ -38,7 +38,9 @@ def clean() -> None:
         f"seen: {counts[Status.SEEN.value]})\n"
         f"Posted images, the asset index, and posted DB records are NOT touched."
     )
-    if input("Proceed? [y/N] ").strip().lower() != "y":
+    if assume_yes:
+        ui.info("--yes given — proceeding without prompt.")
+    elif input("Proceed? [y/N] ").strip().lower() != "y":
         ui.info("Aborted — no changes made.")
         db.close()
         return

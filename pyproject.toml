@@ -11,6 +11,7 @@ dependencies = [
   "requests>=2.32",
   "pillow",
   "pillow-heif",
+  "numpy",         # used directly by polish.py (adaptive local enhance)
   "imagehash",
   "tweepy>=4.14",
   "openai",
@@ -23,8 +24,19 @@ dependencies = [
   "alibabacloud_tea_util",
 ]
 
+[project.optional-dependencies]
+# Test/dev tooling. Install with:  uv sync --extra dev   (or  pip install -e ".[dev]")
+dev = ["pytest>=7"]
+
 [project.scripts]
 ic2x = "ic2x.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+# `pythonpath = src` lets tests import `ic2x` without the sys.path boilerplate; the
+# existing inserts are harmless and keep each file runnable standalone too.
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"

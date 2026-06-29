@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import sys
 import unittest
+from pathlib import Path
 
-from ic2x.utils.response_parsing import parse_json_safe, strip_json_fences
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+from ic2x.utils.response_parsing import parse_json_safe, strip_json_fences  # noqa: E402
 
 
 class TestResponseParsing(unittest.TestCase):

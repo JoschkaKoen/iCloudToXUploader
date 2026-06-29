@@ -25,7 +25,15 @@ def startup_banner(cfg) -> None:
     """Printed once at the start of ic2x run."""
     from ic2x.utils.ai_client import parse_model_effort
     dry = "YES  ⚠" if cfg.x_dry_run else "no"
-    enhance = "enabled" if cfg.enhance_enabled else "disabled"
+    # Summarize the ENHANCEMENTS actually applied to the posted image, in order:
+    # Aliyun color enhance (paid VLM-less API) then the free local polish. (The
+    # legacy InstructIR `enhance_enabled` flag is unwired, so it's not shown.)
+    enh_parts = []
+    if getattr(cfg, "color_enhance_enabled", False):
+        enh_parts.append(f"color:{cfg.color_enhance_mode}")
+    if getattr(cfg, "polish_enabled", False):
+        enh_parts.append(f"polish:{getattr(cfg, 'polish_intensity', 'natural')}")
+    enhance = ", ".join(enh_parts) if enh_parts else "off"
     judge_model, judge_effort = parse_model_effort(cfg.judge_model)
     judge_str = f"{judge_model} [{judge_effort or 'default'}]"
     rows = [

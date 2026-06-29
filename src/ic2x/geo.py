@@ -57,20 +57,25 @@ def extract_gps(image_path: Path) -> tuple[float, float] | None:
 
 
 def reverse_geocode(lat: float, lon: float, timeout: float = 10.0) -> str | None:
-    """"City, Country" for a coordinate (BigDataCloud), or None. Cached by ~100 m."""
+    """"City, Country" for a coordinate (BigDataCloud), or None. Cached by ~100 m.
+
+    Only SUCCESSFUL lookups are cached (including a genuine "no city here" → None).
+    A transient failure (network/timeout) returns None WITHOUT caching, so the next
+    post from that area retries instead of being permanently stuck for the life of
+    the long-running bot process."""
     key = (round(lat, 3), round(lon, 3))
     if key in _cache:
         return _cache[key]
     url = f"{_GEOCODE_URL}?latitude={lat}&longitude={lon}&localityLanguage=en"
-    place: str | None = None
     try:
         with urllib.request.urlopen(url, timeout=timeout) as resp:
             d = json.load(resp)
         city = d.get("city") or d.get("locality") or ""
         country = d.get("countryName") or ""
         place = ", ".join(p for p in (city, country) if p) or None
-    except Exception as exc:  # noqa: BLE001 — best-effort, never raise
+    except Exception as exc:  # noqa: BLE001 — best-effort, never raise (and don't cache)
         logger.warning("geo: reverse geocode failed for %.4f,%.4f: %s", lat, lon, exc)
+        return None
     _cache[key] = place
     return place
 

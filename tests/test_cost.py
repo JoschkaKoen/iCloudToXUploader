@@ -59,6 +59,34 @@ def test_migration_adds_columns_to_old_db():
     db.close()
 
 
+def test_clean_pipeline_keeps_posted_removes_rest():
+    from ic2x.status import Status
+    db = DB(_TMP / "clean.db")
+    c = db._conn
+    for i, st in enumerate([Status.QUEUED, Status.APPROVED, Status.SEEN,
+                            Status.POSTED, Status.REJECTED]):
+        c.execute("INSERT INTO images (sha256, status) VALUES (?, ?)", (f"h{i}", st.value))
+    c.commit()
+    counts = db.get_cleanable_counts()
+    assert counts[Status.QUEUED.value] == 1 and counts[Status.APPROVED.value] == 1 \
+        and counts[Status.SEEN.value] == 1
+    removed = db.clean_pipeline()
+    assert removed == 3                       # queued + approved + seen
+    left = {r["status"] for r in c.execute("SELECT status FROM images").fetchall()}
+    assert left == {Status.POSTED.value, Status.REJECTED.value}  # posted + rejected kept
+    db.close()
+
+
+def test_db_creates_missing_parent_dir():
+    # opening a DB under a not-yet-created dir must work (e.g. ic2x compare's
+    # work/compare_tmp.db before the bot has ever created work/).
+    nested = _TMP / "does" / "not" / "exist" / "state.db"
+    assert not nested.parent.exists()
+    db = DB(nested)
+    assert nested.exists()
+    db.close()
+
+
 def _main() -> int:
     failed = 0
     for name, t in sorted(globals().items()):
