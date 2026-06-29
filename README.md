@@ -29,6 +29,10 @@ sync index ─▶ newest unseen burst ─▶ one VLM call picks best + vets ─�
 - **Walk back until postable** — if the newest burst is boring/unsafe, it falls
   through to older bursts within the same wake-up (bounded by `DAILY_AI_CALLS`).
   Lookback is unbounded.
+- **Optional per-winner passes**, each fail-open and toggled in `default.env`: an
+  AI orientation fix (`ROTATION_*`), same-scene dedup vs recent posts (`SCENE_DEDUP_*`),
+  a GPS→city/time-grounded caption rewrite (`CAPTION_PASS_ENABLED`, `LOCATION_*`),
+  and image enhancement — free local adaptive `POLISH_*` and/or Aliyun `COLOR_ENHANCE_*`.
 
 ## Setup
 
@@ -38,8 +42,10 @@ cp .env.example .env      # fill ICLOUD_USERNAME/PASSWORD, TWITTER_* and one mod
 ic2x login                # one-time interactive 2FA; session persists ~weeks
 ```
 
-Default judge model is `gemini-2.5-flash-lite` (needs `GEMINI_API_KEY`). The
-comparison alternative is `qwen3.5-flash` (`DASHSCOPE_API_KEY`).
+The shipped default judge model is `qwen3.7-plus` and the general fallback is
+`qwen3.5-flash` — both need `DASHSCOPE_API_KEY` (Alibaba DashScope). A cheaper,
+lighter alternative is `gemini-2.5-flash-lite` (needs `GEMINI_API_KEY`); the
+provider is inferred from the model name, so just set `JUDGE_MODEL` accordingly.
 
 ## Commands
 
@@ -47,8 +53,15 @@ comparison alternative is `qwen3.5-flash` (`DASHSCOPE_API_KEY`).
 |---|---|
 | `ic2x` / `ic2x bot` | Run the loop: fetch → pick best of burst → post, every `POST_INTERVAL_HOURS` |
 | `ic2x login` | Interactive iCloud sign-in (2FA); also prints a live access check |
+| `ic2x status` | Offline snapshot: last/next post, 24h count, lifetime totals, today's spend |
+| `ic2x cost` | Show tracked AI spend per day (`--days N`) |
 | `ic2x compare` | Run recent bursts through two models side by side (read-only, no posting, no DB changes) |
 | `ic2x clean` | Discard non-posted image records + queue/approved files |
+
+Calibration / diagnostics (read-only, no posting): `ic2x classify` (judge the N
+newest photos), `ic2x autorotate` (test the rotation pass), `ic2x scene-dedup-test`
+(tune same-scene dedup on a folder), `ic2x enhance-test` / `ic2x polish-test`
+(preview image enhancement). Each writes a `*_out/<timestamp>/` folder to review.
 
 ## Burn-in → live
 
@@ -57,7 +70,7 @@ tweet. Run for a few days, read `logs/YYYY-MM-DD.jsonl` to confirm the best-of-b
 picks, safety calls, and captions look right, then set `X_DRY_RUN=false`.
 
 ```bash
-ic2x compare --bursts 8                 # decide gemini-2.5-flash-lite vs qwen3.5-flash
+ic2x compare --bursts 8                 # A/B two judge models side by side (no posting)
 ic2x bot                                 # dry-run burn-in
 # …looks good… set X_DRY_RUN=false in .env, restart
 ```
@@ -66,7 +79,8 @@ ic2x bot                                 # dry-run burn-in
 
 | Variable | Default | Notes |
 |---|---|---|
-| `AI_DEFAULT_MODEL` / `JUDGE_MODEL` | `gemini-2.5-flash-lite` | the cheap vision judge |
+| `AI_DEFAULT_MODEL` | `qwen3.5-flash, 3000` | fallback model for all AI calls |
+| `JUDGE_MODEL` | `qwen3.7-plus, 1000, 2000` | the best-of-burst vision judge |
 | `POST_INTERVAL_HOURS` | `5` | minimum hours between posts |
 | `X_DRY_RUN` | `true` | simulate posts (advances state, no tweet) |
 | `BURST_HAMMING_THRESHOLD` | `8` | consecutive-shot similarity (tighter than dedup's 12) |
@@ -91,6 +105,13 @@ to `approved` at the next cycle. All decisions append to `logs/YYYY-MM-DD.jsonl`
 
 ## Tests
 
+All tests are offline (no iCloud / X / AI calls — clients are mocked). Run the
+whole suite either way:
+
 ```bash
-.venv/bin/python tests/test_burst.py     # offline burst-assembly correctness
+python tests/run_all.py                   # zero-dependency runner (no pytest needed)
+uv sync --extra dev && pytest             # or pytest, if you prefer
+
+python tests/test_burst.py                # any single file also runs standalone
+python tests/run_all.py burst cost        # run_all can filter by substring
 ```

@@ -1,15 +1,20 @@
 """
 Single source of truth for the image state machine.
 
-Pipeline transitions:
+Pipeline transitions (the best-of-burst bot):
 
-    seen → queued → approved → posting → posted
-                                       ↘ rejected (from any earlier stage)
+    seen → approved → posting → posted
+                             ↘ rejected (from any earlier stage)
 
-`posting` is the idempotency anchor for `ic2x post` — written before the
-tweet API call, then advanced to `posted` after. Any row stuck in `posting`
-on startup means the process was killed mid-call and must be reconciled
-before retrying (see `ic2x unstick`).
+`QUEUED` is a legacy status from the old multi-stage pipeline — the current loop
+prepares the winner straight to `approved`, so it never sets `QUEUED`. It is kept
+in the enum because `ic2x clean` still treats any leftover `queued` row as
+discardable.
+
+`posting` is the idempotency anchor — written before the tweet API call,
+then advanced to `posted` after. Any row stuck in `posting` means the process
+was killed mid-call; the bot auto-recovers it to `approved` at the start of
+each cycle via `DB.reset_stuck_posting()`, so `flush_pending` retries it.
 
 Usage notes
 -----------

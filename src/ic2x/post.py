@@ -83,9 +83,21 @@ def _post_image(path: Path, caption: str, sha256: str, db: DB, api_v1, client_v2
     return tweet_id, tweet_url
 
 
+def _prune_scene_thumbs(scene_dir: Path, keep: int) -> None:
+    """Keep only the `keep` newest scene thumbs (by mtime). Same-scene dedup only ever
+    looks up the few most-recently-posted phashes, so without this the dir would grow
+    one file per post forever on a long-running bot. Best-effort."""
+    try:
+        thumbs = sorted(scene_dir.glob("*.jpg"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for p in thumbs[keep:]:
+            p.unlink(missing_ok=True)
+    except Exception as exc:  # noqa: BLE001 — housekeeping, never fatal
+        logger.warning("scene_thumb: prune failed: %s", exc)
+
+
 def _save_scene_thumb(src: Path, phash: str, cfg: Config) -> None:
-    """Write a small scene_thumbs/{phash}.jpg for the same-scene dedup set.
-    Best-effort — never raises, never blocks a post."""
+    """Write a small scene_thumbs/{phash}.jpg for the same-scene dedup set, then prune
+    old thumbs so the dir stays bounded. Best-effort — never raises, never blocks a post."""
     if not phash:
         return
     try:
@@ -100,6 +112,9 @@ def _save_scene_thumb(src: Path, phash: str, cfg: Config) -> None:
                 im = im.convert("RGB")
             im.thumbnail((max_px, max_px))
             im.save(cfg.scene_thumbs_dir / f"{phash}.jpg", "JPEG", quality=85)
+        # keep a generous multiple of the dedup window (which is only ~6) so the lookup
+        # set is always present, while bounding unlimited growth.
+        _prune_scene_thumbs(cfg.scene_thumbs_dir, keep=max(50, getattr(cfg, "scene_dedup_recent_n", 6) * 6))
     except Exception as exc:  # noqa: BLE001 — dedup aid, never fatal
         logger.warning("scene_thumb: could not save %s: %s", phash, exc)
 

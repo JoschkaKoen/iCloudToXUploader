@@ -93,6 +93,11 @@ class Config:
     enhance_instructir_dir: Path
     enhance_prompt: str
 
+    # Local adaptive polish (free, CPU-only PIL/numpy — opt-in; composes before the
+    # paid Aliyun color enhance, or stands alone as a zero-cost alternative)
+    polish_enabled: bool
+    polish_intensity: str           # natural | punchy | off
+
     # Rotation (opt-in — prepare() already bakes EXIF orientation)
     rotation_enabled: bool
     rotation_model: str             # ROTATION_MODEL or default_model
@@ -126,16 +131,6 @@ class Config:
     ollama_base_url: str
     judge_image_max_px: int | None       # cloud providers; None = full-res (rare)
     ollama_image_max_px: int | None      # all Ollama calls (memory-bound)
-
-
-def _require_env(key: str) -> str:
-    val = os.getenv(key, "").strip()
-    if not val:
-        raise ValueError(
-            f"Missing required environment variable: {key}\n"
-            f"Add it to .env in the project root (see .env.example)."
-        )
-    return val
 
 
 def _resolve(p: str) -> Path:
@@ -181,9 +176,10 @@ def load_config() -> Config:
     rotation_model = os.getenv("ROTATION_MODEL", "").strip() or default_model
 
     return Config(
-        # iCloud
-        icloud_username=_require_env("ICLOUD_USERNAME"),
-        icloud_password=_require_env("ICLOUD_PASSWORD"),
+        # iCloud — soft here; validated by require_credentials() only for commands
+        # that actually hit iCloud, so offline diagnostics + `ic2x cost` run without them.
+        icloud_username=os.getenv("ICLOUD_USERNAME", "").strip(),
+        icloud_password=os.getenv("ICLOUD_PASSWORD", "").strip(),
         icloud_cookie_dir=_resolve(os.getenv("ICLOUD_COOKIE_DIR", "./icloud_auth")),
         icloud_with_family=_bool_env("ICLOUD_WITH_FAMILY", default=False),
         icloud_family_override=_bool_env("I_KNOW_FAMILY_PHOTOS_ARE_PUBLIC", default=False),
@@ -205,11 +201,12 @@ def load_config() -> Config:
         proxy_http=os.getenv("IC2X_HTTP_PROXY", ""),
         proxy_https=os.getenv("IC2X_HTTPS_PROXY", ""),
 
-        # X
-        twitter_consumer_key=_require_env("TWITTER_CONSUMER_KEY"),
-        twitter_consumer_secret=_require_env("TWITTER_CONSUMER_SECRET"),
-        twitter_access_token=_require_env("TWITTER_ACCESS_TOKEN"),
-        twitter_access_token_secret=_require_env("TWITTER_ACCESS_TOKEN_SECRET"),
+        # X — soft here; only REAL posting needs these (dry-run skips them), so
+        # require_credentials() validates them just-in-time.
+        twitter_consumer_key=os.getenv("TWITTER_CONSUMER_KEY", "").strip(),
+        twitter_consumer_secret=os.getenv("TWITTER_CONSUMER_SECRET", "").strip(),
+        twitter_access_token=os.getenv("TWITTER_ACCESS_TOKEN", "").strip(),
+        twitter_access_token_secret=os.getenv("TWITTER_ACCESS_TOKEN_SECRET", "").strip(),
         twitter_bearer_token=os.getenv("TWITTER_BEARER_TOKEN", "").strip(),
         x_dry_run=_bool_env("X_DRY_RUN", default=True),
         test_mode=_bool_env("IC2X_TEST_MODE", default=False),
@@ -242,6 +239,10 @@ def load_config() -> Config:
         enhance_enabled=_bool_env("ENHANCE_ENABLED", default=False),
         enhance_instructir_dir=_resolve(os.getenv("ENHANCE_INSTRUCTIR_DIR", "~/Programming/InstructIR")),
         enhance_prompt=os.getenv("ENHANCE_PROMPT", "sharpen this image, remove blur, improve clarity"),
+
+        # Local adaptive polish
+        polish_enabled=_bool_env("POLISH_ENABLED", default=False),
+        polish_intensity=os.getenv("POLISH_INTENSITY", "").strip() or "natural",
 
         # Rotation
         rotation_enabled=_bool_env("ROTATION_ENABLED", default=False),
@@ -276,6 +277,33 @@ def load_config() -> Config:
         judge_image_max_px=_opt_int_env("JUDGE_IMAGE_MAX_PX", _DEFAULT_JUDGE_MAX_PX),
         ollama_image_max_px=_opt_int_env("OLLAMA_IMAGE_MAX_PX", None),
     )
+
+
+def require_credentials(cfg: Config, *, icloud: bool = True, x: bool = True) -> None:
+    """Raise ValueError (clear, aggregated) if credentials needed for THIS run are
+    missing. iCloud creds are needed to fetch photos; X creds only for REAL posts
+    (pass x=False in dry-run). Offline commands call neither check, so they run with
+    no creds at all."""
+    missing: list[str] = []
+    if icloud:
+        if not cfg.icloud_username:
+            missing.append("ICLOUD_USERNAME")
+        if not cfg.icloud_password:
+            missing.append("ICLOUD_PASSWORD")
+    if x:
+        for name, val in (
+            ("TWITTER_CONSUMER_KEY", cfg.twitter_consumer_key),
+            ("TWITTER_CONSUMER_SECRET", cfg.twitter_consumer_secret),
+            ("TWITTER_ACCESS_TOKEN", cfg.twitter_access_token),
+            ("TWITTER_ACCESS_TOKEN_SECRET", cfg.twitter_access_token_secret),
+        ):
+            if not val:
+                missing.append(name)
+    if missing:
+        raise ValueError(
+            "Missing required credential(s) in .env: " + ", ".join(missing)
+            + "\nAdd them to .env in the project root (see .env.example)."
+        )
 
 
 def ensure_dirs(cfg: Config) -> None:

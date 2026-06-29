@@ -91,6 +91,8 @@ class ICloudPhotos:
     def __init__(self, cfg: Config) -> None:
         self._cfg = cfg
         self._api: Any = None
+        self._ss_cache: set[str] | None = None  # Screenshots-album membership cache
+        self._ss_cache_age = 0                   # cycles since last refresh
 
     # ── auth ───────────────────────────────────────────────────────────────────
 
@@ -104,13 +106,20 @@ class ICloudPhotos:
             os.environ.setdefault("https_proxy", self._cfg.proxy_https)
 
     def _build(self) -> Any:
-        from pyicloud import PyiCloudService
-
+        # Validate config BEFORE importing the heavy pyicloud lib, so a clear
+        # creds/family error surfaces even where pyicloud isn't importable.
+        if not self._cfg.icloud_username or not self._cfg.icloud_password:
+            raise ReauthRequired(
+                "iCloud credentials missing — set ICLOUD_USERNAME and ICLOUD_PASSWORD "
+                "in .env (see .env.example)."
+            )
         if self._cfg.icloud_with_family and not self._cfg.icloud_family_override:
             raise ReauthRequired(
                 "ICLOUD_WITH_FAMILY=true mixes the shared family library into "
                 "auto-posting. Set I_KNOW_FAMILY_PHOTOS_ARE_PUBLIC=true to allow it."
             )
+        from pyicloud import PyiCloudService
+
         self._inject_proxy()
         try:
             return PyiCloudService(
@@ -207,6 +216,19 @@ class ICloudPhotos:
             logger.warning("icloud: Screenshots album unavailable (%s); "
                            "relying on the full-res EXIF gate only", exc)
             return set()
+
+    def screenshot_ids_cached(self, refresh_every: int) -> set[str]:
+        """Screenshots-album membership, re-fetched from iCloud only once every
+        `refresh_every` cycles (≥1); the cached set is returned in between. Iterating
+        the whole smart album is a real per-cycle iCloud round-trip, and the album
+        barely changes minute-to-minute, so caching cuts API load + throttling risk.
+        Safe staleness: a brand-new screenshot that slips past a stale set is still
+        rejected by the fail-closed EXIF gate on the winner's full-res original."""
+        if self._ss_cache is None or self._ss_cache_age >= max(1, refresh_every):
+            self._ss_cache = self.screenshot_ids()
+            self._ss_cache_age = 0
+        self._ss_cache_age += 1
+        return self._ss_cache
 
     def get_asset(self, asset_id: str) -> Any | None:
         """Re-resolve a live PhotoAsset by id (fresh signed download URLs)."""

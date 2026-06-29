@@ -10,6 +10,7 @@ Run: .venv/bin/python tests/test_bot_testmode.py   (or via pytest)
 
 from __future__ import annotations
 
+import os
 import shutil
 import signal
 import sys
@@ -20,6 +21,17 @@ from types import SimpleNamespace
 from PIL import Image, ImageDraw
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+# This test builds a real Config via load_config(), which requires credential env
+# vars. No real network calls are made (clients are monkeypatched below), so dummy
+# values suffice. setdefault means a real .env / environment always wins. Mirrors
+# tests/conftest.py so this file also runs standalone (pytest-free).
+for _k, _v in {
+    "ICLOUD_USERNAME": "test@example.com", "ICLOUD_PASSWORD": "test-password",
+    "TWITTER_CONSUMER_KEY": "test-ck", "TWITTER_CONSUMER_SECRET": "test-cs",
+    "TWITTER_ACCESS_TOKEN": "test-at", "TWITTER_ACCESS_TOKEN_SECRET": "test-ats",
+}.items():
+    os.environ.setdefault(_k, _v)
 
 import ic2x.bot as bot  # noqa: E402
 from ic2x.config import _PROJECT_ROOT  # noqa: E402

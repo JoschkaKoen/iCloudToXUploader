@@ -67,6 +67,7 @@ def _cfg():
         keep_reviewed=False, reviewed_dir=_TMP / "reviewed",
         work_dir=_TMP / "work", queue_dir=_TMP / "queue",
         approved_dir=_TMP / "approved", posted_dir=_TMP / "posted", logs_dir=_TMP / "logs",
+        scene_thumbs_dir=_TMP / "scene_thumbs", scene_dedup_image_max_px=384,
         judge_model="stub", caption_pass_enabled=False, location_enabled=False,
     )
     for d in (c.work_dir, c.queue_dir, c.approved_dir, c.posted_dir, c.logs_dir):

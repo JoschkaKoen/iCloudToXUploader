@@ -132,8 +132,10 @@ def polish(img: Image.Image, cfg) -> Image.Image:
     try:
         if not getattr(cfg, "polish_enabled", False):
             return img
+        # empty / unset intensity falls back to "natural" (the config default); only an
+        # explicit off/none disables polish here (POLISH_ENABLED already gates the rest).
         intensity = (getattr(cfg, "polish_intensity", "natural") or "natural").strip().lower()
-        if intensity in ("off", "none", ""):
+        if intensity in ("off", "none"):
             return img
         gains = _PRESETS.get(intensity)
         if gains is None:
