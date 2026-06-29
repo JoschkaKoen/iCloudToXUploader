@@ -13,15 +13,18 @@ from __future__ import annotations
 
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
+import ic2x.reconcile as reconcile  # noqa: E402
 from ic2x.db import DB  # noqa: E402
 from ic2x.reconcile import reconcile_with_x  # noqa: E402
 from ic2x.status import Status  # noqa: E402
+
+reconcile._X_READ_RETRY_DELAY = 0  # no real sleeps between retries in tests
 
 _TMP = Path(tempfile.mkdtemp(prefix="ic2x_reconcile_test_"))
 _SEQ = [0]
@@ -42,11 +45,11 @@ def _db():
     return DB(_TMP / f"r{_SEQ[0]}.db")
 
 
-def _seed(db, *, asset, sha, tid, ph, caption):
+def _seed(db, *, asset, sha, tid, ph, caption, posted_at=None):
     db._conn.execute(
         "INSERT INTO images (asset_id, sha256, phash, status, caption, tweet_id, posted_at) "
         "VALUES (?,?,?,?,?,?,?)",
-        (asset, sha, ph, Status.POSTED.value, caption, tid, _NOW.isoformat()),
+        (asset, sha, ph, Status.POSTED.value, caption, tid, (posted_at or _NOW).isoformat()),
     )
     db._conn.execute(
         "INSERT INTO asset_index (asset_id, seen) VALUES (?, 1) "
@@ -99,6 +102,70 @@ def test_fail_open_on_x_error():
     _seed(db, asset="A", sha="s", tid="100", ph=_PH_A, caption="x")
     reconcile_with_x(db, cfg, _lookup(raises=True))
     assert db.get_image_by_sha("s") is not None and db.seen_asset_id("A") is True
+    db.close()
+
+
+def test_retries_in_close_succession_then_succeeds():
+    db = _db(); cfg = _cfg()
+    _seed(db, asset="A_DEL", sha="shaDEL", tid="100", ph=_PH_A, caption="d")
+    state = {"n": 0}
+
+    def flaky(ids):  # fail twice, succeed on the 3rd attempt
+        state["n"] += 1
+        if state["n"] < 3:
+            raise RuntimeError(f"proxy 503 ({state['n']})")
+        return {}, {"100"}
+
+    reconcile_with_x(db, cfg, flaky)
+    assert state["n"] == 3                            # one try + two retries
+    assert db.get_image_by_sha("shaDEL") is None      # the 3rd-attempt result was used
+    db.close()
+
+
+def test_gives_up_after_three_attempts():
+    db = _db(); cfg = _cfg()
+    _seed(db, asset="A", sha="s", tid="100", ph=_PH_A, caption="x")
+    state = {"n": 0}
+
+    def always_fail(ids):
+        state["n"] += 1
+        raise RuntimeError("down")
+
+    reconcile_with_x(db, cfg, always_fail)
+    assert state["n"] == 3                             # exactly 3 attempts, then move on
+    assert db.get_image_by_sha("s") is not None        # fail-open: nothing changed
+    db.close()
+
+
+def test_deleting_most_recent_refreshes_post_timer():
+    db = _db(); cfg = _cfg()
+    old, new = _NOW - timedelta(hours=10), _NOW
+    _seed(db, asset="OLD", sha="sOLD", tid="100", ph=_PH_A, caption="old live", posted_at=old)
+    _seed(db, asset="NEW", sha="sNEW", tid="200", ph=_PH_B, caption="new deleted", posted_at=new)
+    db.set_last_posted_at(new)                       # timer points at the soon-deleted post
+    reconcile_with_x(db, cfg, _lookup(deleted={"200"}))
+    assert db.get_last_posted_at() == old            # falls back to the most-recent LIVE post
+    db.close()
+
+
+def test_stale_timer_corrected_without_new_deletions():
+    # the user's case: the deleted post was re-queued in a PRIOR run, so this run sees 0
+    # deletions — but last_posted_at still points at that gone post and must be corrected.
+    db = _db(); cfg = _cfg()
+    live_time = _NOW - timedelta(hours=30)
+    _seed(db, asset="LIVE", sha="sL", tid="100", ph=_PH_A, caption="old live", posted_at=live_time)
+    db.set_last_posted_at(_NOW)                       # stale — points at a post no longer in the DB
+    reconcile_with_x(db, cfg, _lookup(live={"100": "old live"}))   # 0 deletions this run
+    assert db.get_last_posted_at() == live_time       # synced to the most-recent live post → due
+    db.close()
+
+
+def test_deleting_only_post_clears_timer():
+    db = _db(); cfg = _cfg()
+    _seed(db, asset="A", sha="s", tid="100", ph=_PH_A, caption="x")
+    db.set_last_posted_at(_NOW)
+    reconcile_with_x(db, cfg, _lookup(deleted={"100"}))
+    assert db.get_last_posted_at() is None           # nothing live → timer cleared → due now
     db.close()
 
 

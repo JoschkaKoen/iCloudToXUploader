@@ -39,6 +39,7 @@ The tweet needs to be compatible with Chinese culture and laws! The tweet needs 
 Say only what you can see or genuinely know — don't invent prices. 
 
 Under 200 characters, no hashtags, ending with one fitting emoji.
+Do not restate the location and time of the photo in the tweet text (they are automatically appended).
 
 Return ONLY JSON: {{"caption": "<caption>"}}"""
 

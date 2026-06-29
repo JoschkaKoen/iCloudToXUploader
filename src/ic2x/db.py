@@ -387,6 +387,17 @@ class DB:
     def set_last_posted_at(self, dt: datetime) -> None:
         self.set_state("last_posted_at", dt.isoformat())
 
+    def refresh_last_posted_at(self) -> None:
+        """Recompute last_posted_at from the most recent STILL-LIVE post, so a post the
+        owner deleted on X no longer holds the posting interval. Clears it (→ due now) if
+        nothing real is posted. Called by reconcile after it re-queues a deletion."""
+        row = self._conn.execute(
+            "SELECT MAX(posted_at) AS m FROM images "
+            "WHERE status = ? AND tweet_id IS NOT NULL AND tweet_id != 'DRYRUN'",
+            (Status.POSTED.value,),
+        ).fetchone()
+        self.set_state("last_posted_at", (row["m"] if row else None) or "")
+
     # ── Clean ──────────────────────────────────────────────────────────────────
 
     _CLEANABLE_STATUSES = (Status.QUEUED, Status.APPROVED, Status.SEEN)

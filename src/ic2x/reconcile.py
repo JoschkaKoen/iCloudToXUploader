@@ -16,6 +16,7 @@ A sanity cap skips re-queuing when implausibly many look deleted (a bad/partial 
 from __future__ import annotations
 
 import logging
+import time
 
 from ic2x.config import Config
 from ic2x.db import DB
@@ -23,6 +24,9 @@ from ic2x.utils import ui
 from ic2x.utils.decision_log import log_decision
 
 logger = logging.getLogger("ic2x.reconcile")
+
+_X_READ_ATTEMPTS = 3        # one initial try + 2 quick retries before giving up (fail-open)
+_X_READ_RETRY_DELAY = 2.0   # seconds between attempts — close succession, for a transient blip
 
 
 def reconcile_with_x(db: DB, cfg: Config, lookup_tweets) -> None:
@@ -33,11 +37,20 @@ def reconcile_with_x(db: DB, cfg: Config, lookup_tweets) -> None:
         return  # nothing posted yet → nothing to reconcile
     ui.info(f"reconcile — checking {len(candidates)} recent posts against X …")
     ids = [str(c["tweet_id"]) for c in candidates]
-    try:
-        live, deleted = lookup_tweets(ids)
-    except Exception as exc:  # noqa: BLE001 — never block startup on an X read
-        ui.warn(f"reconcile — skipped (X read failed: {exc})")
-        return
+
+    # Retry the X read a couple of times in close succession before giving up — a brief
+    # proxy/VPN blip shouldn't skip reconcile. Fail-open only after all attempts fail.
+    for attempt in range(1, _X_READ_ATTEMPTS + 1):
+        try:
+            live, deleted = lookup_tweets(ids)
+            break
+        except Exception as exc:  # noqa: BLE001 — never block startup on an X read
+            if attempt < _X_READ_ATTEMPTS:
+                ui.warn(f"reconcile — X read failed ({attempt}/{_X_READ_ATTEMPTS}), retrying …")
+                time.sleep(_X_READ_RETRY_DELAY)
+            else:
+                ui.warn(f"reconcile — skipped after {_X_READ_ATTEMPTS} tries (X read failed: {exc})")
+                return
 
     # `deleted` = ids X reports as resource-not-found. Anything not in `deleted` still
     # EXISTS — whether viewable (`live`) or restricted (e.g. visibility lowered) — so
@@ -75,6 +88,11 @@ def reconcile_with_x(db: DB, cfg: Config, lookup_tweets) -> None:
             ui.info(f'   ↳ deleted on X → re-queued: "{snippet}"')
         except Exception as exc:  # noqa: BLE001
             logger.warning("reconcile: re-queue failed for image %s: %s", c["id"], exc)
+
+    # Keep the 5h post timer in sync with the most-recent STILL-LIVE post EVERY run — a
+    # post deleted on X (whether this run or a previous one) must never keep holding the
+    # interval. Normally a no-op (timer already == newest live post); corrects staleness.
+    db.refresh_last_posted_at()
 
     bits = [f"{requeued} re-queued" if requeued else "all in sync"]
     if filled:

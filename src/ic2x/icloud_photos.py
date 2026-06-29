@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -59,6 +60,29 @@ def _classify(exc: Exception) -> Exception:
         if any(s in text for s in ("429", "503", "throttl", "unavailable", "rate")):
             return PyiCloudThrottled(str(exc))
     return exc
+
+
+_ICLOUD_RETRY_ATTEMPTS = 3        # one try + two retries before giving up
+_ICLOUD_RETRY_DELAY = 2.0         # seconds — close succession, for a transient iCloud blip
+
+
+def _icloud_retry(fn, label: str):
+    """Run `fn`, retrying a transient 'Request failed to iCloud' blip a few times in close
+    succession. Reauth (needs 2FA) and throttling are re-raised AT ONCE so the bot loop's
+    own handlers take over — only generic request failures are worth a quick retry."""
+    for attempt in range(1, _ICLOUD_RETRY_ATTEMPTS + 1):
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001
+            classified = _classify(exc)
+            if isinstance(classified, (ReauthRequired, PyiCloudThrottled)):
+                raise classified from exc
+            if attempt == _ICLOUD_RETRY_ATTEMPTS:
+                raise classified from exc
+            logger.warning("icloud: %s failed (%d/%d) — retrying in %.0fs … (%s)",
+                           label, attempt, _ICLOUD_RETRY_ATTEMPTS, _ICLOUD_RETRY_DELAY,
+                           str(exc)[:100])
+            time.sleep(_ICLOUD_RETRY_DELAY)
 
 
 class ICloudPhotos:
@@ -173,9 +197,12 @@ class ICloudPhotos:
         """Asset ids in the Apple Screenshots smart album (by id, not localized name)."""
         from pyicloud.services.photos_cloudkit import SmartAlbumEnum
 
-        try:
+        def _fetch() -> set[str]:
             album = self._photos.albums[SmartAlbumEnum.SCREENSHOTS.value]
             return {a.id for a in album}
+
+        try:
+            return _icloud_retry(_fetch, "Screenshots album")
         except Exception as exc:  # noqa: BLE001
             logger.warning("icloud: Screenshots album unavailable (%s); "
                            "relying on the full-res EXIF gate only", exc)
@@ -189,11 +216,9 @@ class ICloudPhotos:
             raise _classify(exc) from exc
 
     def download(self, asset: Any, version: str, dest: Path) -> Path:
-        """Download `version` of `asset` to `dest`. Raises on failure / missing version."""
-        try:
-            data = asset.download(version)
-        except Exception as exc:  # noqa: BLE001
-            raise _classify(exc) from exc
+        """Download `version` of `asset` to `dest`. Raises on failure / missing version.
+        Transient iCloud request failures are retried in close succession first."""
+        data = _icloud_retry(lambda: asset.download(version), f"download({version})")
         if not data:
             raise RuntimeError(f"download: version {version!r} unavailable for {asset.id}")
         dest.parent.mkdir(parents=True, exist_ok=True)
