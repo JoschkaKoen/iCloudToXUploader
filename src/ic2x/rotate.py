@@ -1,7 +1,10 @@
 """
-AI auto-rotation: the rotation model returns how to rotate (0/90/180/270° CW)
-and we apply it locally. EXIF orientation is baked in first; this catches photos
-whose camera metadata is wrong (EXIF says "upright" but the content is sideways).
+AI auto-rotation (pick-4): the judge sees all 4 rotations of the photo in one
+multi-image call and picks the upright one; a second 2-image call confirms any
+proposed fix against the as-shot version (straight-down shots stay as shot).
+We apply the resulting 0/90/180/270° CW locally. EXIF orientation is baked in
+first; this catches photos whose camera metadata is wrong (EXIF says "upright"
+but the content is sideways).
 
   ic2x autorotate --count N [--models "qwen3.5-flash, 2000; gemini-2.5-flash-lite"]
     → rotate_out/<ts>/<model>/  (one folder per model, for visual comparison)
