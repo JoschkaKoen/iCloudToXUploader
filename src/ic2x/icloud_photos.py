@@ -13,13 +13,17 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator
 
 from ic2x.config import Config
 
 logger = logging.getLogger("ic2x.icloud_photos")
+
+# Added − captured beyond this = a bulk-imported archive photo (chronologically
+# misplaced in rank order); generous margin for late phone syncs.
+_ARCHIVE_IMPORT_GAP = timedelta(days=30)
 
 
 class ReauthRequired(RuntimeError):
@@ -138,7 +142,30 @@ class ICloudPhotos:
         api = self._build()
         if api.requires_2fa or api.requires_2sa:
             raise ReauthRequired("interactive 2FA required — run `ic2x login`")
+        self._enforce_session_timeout(api)
         self._api = api
+
+    @staticmethod
+    def _enforce_session_timeout(api: Any, seconds: int = 90) -> None:
+        """pyicloud issues requests with NO timeout, and urllib3 sets
+        sock.settimeout(None) on reads when none is given — so a dead HTTPS
+        connection blocks an SSL read FOREVER and freezes the whole bot mid-scan
+        (observed twice, 2026-07-14: 0%% CPU, stuck in poll()). A global
+        socket.setdefaulttimeout does NOT cover this (urllib3 overrides it).
+        Inject a default per-request timeout at the requests-session level, so a
+        stalled call raises within `seconds` and flows into the existing
+        transient-retry handling."""
+        try:
+            session = api.session
+            orig = session.request
+
+            def request_with_timeout(method, url, **kw):
+                kw.setdefault("timeout", seconds)
+                return orig(method, url, **kw)
+
+            session.request = request_with_timeout
+        except Exception as exc:  # noqa: BLE001 — never block startup on this guard
+            logger.warning("icloud: could not enforce session timeout: %s", exc)
 
     def interactive_login(self, code_provider) -> None:
         """For `ic2x login` only. code_provider() -> str prompts the user."""
@@ -173,22 +200,262 @@ class ICloudPhotos:
 
     def _recent_album(self) -> Any:
         """Album iterating newest-ADDED first (genuinely new photos, taken or
-        imported, sort first — unlike `.all`, which yields oldest capture date).
-        Falls back to `.all` if the library accessor is unavailable."""
+        imported, sort first). Falls back to `.all` if the library accessor is
+        unavailable."""
         photos = self._photos
         lib = getattr(photos, "_root_library", None)
         if lib is not None and hasattr(lib, "recently_added"):
             return lib.recently_added()
         return photos.all
 
+    def _iter_all_backwards(self) -> Iterator[Any]:
+        """The WHOLE library, newest CloudKit asset-date first — the back-in-time
+        reservoir behind the small Recently-Added window. Ordering mirrors the
+        Photos app's All Photos grid (bulk imports rank at their import time).
+        pyicloud's own DESCENDING album path miscounts synthetic albums, so this
+        pages the genuine ascending `.all` album from its tail, reversing each
+        window. len() is read once; concurrent additions only shift ranks by a
+        few slots, which the caller's id-dedup + DB seen-skip absorb."""
+        from pyicloud.services.photos_cloudkit.constants import DirectionEnum
+
+        photos = self._photos
+        lib = getattr(photos, "_root_library", None)
+        album = lib.all if lib is not None else photos.all
+        page = 100
+        offset = max(len(album) - page, 0)
+        while True:
+            window = list(album._get_photos_at(offset, DirectionEnum.ASCENDING, page))
+            for photo in reversed(window):
+                yield photo
+            if offset == 0:
+                break
+            offset = max(offset - page, 0)
+
+    @staticmethod
+    def _is_archive_import(asset: Any) -> bool:
+        """True when the asset was ADDED long after capture — a bulk-imported old
+        archive photo. Rank order places imports at their IMPORT time, which broke
+        chronology (a 2026 walk-back jumped straight to a 2004 ski archive, user
+        report 2026-07-14). Organic photos (added ≈ captured) already flow in true
+        reverse-chronological order, so archive imports are deferred to a final
+        phase — which is also where they belong chronologically (oldest era)."""
+        try:
+            created, added = asset.created, asset.added_date
+            if created is None or added is None:
+                return False
+            return (added - created) > _ARCHIVE_IMPORT_GAP
+        except Exception:  # noqa: BLE001 — missing/odd fields → treat as organic
+            return False
+
+    # ── Capture-date catalog: build / refresh / positional fetch ────────────────
+
+    def _all_album(self) -> Any:
+        photos = self._photos
+        lib = getattr(photos, "_root_library", None)
+        return lib.all if lib is not None else photos.all
+
+    def ensure_catalog(self, db: Any, page: int = 200) -> None:
+        """Build the capture-date catalog once (metadata sweep of the whole
+        library, ~10 min for 67k assets), then keep it fresh each call by walking
+        pages backward from the album tail until a whole page is already known
+        (new photos and imports both land at the tail — rank = assetDate ≈ now)."""
+        from pyicloud.services.photos_cloudkit.constants import DirectionEnum
+
+        album = self._all_album()
+        total = len(album)
+
+        def _rows(offset: int) -> list[tuple[str, str | None, int]]:
+            out = []
+            for i, a in enumerate(album._get_photos_at(offset, DirectionEnum.ASCENDING, page)):
+                try:
+                    created = a.created.isoformat() if a.created else None
+                except Exception:  # noqa: BLE001
+                    created = None
+                out.append((a.id, created, offset + i))
+            return out
+
+        if db.get_state("catalog_complete") != "1":
+            start = db.catalog_count()  # resume an interrupted build
+            logger.info("icloud: cataloging library capture dates — %d/%d done, "
+                        "sweeping the remaining metadata (this is a one-time pass)",
+                        start, total)
+            offset = start
+            while offset < total:
+                rows = _rows(offset)
+                if not rows:
+                    break
+                db.catalog_upsert_many(rows)
+                offset += len(rows)
+                if offset % 2000 < page:
+                    logger.info("icloud: catalog %d/%d …", offset, total)
+            db.set_state("catalog_complete", "1")
+            logger.info("icloud: catalog complete — %d assets indexed", db.catalog_count())
+            return
+
+        # incremental tail refresh
+        offset = max(total - page, 0)
+        added = 0
+        while True:
+            rows = _rows(offset)
+            known = db.catalog_known([r[0] for r in rows])
+            new = [r for r in rows if r[0] not in known]
+            if new:
+                db.catalog_upsert_many(new)
+                added += len(new)
+            if not new or offset == 0:
+                break
+            offset = max(offset - page, 0)
+        if added:
+            logger.info("icloud: catalog refreshed — %d new assets indexed", added)
+
+    def _fetch_by_rank(self, asset_id: str, rank: int, db: Any = None) -> Any | None:
+        """Live PhotoAsset for a cataloged id: fetch a window around its recorded
+        rank and match by id (positional — resolving by id hangs).
+
+        Robustness (2026-07-15 field lessons):
+        - The list is newest-first, so photos added since catalog time shift ALL
+          old ranks uniformly — a global drift estimate, learned from each hit,
+          keeps probes centered (rank + drift).
+        - Consecutive chronological candidates cluster in rank; the window cache
+          serves them without extra calls.
+        - An id whose (drifted) rank the current window COVERS but doesn't contain
+          was deleted from iCloud (user deleted a batch of Jul-9 photos) — skip
+          for free and, when `db` is given, drop its catalog row so future cycles
+          don't re-probe it."""
+        from pyicloud.services.photos_cloudkit.constants import DirectionEnum
+
+        drift = getattr(self, "_rank_drift", 0)
+        cache: dict[str, Any] = getattr(self, "_fetch_cache", None) or {}
+        ranks: dict[str, int] = getattr(self, "_fetch_ranks", None) or {}
+        bounds = getattr(self, "_fetch_bounds", None)
+
+        def _hit(a_id: str) -> Any:
+            actual = ranks.get(a_id)
+            if actual is not None:
+                self._rank_drift = actual - rank
+            return cache[a_id]
+
+        if asset_id in cache:
+            return _hit(asset_id)
+        expected = rank + drift
+        if bounds and bounds[0] <= expected <= bounds[1]:
+            # window covers where it should be, id absent → deleted from iCloud
+            logger.info("icloud: cataloged asset %s absent from covered window "
+                        "(deleted from library) — dropping", asset_id[:8])
+            if db is not None:
+                db.catalog_delete(asset_id)
+            return None
+
+        album = self._all_album()
+        for width in (120, 700):
+            start = max(expected - width // 2, 0)
+            # iCloud pages at ~100 per query and silently CLAMPS larger requests
+            # (a "700-wide" single fetch returned 100 and ate valid catalog rows,
+            # 2026-07-16) — accumulate explicit 100-page chunks instead.
+            window_list: list[Any] = []
+            off = start
+            while off < start + width:
+                page = list(album._get_photos_at(off, DirectionEnum.ASCENDING,
+                                                 min(100, start + width - off)))
+                window_list.extend(page)
+                if not page:
+                    break  # truly no data at this offset
+                off += len(page)  # iCloud returns SHORT pages (~49) mid-library — keep going
+            cache = {a.id: a for a in window_list}
+            ranks = {a.id: start + i for i, a in enumerate(window_list)}
+            self._fetch_cache, self._fetch_ranks = cache, ranks
+            self._fetch_bounds = (start, start + len(window_list) - 1)
+            if asset_id in cache:
+                return _hit(asset_id)
+        covered = (self._fetch_bounds[0] <= expected <= self._fetch_bounds[1]
+                   and len(window_list) > 0)
+        if covered and db is not None:
+            logger.warning("icloud: cataloged asset %s not at rank %d(+%d drift) though "
+                           "window covered it — deleted from library, dropping",
+                           asset_id[:8], rank, drift)
+            db.catalog_delete(asset_id)
+        else:
+            logger.warning("icloud: cataloged asset %s not found near rank %d(+%d drift) — "
+                           "window did NOT cover it; keeping for retry", asset_id[:8],
+                           rank, drift)
+        return None
+
+    def iter_image_assets_chrono(self, db: Any) -> Iterator[tuple[AssetMeta, Any]]:
+        """The bot's walk-back order: Recently-Added first (fresh shots; bulk
+        imports deferred — the catalog places them at their true position), then
+        every not-yet-decided asset in strict capture-date-DESC order from the
+        persisted catalog. Never starves while unseen photos exist; never jumps
+        eras (user steer 2026-07-14: 'go back in time chronologically')."""
+        yielded: set[str] = set()
+
+        def _meta(asset: Any) -> AssetMeta | None:
+            try:
+                if asset.item_type != "image":
+                    return None
+                w, h = asset.dimensions or (None, None)
+                return AssetMeta(id=asset.id, created=asset.created,
+                                 filename=asset.filename,
+                                 is_live=bool(asset.is_live_photo), width=w, height=h)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("icloud: skipping unreadable asset: %s", exc)
+                return None
+
+        try:
+            self.ensure_catalog(db)
+            try:
+                for asset in self._recent_album():
+                    if getattr(asset, "id", None) in yielded or self._is_archive_import(asset):
+                        continue
+                    m = _meta(asset)
+                    if m is not None:
+                        yielded.add(m.id)
+                        yield m, asset
+            except Exception as exc:  # noqa: BLE001 — recent-album query is flaky
+                # (observed 2026-07-15: the ADDED-index endpoint failing while the
+                # catalog's queries work). The tail-refresh above already cataloged
+                # anything new, so the catalog phase still serves newest-first —
+                # losing only the added-order preference, never any photo.
+                logger.warning("icloud: recent-window query failed (%s) — falling "
+                               "through to the catalog walk", str(exc)[:120])
+            logger.info("icloud: recent window done (%d yielded) — continuing back "
+                        "in time chronologically via the catalog", len(yielded))
+            for row in db.catalog_unseen_desc():
+                if row["asset_id"] in yielded:
+                    continue
+                asset = self._fetch_by_rank(row["asset_id"], row["rank"], db)
+                if asset is None:
+                    continue
+                m = _meta(asset)
+                if m is not None:
+                    yielded.add(m.id)
+                    yield m, asset
+        except Exception as exc:  # noqa: BLE001
+            raise _classify(exc) from exc
+
     def iter_image_assets(self) -> Iterator[tuple[AssetMeta, Any]]:
-        """Yield (metadata, live PhotoAsset) newest-ADDED-first, still images only.
+        """Yield (metadata, live PhotoAsset), still images only, in CHRONOLOGICAL
+        walk-back order:
+          1. Recently-Added window (newest first) — new shots always come first;
+          2. the whole library newest-capture-first (organic photos, whose rank
+             order ≈ capture order), skipping bulk-imported archives;
+          3. only when the organic timeline is exhausted: the deferred archive
+             imports (chronologically the oldest era anyway).
+        The caller's DB seen-skip decides how deep each cycle actually walks; this
+        iterator never starves while unseen photos exist anywhere in the library.
         Videos/movies excluded by item_type. Metadata + a live downloadable asset;
         the asset is downloaded directly (never re-resolved by id — that hangs)."""
-        try:
-            for asset in self._recent_album():
+        yielded: set[str] = set()
+        deferred = 0
+
+        def _images(assets: Iterator[Any], archive_pass: bool
+                    ) -> Iterator[tuple[AssetMeta, Any]]:
+            nonlocal deferred
+            for asset in assets:
                 try:
-                    if asset.item_type != "image":
+                    if asset.item_type != "image" or asset.id in yielded:
+                        continue
+                    if not archive_pass and self._is_archive_import(asset):
+                        deferred += 1
                         continue
                     w, h = asset.dimensions or (None, None)
                     meta = AssetMeta(
@@ -198,7 +465,19 @@ class ICloudPhotos:
                 except Exception as exc:  # noqa: BLE001 — one bad asset is not fatal
                     logger.warning("icloud: skipping unreadable asset: %s", exc)
                     continue
+                yielded.add(asset.id)
                 yield meta, asset
+
+        try:
+            yield from _images(iter(self._recent_album()), False)
+            logger.info("icloud: recent window exhausted — walking back in time "
+                        "chronologically (%d yielded, %d archive imports deferred)",
+                        len(yielded), deferred)
+            yield from _images(self._iter_all_backwards(), False)
+            if deferred:
+                logger.info("icloud: organic timeline exhausted — %d deferred "
+                            "archive-import assets now eligible (oldest era)", deferred)
+                yield from _images(self._iter_all_backwards(), True)
         except Exception as exc:  # noqa: BLE001
             raise _classify(exc) from exc
 

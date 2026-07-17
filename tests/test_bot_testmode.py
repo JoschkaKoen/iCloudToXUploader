@@ -108,6 +108,9 @@ def test_bot_test_mode_isolates_state_and_bounds_cycles():
     cfg.scene_group_enabled = False
     cfg.rotation_enabled = False
     cfg.location_enabled = False
+    cfg.owner_check_enabled = False     # keep the soak offline (no owner-gate VLM call)
+    cfg.local_prefilter_enabled = False  # keep the soak hermetic (no local Ollama calls)
+    cfg.local_judge_shadow = False
     cfg.color_enhance_enabled = False   # keep the soak offline (no Aliyun calls)
     cfg.caption_pass_enabled = False    # keep the soak offline (no caption VLM call)
     cfg.reconcile_on_startup = False    # keep the soak offline (no X reads)

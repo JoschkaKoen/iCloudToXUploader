@@ -113,7 +113,8 @@ def test_pick_plus_confirm_applies_fix():
         ({"upright_index": idx180, "confident": True, "reason": "sky below"}, True),
         ({"apply_fix": True, "reason": "clearly upside down"}, True),
     ])
-    assert res == {"upright": False, "rotate_cw_degrees": 180}
+    assert res["upright"] is False and res["rotate_cw_degrees"] == 180
+    assert "sky below" in res["reason"] and "clearly upside down" in res["reason"]
     assert [c["label"] for c in rec.calls] == ["rotation", "rotation_confirm"]
     confirm = rec.calls[1]
     assert confirm["n"] == 2

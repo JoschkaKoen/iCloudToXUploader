@@ -270,10 +270,12 @@ def call_rotation_pick4(image_path: Path, cfg: Config, model_string: str | None 
                             str(confirm.get("reason", ""))[:80])
                 return dict(_OK), elapsed, used_network
 
-            logger.info("rotation(pick4): %s → %d° CW (pick: %s | confirm: %s)",
-                        image_path.name, degrees, str(parsed.get("reason", ""))[:60],
-                        str(confirm.get("reason", ""))[:60])
-            return {"upright": False, "rotate_cw_degrees": degrees}, elapsed, used_network
+            reason = (f"pick: {str(parsed.get('reason', ''))[:60]} | "
+                      f"confirm: {str(confirm.get('reason', ''))[:60]}")
+            logger.info("rotation(pick4): %s → %d° CW (%s)",
+                        image_path.name, degrees, reason)
+            return ({"upright": False, "rotate_cw_degrees": degrees, "reason": reason},
+                    elapsed, used_network)
     except Exception as exc:  # noqa: BLE001 — fail open, never block a post
         logger.warning("rotation(pick4): error for %s: %s", image_path.name, exc)
         return dict(_OK), 0.0, False

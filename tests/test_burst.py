@@ -153,8 +153,31 @@ def test_screenshot_dropped_to_aux():
 
 
 def test_undecodable_to_aux():
-    b = _burst(_fresh_db(), [_asset("bad", 0, dead=True), _asset("good", 2, 1)], _cfg())
+    # a file that downloads but can't be hashed (corrupt) is permanently aux-seen
+    p = _FIX / "corrupt.jpg"
+    p.write_bytes(b"definitely not a jpeg")
+    b = _burst(_fresh_db(), [("bad", p), _asset("good", 2, 1)], _cfg())
     assert "bad" in b.aux_seen and [m.asset_id for m in b.members] == ["good"]
+
+
+def test_download_failure_retries_until_attempts_exhausted():
+    # a DOWNLOAD failure must NOT mark the photo seen — it retries next cycle
+    # ("go back in time only when no newest unposted image was detected/downloaded")
+    db = _fresh_db()
+    cfg = _cfg()
+    cfg.burst_max_attempts = 3
+    items = [_asset("flaky", 0, dead=True), _asset("good", 2, 1)]
+
+    for round_no in (1, 2):  # first two failures: retried, not seen
+        b = assemble_burst(_stream(db, items, cfg), cfg, FakeIC(), set(), db)
+        assert "flaky" not in b.aux_seen, round_no
+        assert [m.asset_id for m in b.members] == ["good"]
+        assert db.seen_asset_id("flaky") is False
+        db._conn.execute("UPDATE asset_index SET seen=0 WHERE asset_id='good'")
+        db._conn.commit()
+
+    b = assemble_burst(_stream(db, items, cfg), cfg, FakeIC(), set(), db)  # 3rd → give up
+    assert "flaky" in b.aux_seen
 
 
 def _main() -> int:

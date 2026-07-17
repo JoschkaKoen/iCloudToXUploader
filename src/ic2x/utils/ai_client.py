@@ -236,7 +236,7 @@ _PROVIDER_REGISTRY: list[_ProviderDef] = [
         base_url="http://localhost:11434/v1",
         api_key_env="OLLAMA_API_KEY",
         model_prefixes=(),
-        exact_models=("qwen3-vl:8b",),
+        exact_models=("qwen3-vl:8b", "qwen3-vl:30b"),
         api_key_default="ollama",
         timeout=120.0,
     ),
@@ -568,10 +568,16 @@ def call_ollama_chat(
     base_url: str,
     model: str,
     prompt: str,
-    image_b64: str,
+    image_b64: str | list[str],
     *,
-    timeout: float = 120.0,
+    timeout: float = 300.0,
+    think: bool | None = None,
 ) -> str:
+    """One Ollama chat call. image_b64 may be a single image or a LIST (multi-
+    image, e.g. the local safety pre-filter over a whole burst — images appear
+    to the model in list order, matching the prompt's "Image index i" labels).
+    num_predict is generous: qwen3-vl thinks in a separate channel and a small
+    budget starves the actual answer (observed: empty content at 200)."""
     import urllib.request
     import json as _json
 
@@ -579,12 +585,18 @@ def call_ollama_chat(
     if api_base.endswith("/v1"):
         api_base = api_base[:-3]
 
-    payload = _json.dumps({
+    images = image_b64 if isinstance(image_b64, list) else [image_b64]
+    body = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt, "images": [image_b64]}],
+        "messages": [{"role": "user", "content": prompt, "images": images}],
         "stream": False,
         "format": "json",
-    }).encode()
+        "options": {"num_predict": 1600},
+        "keep_alive": "10m",
+    }
+    if think is not None:
+        body["think"] = think  # qwen3-vl: thinking eats num_predict; False for judges
+    payload = _json.dumps(body).encode()
 
     req = urllib.request.Request(
         f"{api_base}/api/chat",

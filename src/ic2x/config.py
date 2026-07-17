@@ -68,6 +68,8 @@ class Config:
     location_enabled: bool
     location_timeout: float
     caption_pass_enabled: bool      # location/time-grounded caption pass on the winner
+    caption_candidates: int         # best-of-N captions (N parallel calls + AI picker)
+    caption_picker_model: str       # CAPTION_PICKER_MODEL or judge_model
 
     # Limits / dedup
     daily_ai_calls: int             # also bounds walk-back cost per day
@@ -111,6 +113,21 @@ class Config:
     scene_dedup_recent_n: int
     scene_dedup_image_max_px: int | None
     scene_thumbs_dir: Path
+
+    # Local (Ollama) safety pre-filter — screens bursts ON-DEVICE before any
+    # thumbnail is uploaded to a cloud judge; fail-through on any problem
+    local_prefilter_enabled: bool
+    local_prefilter_model: str
+    local_prefilter_min_free_gb: int    # skip local inference below this kernel-free level
+    local_judge_shadow: bool            # Tier-2 pilot: log local-vs-cloud judge agreement
+    local_judge_model: str
+
+    # Owner-selfie gate (reference-based "is the owner the main subject?" check on
+    # the winner; the judge's composition rule (flag "selfie") is the first layer)
+    owner_check_enabled: bool
+    owner_check_model: str           # OWNER_CHECK_MODEL or rotation_model
+    owner_check_image_max_px: int | None
+    owner_refs_dir: Path             # reference photos of the owner's face
 
     # Color enhancement (Aliyun VIAPI EnhanceImageColor on the winner before posting)
     color_enhance_enabled: bool
@@ -215,6 +232,8 @@ def load_config() -> Config:
         location_enabled=_bool_env("LOCATION_ENABLED", default=True),
         location_timeout=float(_int_env("LOCATION_TIMEOUT", 10)),
         caption_pass_enabled=_bool_env("CAPTION_PASS_ENABLED", default=True),
+        caption_candidates=_int_env("CAPTION_CANDIDATES", 4),
+        caption_picker_model=os.getenv("CAPTION_PICKER_MODEL", "").strip() or judge_model,
 
         # Limits / dedup
         daily_ai_calls=_int_env("DAILY_AI_CALLS", 200),
@@ -256,6 +275,15 @@ def load_config() -> Config:
         scene_dedup_recent_n=_int_env("SCENE_DEDUP_RECENT_N", 6),
         scene_dedup_image_max_px=_opt_int_env("SCENE_DEDUP_IMAGE_MAX_PX", 384),
         scene_thumbs_dir=_resolve(os.getenv("SCENE_THUMBS_DIR", "./scene_thumbs")),
+        local_prefilter_enabled=_bool_env("LOCAL_PREFILTER_ENABLED", default=False),
+        local_prefilter_model=os.getenv("LOCAL_PREFILTER_MODEL", "").strip() or "qwen3-vl:8b",
+        local_prefilter_min_free_gb=_int_env("LOCAL_PREFILTER_MIN_FREE_GB", 5),
+        local_judge_shadow=_bool_env("LOCAL_JUDGE_SHADOW", default=False),
+        local_judge_model=os.getenv("LOCAL_JUDGE_MODEL", "").strip() or "qwen3-vl:8b",
+        owner_check_enabled=_bool_env("OWNER_CHECK_ENABLED", default=True),
+        owner_check_model=os.getenv("OWNER_CHECK_MODEL", "").strip() or rotation_model,
+        owner_check_image_max_px=_opt_int_env("OWNER_CHECK_IMAGE_MAX_PX", 768),
+        owner_refs_dir=_resolve(os.getenv("OWNER_REFS_DIR", "./owner_refs")),
 
         # Color enhancement (EnhanceImageColor on the winner before posting)
         color_enhance_enabled=_bool_env("COLOR_ENHANCE_ENABLED", default=False),

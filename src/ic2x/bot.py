@@ -130,6 +130,7 @@ class _Ready:
     thumb: Path | None       # downloaded thumbnail, or None (screenshot / failed)
     phash: str | None        # perceptual hash, or None
     is_screenshot: bool
+    dl_failed: bool = False  # thumb download failed (transient) — retry, don't mark seen
 
 
 class _Stream:
@@ -170,14 +171,17 @@ class _Stream:
             return _Ready(meta, asset, None, None, True)
         dest = self._cfg.work_dir / f"thumb_{_safe_name(meta.id)}.jpg"
         thumb = _download(self._ic, asset, self._cfg.thumb_version, dest)
+        if thumb is None:
+            # Transient download failure — flag it so assembly retries the photo
+            # on a later cycle instead of permanently marking it seen.
+            return _Ready(meta, asset, None, None, False, dl_failed=True)
         ph: str | None = None
-        if thumb is not None:
-            try:
-                ph = dedup.phash_of(thumb)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("burst: pHash failed for %s: %s", meta.id, exc)
-                _unlink(thumb)
-                thumb = None
+        try:
+            ph = dedup.phash_of(thumb)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("burst: pHash failed for %s: %s", meta.id, exc)
+            _unlink(thumb)
+            thumb = None
         return _Ready(meta, asset, thumb, ph, False)
 
     def _fill(self) -> None:
@@ -271,6 +275,17 @@ def assemble_burst(stream: _Stream, cfg: Config, ic: ICloudPhotos, screenshot_id
         r = stream.peek()
         if r is None:
             break
+        if r.dl_failed:
+            stream.take()
+            # Transient download failure — leave UNSEEN so the photo is retried
+            # next cycle ("go back in time only when no newest unposted image was
+            # detected/downloaded"); the attempts breaker bounds poison assets.
+            max_att = getattr(cfg, "burst_max_attempts", 3)
+            if db is not None and db.incr_asset_attempts(r.meta.id) >= max_att:
+                aux_seen.append(r.meta.id)
+                logger.warning("burst: %s failed download %d× — giving up (seen)",
+                               r.meta.id, cfg.burst_max_attempts)
+            continue
         if r.is_screenshot or r.thumb is None or r.phash is None:
             aux_seen.append(r.meta.id)  # screenshot / undecodable / hash-failed
             stream.take()
@@ -365,6 +380,29 @@ def _prepare_winner(db: DB, cfg: Config, ic: ICloudPhotos, winner: BurstMember, 
             logger.warning("location: skipped (%s)", exc)
 
         prepared = prepare.prepare(orig, cfg.queue_dir, ph)
+        # Owner-selfie gate: the owner's own face as main subject never gets posted.
+        # Runs FIRST among the winner passes — a rejection walks back before any
+        # rotation/enhance/caption spend. Fail-open (layer 1 = judge "selfie" flag).
+        if getattr(cfg, "owner_check_enabled", False):
+            try:
+                from ic2x import judge_owner
+                ow, _oel, oused = judge_owner.call_owner_check(prepared, cfg)
+                if oused:
+                    db.increment_ai_calls()
+                if ow["owner_main_subject"]:
+                    ui.warn(f"   ↳ skipped — owner selfie ({ow.get('reason', '')})")
+                    _unlink(prepared)
+                    return "rejected", {
+                        "asset_id": winner.asset_id, "sha256": sha, "phash": ph,
+                        "status": Status.REJECTED, "reject_stage": "owner_selfie",
+                        "reject_reason": ow.get("reason", "owner is main subject"),
+                        "caption": "",
+                    }
+                ui.info("   ↳ owner check: not a selfie ✓")
+            except (ReauthRequired, PyiCloudThrottled):
+                raise
+            except Exception as exc:  # noqa: BLE001 — optional; never block the post
+                logger.warning("owner-check: skipped (%s)", exc)
         if cfg.rotation_enabled:
             try:
                 from ic2x import judge_rotation
@@ -373,6 +411,10 @@ def _prepare_winner(db: DB, cfg: Config, ic: ICloudPhotos, winner: BurstMember, 
                     db.increment_ai_calls()
                 if not rot["upright"] and rot["rotate_cw_degrees"]:
                     _apply_rotation(prepared, rot["rotate_cw_degrees"])
+                    ui.info(f"   ↳ rotation: was stored {rot['rotate_cw_degrees']}° off — "
+                            f"fixed ({rot.get('reason', 'AI pick-4')})")
+                else:
+                    ui.info("   ↳ rotation check: upright ✓")
             except Exception as exc:  # noqa: BLE001 — optional; never block the post
                 logger.warning("rotation: skipped (%s)", exc)
         # Free local adaptive polish (CPU-only). Runs BEFORE the paid color enhance, so
@@ -409,7 +451,7 @@ def _prepare_winner(db: DB, cfg: Config, ic: ICloudPhotos, winner: BurstMember, 
             try:
                 from ic2x import caption as caption_mod
                 new_cap, used = caption_mod.generate_caption(prepared, place, when, cfg)
-                if used:
+                for _ in range(int(used)):   # best-of-N: one increment per network call
                     db.increment_ai_calls()
                 if new_cap:
                     caption = new_cap
@@ -458,7 +500,11 @@ def run_one_cycle(db: DB, cfg: Config, ic: ICloudPhotos, clients) -> str:
     _ss_cached = getattr(ic, "screenshot_ids_cached", None)
     screenshot_ids = (_ss_cached(cfg.screenshot_album_refresh_cycles)
                       if _ss_cached else ic.screenshot_ids())
-    stream = _Stream(ic.iter_image_assets(), db, cfg, ic, screenshot_ids,
+    # Chronological catalog walk when the client supports it (real ICloudPhotos);
+    # plain iteration for lightweight test fakes.
+    _chrono = getattr(ic, "iter_image_assets_chrono", None)
+    stream = _Stream(_chrono(db) if _chrono else ic.iter_image_assets(),
+                     db, cfg, ic, screenshot_ids,
                      concurrency=cfg.prefetch_concurrency)
     thumbs: list[Path] = []
     try:
@@ -474,11 +520,49 @@ def run_one_cycle(db: DB, cfg: Config, ic: ICloudPhotos, clients) -> str:
                 db.commit_burst(seen_ids, None)  # all screenshots/undecodable
                 continue
 
+            # Local safety pre-filter (Tier 1 localization): screens the burst
+            # ON-DEVICE before any thumbnail is uploaded. Unsafe → reject here,
+            # photos never leave the Mac. Fail-through: cloud judge still screens.
+            if getattr(cfg, "local_prefilter_enabled", False):
+                from ic2x import judge_local_safety
+                lv, ran = judge_local_safety.prefilter_burst(
+                    [m.thumb for m in burst.members], cfg)
+                if ran and not lv.get("safe", True):
+                    db.commit_burst(seen_ids, None)
+                    lflags = ",".join(lv.get("flags") or []) or "local_unsafe"
+                    log_decision(cfg.logs_dir, outcome="rejected_local", asset_id=burst.head,
+                                 detail={"n": len(burst.members), "flags": lv.get("flags"),
+                                         "reason": lv.get("reason")})
+                    _keep_reviewed(cfg, "unsafe", burst, 0, f"local:{lflags}")
+                    ui.warn(f"   ↳ skipped — UNSAFE, caught on-device [{lflags}] "
+                            "(never uploaded)")
+                    continue
+
             n = len(burst.members)
             ui.info(f"judging burst — {n} shot{'s' if n != 1 else ''} …")
             verdict, _el, used_net = judge_burst([m.thumb for m in burst.members], cfg)
             if used_net:
                 db.increment_ai_calls()
+            # Tier-2 pilot: local judge runs in SHADOW — agreement is logged,
+            # the cloud verdict always decides. Flip LOCAL_JUDGE_* config to
+            # promote once a week of shadow data looks clean.
+            if getattr(cfg, "local_judge_shadow", False):
+                from ic2x import judge_local_safety
+                sv, s_ran = judge_local_safety.shadow_judge_burst(
+                    [m.thumb for m in burst.members], cfg)
+                if s_ran:
+                    a_safe = bool(sv.get("safe", True)) == bool(verdict.get("safe"))
+                    a_int = bool(sv.get("interesting", False)) == bool(verdict.get("interesting"))
+                    tag = "agrees" if (a_safe and a_int) else "DISAGREES"
+                    ui.info(f"   ↳ local shadow judge {tag} "
+                            f"(safe {sv.get('safe')}/{verdict.get('safe')}, "
+                            f"interesting {sv.get('interesting')}/{verdict.get('interesting')})")
+                    log_decision(cfg.logs_dir, outcome="local_shadow", asset_id=burst.head,
+                                 detail={"agree_safe": a_safe, "agree_interesting": a_int,
+                                         "local": {k: sv.get(k) for k in
+                                                   ("safe", "interesting", "best_index", "flags")},
+                                         "cloud": {k: verdict.get(k) for k in
+                                                   ("safe", "interesting", "best_index", "flags")}})
             shows = (verdict.get("shows") or "").strip()
             if shows:
                 ui.info(f"   ↳ shows: {shows}")
@@ -658,6 +742,13 @@ def _tidy_empty_dirs(cfg: Config) -> None:
 def bot(once: bool = False, test: bool = False, test_cycles: int = 20,
         post: bool = False) -> None:
     global _stop
+    # A dead HTTPS connection without a timeout blocks an SSL read FOREVER and
+    # silently freezes the whole loop mid-scan (observed 2026-07-14: 0% CPU,
+    # stuck in poll() after "scanning iCloud…"). pyicloud issues requests with
+    # no timeout, so give every socket a generous default — a stalled read then
+    # raises within 90s and flows into the existing transient-retry handling.
+    import socket
+    socket.setdefaulttimeout(90)
     cfg = load_config()
 
     # ── fast test-run mode: no waits + bypass the post interval / daily cap ──
@@ -845,6 +936,18 @@ def bot(once: bool = False, test: bool = False, test_cycles: int = 20,
                     logger.info("iCloud session refreshed after repeated errors.")
                 except Exception as e2:  # noqa: BLE001
                     logger.warning("session refresh failed: %s", e2)
+            if errors >= 6:
+                # In-process session rebuilds can fail while a FRESH process works
+                # (observed 2026-07-15: pyicloud's mid-call session renewal kept
+                # dying for hours; a new process recovered instantly). exec a clean
+                # interpreter in place — same PID, same nohup/log redirection, the
+                # DB carries all state, startup reconcile resyncs with X.
+                logger.error("still failing after %d errors — re-execing a fresh "
+                             "process to shed poisoned session state", errors)
+                ui.warn("♻️  restarting the bot process (fresh iCloud session) …")
+                import os as _os
+                import sys as _sys
+                _os.execv(_sys.executable, [_sys.executable, *_sys.argv])
             _sleep_interruptible(backoff)
             continue
 

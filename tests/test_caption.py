@@ -36,7 +36,10 @@ def test_format_location_line():
 def test_prompt_interpolates_place_time_and_stays_concise():
     p = cap._CAPTION_PROMPT.format(place="Ningbo, China", when="19:50")
     assert "Ningbo, China" in p and "19:50" in p   # place + time reach the model
-    assert len(cap._CAPTION_PROMPT) < 1200         # one focused template, not a rule pile
+    # Focused template, not a rule pile — but every rule here maps to a REAL posted
+    # caption the owner deleted (politics/tone/length/accuracy steers of 2026-07-12/13),
+    # so the ceiling was consciously raised from 1200 once those were encoded.
+    assert len(cap._CAPTION_PROMPT) < 1400
 
 
 def _patch(result):
@@ -66,7 +69,7 @@ def test_returns_model_caption_and_grounds_prompt():
         out, used = cap.generate_caption(Path("/x.jpg"), "Ningbo, China", "19:50", _cfg())
     finally:
         restore()
-    assert out == text and used is True
+    assert out == text and used == 1
     assert "Ningbo, China" in captured["prompt"] and "19:50" in captured["prompt"]
     assert captured["label"] == "caption"
 
@@ -89,6 +92,32 @@ def test_caption_whitespace_normalised_not_truncated():
     assert out == "line one line two spaced"  # collapsed whitespace, no length cap
 
 
+def test_emoji_field_appended():
+    _captured, restore = _patch(({"caption": "Noodles for lunch", "emoji": "🍜"}, 0.1, True, True))
+    try:
+        out, _ = cap.generate_caption(Path("/x.jpg"), "Ningbo, China", "12:00", _cfg())
+    finally:
+        restore()
+    assert out == "Noodles for lunch 🍜"
+
+
+def test_emoji_field_junk_duplicate_and_cjk():
+    for result, expected in [
+        ({"caption": "Nice lane 🌿", "emoji": "🍜"}, "Nice lane 🌿"),      # already ends with one
+        ({"caption": "Nice lane", "emoji": "abc"}, "Nice lane"),           # ascii junk skipped
+        ({"caption": "Nice lane", "emoji": ""}, "Nice lane"),              # empty skipped
+        ({"caption": "Nice lane"}, "Nice lane"),                           # field absent
+        ({"caption": "Nice lane", "emoji": "🍜 for the noodles"}, "Nice lane 🍜"),  # padded field
+        ({"caption": "Locals love 换购", "emoji": "🏮"}, "Locals love 换购 🏮"),  # CJK ≠ emoji
+    ]:
+        _captured, restore = _patch((result, 0.1, True, True))
+        try:
+            out, _ = cap.generate_caption(Path("/x.jpg"), None, None, _cfg())
+        finally:
+            restore()
+        assert out == expected, (result, out)
+
+
 def test_fails_safe_on_error():
     _captured, restore = _patch(({"caption": ""}, 0.1, False, False))  # ok=False
     try:
@@ -105,7 +134,115 @@ def test_skips_on_ollama():
         out, used = cap.generate_caption(Path("/x.jpg"), "Ningbo", "10:00", _cfg())
     finally:
         cap.provider_for_model = orig
-    assert out is None and used is False
+    assert out is None and used == 0
+
+
+# ── Best-of-N (caption_candidates > 1) ──────────────────────────────────────────
+
+def _cfg_n(n=4):
+    c = _cfg()
+    c.caption_candidates = n
+    c.caption_picker_model = "qwen3.7-plus"
+    return c
+
+
+def _patch_multi(gen_results, pick_result):
+    """Thread-safe fake: per-call caption results by label; captures the picker prompt."""
+    import threading
+    lock = threading.Lock()
+    captured = {"gen_calls": 0, "pick_calls": 0, "pick_prompt": None}
+    orig = (cap.call_vision_judge, cap.provider_for_model, cap.parse_model_effort)
+
+    def fake_call(*, model_string, ollama_base_url, call):
+        with lock:
+            if call.label == "caption":
+                r = gen_results[captured["gen_calls"] % len(gen_results)]
+                captured["gen_calls"] += 1
+                return r
+            captured["pick_calls"] += 1
+            captured["pick_prompt"] = call.prompt
+            return pick_result(call.prompt) if callable(pick_result) else pick_result
+
+    cap.call_vision_judge = fake_call
+    cap.provider_for_model = lambda m: "dashscope"
+    cap.parse_model_effort = lambda s: (s, None)
+
+    def restore():
+        cap.call_vision_judge, cap.provider_for_model, cap.parse_model_effort = orig
+
+    return captured, restore
+
+
+def test_best_of_n_picks_winner_and_counts_calls():
+    gens = [({"caption": f"candidate {i}", "emoji": "🍜"}, 0.1, True, True) for i in range(4)]
+    captured, restore = _patch_multi(gens, ({"best_index": 2, "reason": "best"}, 0.1, True, True))
+    try:
+        out, used = cap.generate_caption(Path("/x.jpg"), "Ningbo, China", "12:00", _cfg_n(4))
+    finally:
+        restore()
+    # thread scheduling shuffles which text lands at which index — verify the
+    # winner via the picker's own numbered list (index 2 → that exact text)
+    line2 = next(ln for ln in captured["pick_prompt"].splitlines() if ln.startswith("2: "))
+    assert out == line2[3:]
+    assert used == 5  # 4 generators + 1 picker
+    assert captured["gen_calls"] == 4 and captured["pick_calls"] == 1
+    for i in range(4):  # all 4 distinct candidates reached the picker
+        assert f"candidate {i} 🍜" in captured["pick_prompt"]
+
+
+def test_best_of_n_identical_candidates_skip_picker():
+    gens = [({"caption": "same text", "emoji": "🍜"}, 0.1, True, True)] * 4
+    captured, restore = _patch_multi(gens, ({"best_index": 3}, 0.1, True, True))
+    try:
+        out, used = cap.generate_caption(Path("/x.jpg"), None, None, _cfg_n(4))
+    finally:
+        restore()
+    assert out == "same text 🍜" and used == 4
+    assert captured["pick_calls"] == 0  # deduped to one → no picker needed
+
+
+def test_best_of_n_picker_failure_falls_back_to_first():
+    gens = [({"caption": f"cand {i}"}, 0.1, True, True) for i in range(4)]
+    for bad in [({"best_index": 99, "reason": "oob"}, 0.1, True, True),
+                ({"nope": 1}, 0.1, True, True),
+                ({"best_index": 0}, 0.1, False, False)]:  # ok=False
+        _captured, restore = _patch_multi(gens, bad)
+        try:
+            out, _used = cap.generate_caption(Path("/x.jpg"), None, None, _cfg_n(4))
+        finally:
+            restore()
+        assert out == "cand 0", (bad, out)
+
+
+def test_winner_without_emoji_borrows_consensus_emoji():
+    gens = [({"caption": "Lantern alley one", "emoji": "🏮"}, 0.1, True, True),
+            ({"caption": "Lantern alley two", "emoji": "🏮"}, 0.1, True, True),
+            ({"caption": "Lantern alley three", "emoji": "🍜"}, 0.1, True, True),
+            ({"caption": "Accurate translation text", "emoji": ""}, 0.1, True, True)]
+
+    def pick_no_emoji(prompt):  # picker chooses the emoji-less candidate, race-proof
+        for ln in prompt.splitlines():
+            head, _, text = ln.partition(": ")
+            if head.isdigit() and text and not cap._is_emoji_char(text[-1]):
+                return {"best_index": int(head), "reason": "most accurate"}, 0.1, True, True
+        raise AssertionError("no emoji-less candidate in picker prompt")
+
+    _captured, restore = _patch_multi(gens, pick_no_emoji)
+    try:
+        out, _used = cap.generate_caption(Path("/x.jpg"), None, None, _cfg_n(4))
+    finally:
+        restore()
+    assert out == "Accurate translation text 🏮"  # consensus emoji borrowed, majority wins
+
+
+def test_best_of_n_all_failed_returns_none():
+    gens = [({"caption": ""}, 0.1, False, True)] * 4  # every generator errored
+    captured, restore = _patch_multi(gens, ({"best_index": 0}, 0.1, True, True))
+    try:
+        out, used = cap.generate_caption(Path("/x.jpg"), None, None, _cfg_n(4))
+    finally:
+        restore()
+    assert out is None and used == 4 and captured["pick_calls"] == 0
 
 
 def _main() -> int:

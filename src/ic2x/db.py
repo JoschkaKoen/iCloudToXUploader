@@ -62,6 +62,19 @@ CREATE TABLE IF NOT EXISTS run_state (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
+
+-- Capture-date catalog of the WHOLE iCloud library (built once by a metadata
+-- sweep, refreshed incrementally). Drives the chronological walk-back: iterate
+-- created DESC, skipping seen assets; rank is the asset's position in the
+-- ascending .all album at catalog time (positional re-fetch hint — live assets
+-- can't be resolved by id, that hangs).
+CREATE TABLE IF NOT EXISTS asset_catalog (
+    asset_id     TEXT PRIMARY KEY,
+    created      TEXT,               -- ISO capture datetime (UTC)
+    rank         INTEGER,            -- position in ascending .all at catalog time
+    cataloged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_catalog_created ON asset_catalog(created DESC);
 """
 
 
@@ -383,6 +396,45 @@ class DB:
         self._conn.commit()
 
     # ── Run state (generic key/value) ──────────────────────────────────────────
+
+    # ── Capture-date catalog (chronological walk-back) ─────────────────────────
+
+    def catalog_count(self) -> int:
+        return self._conn.execute("SELECT COUNT(*) FROM asset_catalog").fetchone()[0]
+
+    def catalog_upsert_many(self, rows: list[tuple[str, str | None, int]]) -> None:
+        """rows = (asset_id, created_iso | None, rank). Upsert keeps refreshes cheap."""
+        self._conn.executemany(
+            "INSERT INTO asset_catalog (asset_id, created, rank) VALUES (?,?,?) "
+            "ON CONFLICT(asset_id) DO UPDATE SET created=excluded.created, rank=excluded.rank",
+            rows)
+        self._conn.commit()
+
+    def catalog_known(self, asset_ids: list[str]) -> set[str]:
+        """Subset of asset_ids already cataloged (for the tail refresh)."""
+        out: set[str] = set()
+        for i in range(0, len(asset_ids), 500):
+            chunk = asset_ids[i:i + 500]
+            q = ",".join("?" * len(chunk))
+            out.update(r[0] for r in self._conn.execute(
+                f"SELECT asset_id FROM asset_catalog WHERE asset_id IN ({q})", chunk))
+        return out
+
+    def catalog_delete(self, asset_id: str) -> None:
+        """Drop a catalog row whose asset was deleted from the iCloud library."""
+        self._conn.execute("DELETE FROM asset_catalog WHERE asset_id = ?", (asset_id,))
+        self._conn.commit()
+
+    def catalog_unseen_desc(self) -> list:
+        """(asset_id, created, rank) newest-capture-first, excluding assets the bot
+        has already decided on — the chronological walk-back order. ~4 MB for a
+        67k-photo library; loaded once per cycle. The scanner re-checks seen
+        downstream, so mid-cycle staleness is harmless."""
+        return self._conn.execute(
+            "SELECT c.asset_id, c.created, c.rank FROM asset_catalog c "
+            "LEFT JOIN asset_index i ON i.asset_id = c.asset_id AND i.seen = 1 "
+            "WHERE i.asset_id IS NULL AND c.created IS NOT NULL "
+            "ORDER BY c.created DESC, c.asset_id").fetchall()
 
     def get_state(self, key: str) -> str | None:
         row = self._conn.execute(
