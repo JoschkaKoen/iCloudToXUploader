@@ -816,11 +816,20 @@ def bot(once: bool = False, test: bool = False, test_cycles: int = 20,
             return
     clients = make_clients(cfg)
     ic = ICloudPhotos(cfg)
+    # An expired 2FA session must NOT kill a continuous run. `--once` is a one-shot
+    # command, so it still fails fast with one clear line; the long-running bot instead
+    # starts in a reauth-pending state and keeps polling, so a later `ic2x login` (fresh
+    # cookies on disk) revives it unattended. Before this, the errors>=6 re-exec below
+    # dropped the loop's own reauth resilience into this exit path and the bot died for
+    # good — observed 2026-07-20: 15 days down after a routine ~30-day session expiry.
+    reauth_pending = False
     try:
         ic.ensure_session()
     except ReauthRequired as exc:
         _notify_reauth(cfg, exc)
-        return
+        if once or cfg.test_mode:
+            return
+        reauth_pending = True
     db = DB(cfg.db_path)
 
     # startup reconciliation, at the start of EVERY bot run: sync the DB with what's
@@ -880,7 +889,7 @@ def bot(once: bool = False, test: bool = False, test_cycles: int = 20,
         ui.info(f"today so far: {_today['ai_calls']} AI calls · {_sym}{_today['cost_rmb']:.4f}")
 
     throttles = errors = 0
-    reauth_notified = False
+    reauth_notified = reauth_pending   # already told them at startup; don't repeat it
     cycles = posts = 0
     reason = "interrupted"
     while not _stop:
@@ -949,6 +958,16 @@ def bot(once: bool = False, test: bool = False, test_cycles: int = 20,
                 try:
                     ic.ensure_session()
                     logger.info("iCloud session refreshed after repeated errors.")
+                except ReauthRequired as e2:
+                    # Interactive 2FA is the one failure a fresh process CANNOT fix, so
+                    # escalating to the re-exec below only burns the loop's reauth
+                    # handling. Notify once and keep polling instead — `ic2x login` then
+                    # revives this same process.
+                    if not reauth_notified:
+                        _notify_reauth(cfg, e2)
+                        reauth_notified = True
+                    _sleep_interruptible(min(cfg.daemon_check_interval, 600))
+                    continue
                 except Exception as e2:  # noqa: BLE001
                     logger.warning("session refresh failed: %s", e2)
             if errors >= 6:
