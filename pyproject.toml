@@ -12,6 +12,11 @@ dependencies = [
   "pillow",
   "pillow-heif",
   "numpy",         # used directly by polish.py (adaptive local enhance)
+  # face_gate.py (owner-selfie gate) runs YuNet+SFace through cv2. Undeclared until
+  # 2026-08-04, when a clean install on the render-worker host came up without it and
+  # the gate silently degraded to the VLM fallback ("face-gate: OpenCV unavailable").
+  # headless: no GUI/X11 libs, which is what a server wants.
+  "opencv-python-headless",
   "imagehash",
   "tweepy>=4.14",
   "openai",

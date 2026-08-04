@@ -66,7 +66,14 @@ def _run(method: str, build_request, url_attr: str, image_path: Path) -> bytes:
 
     # The *_advance call uploads the file to a temp OSS bucket first; multi-MB photos
     # exceed the 10s default, so widen the timeouts (ms) and let it retry once.
-    runtime = RuntimeOptions(connect_timeout=15000, read_timeout=90000,
+    #
+    # connect_timeout must be generous, not just read_timeout: the SDK reports its
+    # read timeouts using the CONNECT value ("Read timed out. (read timeout=15.0)"
+    # while read_timeout was 90000), so connect_timeout is the limit that actually
+    # binds. At 15s it was too tight for a cold call — measured on the render-worker
+    # host 2026-08-04, a cold enhance took 18.5s and a warm one 5.6s, so the first
+    # enhance after startup timed out every time and the photo posted unenhanced.
+    runtime = RuntimeOptions(connect_timeout=60000, read_timeout=90000,
                              autoretry=True, max_attempts=2)
     client = _client()
     try:
