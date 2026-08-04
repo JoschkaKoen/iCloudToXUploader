@@ -5,12 +5,14 @@ Runs once at the start of the normal bot (`bot()`), live runs only: take the DB'
 most-recent posted tweet ids and check each one's existence on X with Bearer-token
 `get_tweets(ids=…)` — the only X read that works here (OAuth 1.0a 401s on tweet reads,
 and the user-timeline endpoint misbehaves). Any tracked post X reports as
-"resource-not-found" was deleted by the owner → re-queue the iCloud photo (delete the
-stale row + clear the asset from the seen-set) so the bot re-posts it. Captions of
-still-live posts are filled if missing.
+"resource-not-found" was deleted by the owner → RETIRE that photo: mark the row rejected
+and keep the asset in the seen-set, so it is never posted again. Deleting a post is the
+owner's verdict on the photo; until 2026-08-04 this re-queued it instead, so deleting a
+post you disliked simply put it back in the pool. Captions of still-live posts are
+filled if missing.
 
 FAIL-OPEN: any X/network/tier error logs a note and returns — startup is never blocked.
-A sanity cap skips re-queuing when implausibly many look deleted (a bad/partial read).
+A sanity cap skips retiring when implausibly many look deleted (a bad/partial read).
 """
 
 from __future__ import annotations
@@ -54,7 +56,7 @@ def reconcile_with_x(db: DB, cfg: Config, lookup_tweets) -> None:
 
     # `deleted` = ids X reports as resource-not-found. Anything not in `deleted` still
     # EXISTS — whether viewable (`live`) or restricted (e.g. visibility lowered) — so
-    # it counts as still-on-X and is NOT re-queued.
+    # it counts as still-on-X and is NOT retired.
     deletions = [c for c in candidates if str(c["tweet_id"]) in deleted]
     ui.info(f"reconcile — {len(candidates) - len(deletions)} still on X · "
             f"{len(deletions)} deleted")
@@ -63,7 +65,7 @@ def reconcile_with_x(db: DB, cfg: Config, lookup_tweets) -> None:
     if len(deletions) > cfg.reconcile_max_requeue_per_run:
         ui.warn(f"reconcile — {len(deletions)} look deleted (cap "
                 f"{cfg.reconcile_max_requeue_per_run}); likely an X read glitch — "
-                "skipping re-queue this run")
+                "skipping retire this run")
         return
 
     # Fill missing captions for still-live posts (never overwrite an existing one).
@@ -76,25 +78,28 @@ def reconcile_with_x(db: DB, cfg: Config, lookup_tweets) -> None:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("reconcile: caption fill failed for %s: %s", c["id"], exc)
 
-    # Re-queue each deleted post (one bad row never aborts the rest).
-    requeued = 0
+    # Retire each deleted post (one bad row never aborts the rest). The owner deleting
+    # a post is a verdict on that photo, so it is recorded as rejected and stays in the
+    # seen-set — never posted again. It used to be re-queued, which meant deleting a
+    # post you disliked just put it back in the pool to return later.
+    retired = 0
     for c in deletions:
         try:
             log_decision(cfg.logs_dir, outcome="deleted_on_x", asset_id=c["asset_id"],
                          detail={"tweet_id": c["tweet_id"], "caption": c["caption"]})
-            db.requeue_deleted(c["id"], c["asset_id"])
-            requeued += 1
+            db.reject_deleted(c["id"], c["asset_id"])
+            retired += 1
             snippet = (c["caption"] or "").replace("\n", " ").strip()[:60] or "(no caption)"
-            ui.info(f'   ↳ deleted on X → re-queued: "{snippet}"')
+            ui.info(f'   ↳ deleted on X → retired, will not post again: "{snippet}"')
         except Exception as exc:  # noqa: BLE001
-            logger.warning("reconcile: re-queue failed for image %s: %s", c["id"], exc)
+            logger.warning("reconcile: retire failed for image %s: %s", c["id"], exc)
 
     # Keep the 5h post timer in sync with the most-recent STILL-LIVE post EVERY run — a
     # post deleted on X (whether this run or a previous one) must never keep holding the
     # interval. Normally a no-op (timer already == newest live post); corrects staleness.
     db.refresh_last_posted_at()
 
-    bits = [f"{requeued} re-queued" if requeued else "all in sync"]
+    bits = [f"{retired} retired" if retired else "all in sync"]
     if filled:
         bits.append(f"{filled} caption{'s' if filled != 1 else ''} filled")
     ui.ok("reconcile done — " + " · ".join(bits))

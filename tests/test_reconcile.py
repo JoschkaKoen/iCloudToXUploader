@@ -72,15 +72,23 @@ def _log_has(cfg, needle):
 
 
 # ── tests ──────────────────────────────────────────────────────────────────────
-def test_deleted_is_requeued_and_live_kept():
+def test_deleted_is_retired_and_live_kept():
+    """The owner deleting a post is a verdict on that photo — it must never come back.
+    Re-queuing it (the behaviour until 2026-08-04) meant deleting a post you disliked
+    put the photo straight back in the pool."""
     db = _db(); cfg = _cfg()
     _seed(db, asset="A_DEL", sha="shaDEL", tid="100", ph=_PH_A, caption="deleted one")
     _seed(db, asset="A_LIVE", sha="shaLIVE", tid="200", ph=_PH_B, caption="live one")
     reconcile_with_x(db, cfg, _lookup(live={"200": "live one"}, deleted={"100"}))
-    assert db.get_image_by_sha("shaDEL") is None              # row gone
-    assert db.seen_asset_id("A_DEL") is False                 # asset un-seen
-    assert db.seen_sha256("shaDEL") is False                  # re-postable …
-    assert db.seen_phash_similar(_PH_A, 12) is False          # … nothing blocks it
+
+    row = db.get_image_by_sha("shaDEL")
+    assert row is not None, "the row was dropped — the photo can be picked up again"
+    assert row["status"] == Status.REJECTED.value
+    assert row["reject_stage"] == "deleted_on_x"
+    assert db.seen_asset_id("A_DEL") is True, "asset went back in the pool"
+    assert db.seen_sha256("shaDEL") is True, "the exact file is no longer blocked"
+    # Near-duplicates are NOT blocked: rejecting one frame shouldn't retire the scene.
+    assert db.seen_phash_similar(_PH_A, 12) is False
     assert db.get_image_by_sha("shaLIVE") is not None         # live kept
     assert db.seen_asset_id("A_LIVE") is True
     assert _log_has(cfg, "deleted_on_x")
@@ -118,7 +126,8 @@ def test_retries_in_close_succession_then_succeeds():
 
     reconcile_with_x(db, cfg, flaky)
     assert state["n"] == 3                            # one try + two retries
-    assert db.get_image_by_sha("shaDEL") is None      # the 3rd-attempt result was used
+    assert db.get_image_by_sha("shaDEL")["status"] == Status.REJECTED.value, \
+        "the 3rd-attempt result was not used"
     db.close()
 
 
@@ -185,7 +194,19 @@ def test_no_posted_rows_is_noop():
     db.close()
 
 
-def test_requeue_deleted_method():
+def test_reject_deleted_method():
+    """What reconcile uses: the row survives as rejected and the asset stays seen."""
+    db = _db()
+    iid = _seed(db, asset="A", sha="s", tid="100", ph=_PH_A, caption="x")
+    db.reject_deleted(iid, "A")
+    row = db.get_image_by_sha("s")
+    assert row["status"] == Status.REJECTED.value and row["tweet_id"] is None
+    assert db.seen_asset_id("A") is True
+    db.close()
+
+
+def test_requeue_deleted_method_is_the_manual_escape_hatch():
+    """Still available for deliberately giving a retired photo another chance."""
     db = _db()
     iid = _seed(db, asset="A", sha="s", tid="100", ph=_PH_A, caption="x")
     db.requeue_deleted(iid, "A")

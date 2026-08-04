@@ -400,14 +400,46 @@ class DB:
         ).fetchall()
 
     def requeue_deleted(self, image_id: int, asset_id: str | None) -> None:
-        """A post was deleted on X → drop its images row and clear the iCloud asset
-        from the seen-set, so the bot reconsiders and re-posts it. Atomic."""
+        """Put a photo back in the pool: drop its images row and clear the iCloud asset
+        from the seen-set, so the bot reconsiders and posts it again. Atomic.
+
+        NOT what reconcile does with a post deleted on X — that retires it via
+        reject_deleted(). This is the manual escape hatch for deliberately giving a
+        retired photo another chance.
+        """
         try:
             self._conn.execute("BEGIN")
             self._conn.execute("DELETE FROM images WHERE id = ?", (image_id,))
             if asset_id:
                 self._conn.execute(
                     "UPDATE asset_index SET seen = 0 WHERE asset_id = ?", (asset_id,))
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def reject_deleted(self, image_id: int, asset_id: str | None) -> None:
+        """A post was deleted on X → record it as REJECTED and keep the asset in the
+        seen-set, so the bot never posts that photo again. The owner deleting a post
+        is a judgement about the photo, not a request to try it once more; re-queuing
+        made the bot argue with them (2026-08-04: a post was deleted minutes after it
+        went up and the photo went straight back into the pool). Atomic.
+
+        Reversible by hand if a photo really should return:
+            UPDATE images SET status='rejected' ...  -- find the row, then
+            DELETE FROM images WHERE id=<id>; UPDATE asset_index SET seen=0 WHERE ...
+        """
+        try:
+            self._conn.execute("BEGIN")
+            self._conn.execute(
+                "UPDATE images SET status = ?, reject_stage = ?, reject_reason = ?, "
+                "tweet_id = NULL WHERE id = ?",
+                (Status.REJECTED.value, "deleted_on_x", "owner deleted the post on X",
+                 image_id))
+            if asset_id:
+                self._conn.execute(
+                    "INSERT INTO asset_index (asset_id, seen) VALUES (?, 1) "
+                    "ON CONFLICT(asset_id) DO UPDATE SET seen = 1", (asset_id,))
             self._conn.commit()
         except Exception:
             self._conn.rollback()
