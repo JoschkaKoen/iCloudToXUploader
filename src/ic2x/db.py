@@ -433,8 +433,19 @@ class DB:
             rows)
         self._conn.commit()
 
+    def catalog_shift_ranks(self, by: int) -> None:
+        """Push every cataloged rank down by `by`. The .all album is NEWEST-FIRST, so
+        assets added since the last sweep occupy positions 0..by-1 and displace every
+        existing asset by exactly that much. Renumbering here keeps stored ranks true,
+        which is what lets _fetch_by_rank probe with a near-zero drift instead of
+        hunting — and stops it mistaking a shifted asset for a deleted one."""
+        if by <= 0:
+            return
+        self._conn.execute("UPDATE asset_catalog SET rank = rank + ?", (by,))
+        self._conn.commit()
+
     def catalog_known(self, asset_ids: list[str]) -> set[str]:
-        """Subset of asset_ids already cataloged (for the tail refresh)."""
+        """Subset of asset_ids already cataloged (for the head refresh)."""
         out: set[str] = set()
         for i in range(0, len(asset_ids), 500):
             chunk = asset_ids[i:i + 500]

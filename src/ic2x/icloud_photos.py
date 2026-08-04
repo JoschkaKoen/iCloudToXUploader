@@ -257,8 +257,16 @@ class ICloudPhotos:
     def ensure_catalog(self, db: Any, page: int = 200) -> None:
         """Build the capture-date catalog once (metadata sweep of the whole
         library, ~10 min for 67k assets), then keep it fresh each call by walking
-        pages backward from the album tail until a whole page is already known
-        (new photos and imports both land at the tail — rank = assetDate ≈ now)."""
+        pages forward from the album HEAD until a whole page is already known.
+
+        The .all album is NEWEST-FIRST (offset 0 = most recent — verified live
+        2026-08-04: offset 0 was that morning's photo, the tail was from 2004), the
+        same ordering _fetch_by_rank relies on. This refresh used to scan from the
+        TAIL on the belief that new assets land there; the tail is the 2004 photos,
+        so every refresh hit an all-known page and broke immediately. The catalog
+        silently stopped growing after the initial sweep — by the time it was caught
+        the library had 69974 assets against 67741 cataloged, and the walk-back
+        could not see ANY photo from the preceding three weeks."""
         from pyicloud.services.photos_cloudkit.constants import DirectionEnum
 
         album = self._all_album()
@@ -292,21 +300,29 @@ class ICloudPhotos:
             logger.info("icloud: catalog complete — %d assets indexed", db.catalog_count())
             return
 
-        # incremental tail refresh
-        offset = max(total - page, 0)
-        added = 0
-        while True:
+        # ── incremental HEAD refresh ──
+        # Collect every unknown asset from offset 0 forward, stopping at the first
+        # page that is already fully cataloged. Nothing is written until the whole
+        # run is known, because the rank shift below needs the final count: new
+        # assets take positions 0..n-1 and push every existing asset down by n.
+        # Writing per page would shift repeatedly and corrupt the ranks.
+        offset = 0
+        fresh: list[tuple[str, str | None, int]] = []
+        while offset < total:
             rows = _rows(offset)
+            if not rows:
+                break
             known = db.catalog_known([r[0] for r in rows])
             new = [r for r in rows if r[0] not in known]
-            if new:
-                db.catalog_upsert_many(new)
-                added += len(new)
-            if not new or offset == 0:
+            fresh.extend(new)
+            if len(new) < len(rows):   # reached already-cataloged territory
                 break
-            offset = max(offset - page, 0)
-        if added:
-            logger.info("icloud: catalog refreshed — %d new assets indexed", added)
+            offset += page
+        if fresh:
+            db.catalog_shift_ranks(len(fresh))   # BEFORE inserting the new head rows
+            db.catalog_upsert_many(fresh)
+            logger.info("icloud: catalog refreshed — %d new assets indexed (ranks "
+                        "shifted by %d)", len(fresh), len(fresh))
 
     def _fetch_by_rank(self, asset_id: str, rank: int, db: Any = None) -> Any | None:
         """Live PhotoAsset for a cataloged id: fetch a window around its recorded

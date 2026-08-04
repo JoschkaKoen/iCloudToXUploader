@@ -6,6 +6,12 @@ recent window comes first; the deep walk skips bulk-imported archives (added ≫
 captured) until the organic timeline is exhausted; imports then surface in the
 final phase; ids never repeat across phases; broken assets are skipped.
 
+Also covers ensure_catalog's incremental refresh, which must scan from the album
+HEAD: the .all album is newest-first, so new photos land at offset 0. Scanning
+from the tail (the 2004 imports) hit an all-known page and broke instantly, and
+the catalog silently stopped growing — 69974 assets in the library against 67741
+cataloged, with three weeks of photos invisible to the walk-back (2026-08-04).
+
 Run: .venv/bin/python tests/test_icloud_walkback.py
 """
 
@@ -132,6 +138,73 @@ def test_chrono_iterator_uses_catalog_order_and_recent_first():
     # recent first; then catalog strictly by capture DESC ("gone" skipped);
     # the 2004 import surfaces only at its true chronological position — last.
     assert order == ["fresh", "older", "oldest", "import2004"]
+
+
+class _FakeAlbum:
+    """Stand-in for the .all album: NEWEST-FIRST, so offset 0 is the most recent
+    asset and the tail holds the oldest imports (verified against live iCloud)."""
+
+    def __init__(self, assets):
+        self._assets = list(assets)
+        self.reads: list[tuple[int, int]] = []
+
+    def __len__(self):
+        return len(self._assets)
+
+    def _get_photos_at(self, offset, direction, page):
+        self.reads.append((offset, page))
+        return self._assets[offset:offset + page]
+
+
+def _catalog_ic(album):
+    ic = ICloudPhotos.__new__(ICloudPhotos)   # no session needed for cataloging
+    ic._all_album = lambda: album
+    return ic
+
+
+def _fresh_db():
+    import tempfile
+    from ic2x.db import DB
+    return DB(Path(tempfile.mkdtemp(prefix="ic2x_catalog_")) / "state.db")
+
+
+def test_catalog_refresh_indexes_new_photos_at_the_head():
+    """New photos arrive at offset 0 and must be picked up, with every existing
+    rank pushed down by exactly the number added so stored ranks stay true."""
+    db = _fresh_db()
+    old = [_asset(f"old{i}", created_days_ago=10 + i) for i in range(5)]
+    db.catalog_upsert_many([(a.id, a.created.isoformat(), i) for i, a in enumerate(old)])
+    db.set_state("catalog_complete", "1")
+
+    new = [_asset(f"new{i}", created_days_ago=i) for i in range(3)]   # newer than all
+    album = _FakeAlbum(new + old)                                     # newest-first
+    _catalog_ic(album).ensure_catalog(db, page=4)
+
+    assert db.catalog_count() == 8, f"new head photos were not indexed ({db.catalog_count()})"
+    ranks = {r["asset_id"]: r["rank"] for r in
+             db._conn.execute("SELECT asset_id, rank FROM asset_catalog")}
+    assert [ranks[f"new{i}"] for i in range(3)] == [0, 1, 2], ranks
+    assert [ranks[f"old{i}"] for i in range(5)] == [3, 4, 5, 6, 7], \
+        f"existing ranks not shifted by the 3 new assets: {ranks}"
+    db.close()
+
+
+def test_catalog_refresh_stops_at_known_territory():
+    """It must stop at the first fully-known page, not re-walk the whole library —
+    the refresh runs every cycle against a ~70k-asset album."""
+    db = _fresh_db()
+    old = [_asset(f"old{i}", created_days_ago=10 + i) for i in range(50)]
+    db.catalog_upsert_many([(a.id, a.created.isoformat(), i) for i, a in enumerate(old)])
+    db.set_state("catalog_complete", "1")
+
+    album = _FakeAlbum(old)          # nothing new at all
+    ic = _catalog_ic(album)
+    ic.ensure_catalog(db, page=10)
+
+    assert db.catalog_count() == 50
+    assert len(album.reads) == 1, f"walked {len(album.reads)} pages for a no-op refresh"
+    assert album.reads[0][0] == 0, f"refresh started at offset {album.reads[0][0]}, not the head"
+    db.close()
 
 
 def _main() -> int:
