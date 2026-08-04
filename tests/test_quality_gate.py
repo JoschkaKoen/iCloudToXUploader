@@ -42,8 +42,10 @@ def _img(path: Path, scene: int) -> None:
     d = ImageDraw.Draw(im)
     if scene == 0:
         d.rectangle([0, 0, 128, 256], fill="white")
-    else:
+    elif scene == 1:
         d.ellipse([48, 48, 208, 208], fill="white")
+    else:
+        d.rectangle([0, 0, 256, 96], fill="white")
     im.save(path, "JPEG", quality=92)
 
 
@@ -66,11 +68,13 @@ class FakeIC:
         return set()
 
 
-def _cfg(tag: str, min_q: int = 7):
+def _cfg(tag: str, min_q: int = 7, daily_ai_calls: int = 200):
     root = _TMP / tag
     c = SimpleNamespace(
         burst_max_size=5, burst_hamming_threshold=8, burst_max_attempts=3,
-        daily_ai_calls=200, hamming_threshold=12, rotation_enabled=False,
+        daily_ai_calls=daily_ai_calls, daily_support_calls=1500,
+        scene_group_enabled=False, scene_dedup_model="stub",
+        hamming_threshold=12, rotation_enabled=False,
         x_dry_run=True, post_max_attempts=3, max_posts_per_day=6, thumb_version="thumb",
         prefetch_concurrency=4, scene_dedup_enabled=False, quality_min_score=min_q,
         keep_reviewed=False, reviewed_dir=root / "reviewed",
@@ -140,6 +144,44 @@ def test_missing_quality_fails_closed():
     assert outcome == "exhausted", outcome
     assert db.seen_asset_id("nq")
     assert db.count_posts_rolling_24h() == 0
+    db.close()
+
+
+def test_grouping_calls_do_not_starve_the_judging_budget():
+    """Scene grouping fires at every pHash boundary and bills to its OWN meter, so
+    the full DAILY_AI_CALLS budget stays available for judging. With both on one
+    meter the walk-back stopped after 19 of 195 calls reached the judge (2026-07-17)
+    — here a 2-call decision budget must still buy 2 judgments, not 1."""
+    cfg = _cfg("budget", daily_ai_calls=2)
+    cfg.scene_group_enabled = True
+    db = DB(_TMP / "budget.db")
+    assets = []
+    for i in range(3):                       # three DISTINCT scenes → a boundary each
+        p = _FIX / f"bud{i}.jpg"; _img(p, i); assets.append((f"bud{i}", p))
+    ic = FakeIC(assets)
+
+    judged = {"n": 0}
+
+    def rejecting(thumbs, cfg_, model_string=None):
+        judged["n"] += 1
+        return ({"best_index": 0, "safe": True, "interesting": True, "quality": 3,
+                 "flags": [], "caption": "c", "reason": "below bar"}, 0.1, True)
+
+    from ic2x import judge_scene_dedup
+    orig = judge_scene_dedup.call_scene_dedup
+    # "not a duplicate, network was used" → a real grouping call, charged to support
+    judge_scene_dedup.call_scene_dedup = lambda *a, **k: (None, True)
+    try:
+        outcome = _run_cycle(cfg, db, ic, rejecting)
+    finally:
+        judge_scene_dedup.call_scene_dedup = orig
+
+    stats = db.get_today_stats()
+    assert outcome == "ai_cap", outcome
+    assert judged["n"] == 2, \
+        f"grouping ate the judging budget: only {judged['n']} of 2 bursts judged"
+    assert stats["ai_calls"] == 2, stats
+    assert stats["support_calls"] > 0, "grouping calls were not tracked at all"
     db.close()
 
 

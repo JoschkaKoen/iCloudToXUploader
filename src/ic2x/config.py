@@ -72,7 +72,8 @@ class Config:
     caption_picker_model: str       # CAPTION_PICKER_MODEL or judge_model
 
     # Limits / dedup
-    daily_ai_calls: int             # also bounds walk-back cost per day
+    daily_ai_calls: int             # DECISION calls/day (judge, owner, rotation, caption)
+    daily_support_calls: int        # cheap scene-grouping calls/day — runaway guard only
     hamming_threshold: int          # cross-library pHash dedup distance
     quality_min_score: int          # posting bar: judge's 0-10 quality score floor
 
@@ -250,6 +251,7 @@ def load_config() -> Config:
 
         # Limits / dedup
         daily_ai_calls=_int_env("DAILY_AI_CALLS", 200),
+        daily_support_calls=_int_env("DAILY_SUPPORT_CALLS", 1500),
         hamming_threshold=_int_env("HAMMING_THRESHOLD", 12),
         quality_min_score=_int_env("QUALITY_MIN_SCORE", 7),
 

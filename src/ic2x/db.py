@@ -52,10 +52,11 @@ CREATE INDEX IF NOT EXISTS idx_images_asset ON images(asset_id);
 
 CREATE TABLE IF NOT EXISTS run_stats (
     date            TEXT PRIMARY KEY,
-    ai_calls        INTEGER DEFAULT 0,
+    ai_calls        INTEGER DEFAULT 0,  -- DECISION calls (judge/owner/rotation/caption)
     images_posted   INTEGER DEFAULT 0,
     cost_rmb        REAL DEFAULT 0,     -- estimated daily AI spend (tokens + any flat API)
-    color_calls     INTEGER DEFAULT 0   -- VIAPI color-enhance calls (for the monthly free quota)
+    color_calls     INTEGER DEFAULT 0,  -- VIAPI color-enhance calls (for the monthly free quota)
+    support_calls   INTEGER DEFAULT 0   -- cheap scene-grouping/dedup calls made while assembling
 );
 
 CREATE TABLE IF NOT EXISTS run_state (
@@ -95,7 +96,8 @@ class DB:
 
     def _migrate(self) -> None:
         """Add columns to pre-existing tables (CREATE TABLE IF NOT EXISTS won't)."""
-        for col, ddl in (("cost_rmb", "REAL DEFAULT 0"), ("color_calls", "INTEGER DEFAULT 0")):
+        for col, ddl in (("cost_rmb", "REAL DEFAULT 0"), ("color_calls", "INTEGER DEFAULT 0"),
+                         ("support_calls", "INTEGER DEFAULT 0")):
             try:
                 self._conn.execute(f"ALTER TABLE run_stats ADD COLUMN {col} {ddl}")
             except sqlite3.OperationalError:
@@ -265,10 +267,30 @@ class DB:
         ).fetchone()
         return (row["ai_calls"] if row else 0) >= limit
 
+    def check_daily_support_limit(self, limit: int) -> bool:
+        """Runaway guard for the cheap assembly calls. Separate from the decision
+        budget on purpose: scene-grouping fires at every pHash boundary, so billing it
+        to the same meter as judging starves the walk-back — measured 2026-07-17, 172
+        of 195 calls were grouping and only 19 bursts ever got judged."""
+        self._ensure_today_stats()
+        row = self._conn.execute(
+            "SELECT COALESCE(support_calls, 0) AS n FROM run_stats WHERE date = ?",
+            (self._today(),)
+        ).fetchone()
+        return (row["n"] if row else 0) >= limit
+
     def increment_ai_calls(self, n: int = 1) -> None:
         self._ensure_today_stats()
         self._conn.execute(
             "UPDATE run_stats SET ai_calls = ai_calls + ? WHERE date = ?", (n, self._today())
+        )
+        self._conn.commit()
+
+    def increment_support_calls(self, n: int = 1) -> None:
+        self._ensure_today_stats()
+        self._conn.execute(
+            "UPDATE run_stats SET support_calls = COALESCE(support_calls, 0) + ? "
+            "WHERE date = ?", (n, self._today())
         )
         self._conn.commit()
 
@@ -296,11 +318,12 @@ class DB:
     def get_today_stats(self) -> dict[str, float]:
         self._ensure_today_stats()
         row = self._conn.execute(
-            "SELECT ai_calls, images_posted, COALESCE(cost_rmb, 0) AS cost_rmb "
+            "SELECT ai_calls, images_posted, COALESCE(cost_rmb, 0) AS cost_rmb, "
+            "COALESCE(support_calls, 0) AS support_calls "
             "FROM run_stats WHERE date = ?", (self._today(),)
         ).fetchone()
         return {"ai_calls": row["ai_calls"], "images_posted": row["images_posted"],
-                "cost_rmb": row["cost_rmb"]}
+                "cost_rmb": row["cost_rmb"], "support_calls": row["support_calls"]}
 
     def overview(self) -> dict[str, int]:
         """Lifetime counts for `ic2x status` — posted / approved-pending / rejected

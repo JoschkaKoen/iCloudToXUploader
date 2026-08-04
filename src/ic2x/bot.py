@@ -250,7 +250,7 @@ def _ai_same_scene(candidate_thumb: Path, head_thumb: Path, cfg: Config, db: "DB
         dup, used = judge_scene_dedup.call_scene_dedup(
             candidate_thumb, [head_thumb], cfg, model_string=cfg.scene_dedup_model)
         if used:
-            db.increment_ai_calls()
+            db.increment_support_calls()
         return dup is not None
     except Exception as exc:  # noqa: BLE001 — grouping aid, never crash assembly
         logger.warning("scene_group: check failed (%s) — treating as new scene", exc)
@@ -507,8 +507,24 @@ def run_one_cycle(db: DB, cfg: Config, ic: ICloudPhotos, clients) -> str:
                      db, cfg, ic, screenshot_ids,
                      concurrency=cfg.prefetch_concurrency)
     thumbs: list[Path] = []
+    def _capped() -> bool:
+        """The walk-back stops on either budget. DAILY_AI_CALLS bounds DECISION calls
+        (judge, owner, rotation, caption) — the ones that actually produce a post.
+        Cheap scene-grouping calls fire at every pHash boundary and are bounded
+        separately by the much larger DAILY_SUPPORT_CALLS guard: billing them to the
+        same meter starved the search (2026-07-17: 172 of 195 calls were grouping, so
+        only 19 bursts were ever judged and the walk-back stopped for the day)."""
+        if db.check_daily_ai_limit(cfg.daily_ai_calls):
+            return True
+        if db.check_daily_support_limit(getattr(cfg, "daily_support_calls", 1500)):
+            logger.warning("assembly-call guard hit (%d/day) — grouping walked a long "
+                           "way without finding a postable burst",
+                           getattr(cfg, "daily_support_calls", 1500))
+            return True
+        return False
+
     try:
-        while not db.check_daily_ai_limit(cfg.daily_ai_calls):
+        while not _capped():
             burst = assemble_burst(stream, cfg, ic, screenshot_ids, db)
             if burst is None:
                 db.set_state("backward_exhausted", "1")
