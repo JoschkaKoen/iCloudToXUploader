@@ -122,7 +122,7 @@ def _keep_images(cfg, models, bursts, results) -> None:
         for model in models:
             v = results[model]["verdicts"][bi]
             lines.append(f"- **{model}**: best={v.get('best_index')} safe={v.get('safe')} "
-                         f"interesting={v.get('interesting')} caption={v.get('caption','')!r}")
+                         f"q={v.get('quality')} interesting={v.get('interesting')} caption={v.get('caption','')!r}")
         lines.append("")
     (out / "verdicts.md").write_text("\n".join(lines), encoding="utf-8")
     ui.ok(f"saved {n_saved} thumbnail(s) + verdicts.md to {out}")
@@ -135,7 +135,7 @@ def _print_report(models, bursts, results) -> None:
         for model in models:
             v = results[model]["verdicts"][bi]
             print(f"  {model:28} best={v.get('best_index')}  safe={v.get('safe')}  "
-                  f"interesting={v.get('interesting')}  caption={v.get('caption','')!r}")
+                  f"q={v.get('quality')}  interesting={v.get('interesting')}  caption={v.get('caption','')!r}")
     print("\n--- cost ---")
     for model in models:
         usage = results[model]["usage"]
@@ -159,7 +159,7 @@ def _write_artifact(cfg, models, bursts, results) -> None:
             for model in models:
                 v = results[model]["verdicts"][bi]
                 lines.append(f"- **{model}**: best={v.get('best_index')} safe={v.get('safe')} "
-                             f"interesting={v.get('interesting')} caption={v.get('caption','')!r}")
+                             f"q={v.get('quality')} interesting={v.get('interesting')} caption={v.get('caption','')!r}")
             lines.append("")
         lines.append("## cost")
         for model in models:

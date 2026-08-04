@@ -23,13 +23,18 @@ from ic2x.utils.cost_report import compute_cost, format_total_cost_line
 logger = logging.getLogger("ic2x.classify")
 
 
-def _label(v: dict) -> tuple[str, str]:
-    """(label, note) for a verdict."""
+def _label(v: dict, min_q: int = 7) -> tuple[str, str]:
+    """(label, note) for a verdict — same gate as the bot (safe + interesting +
+    quality >= min_q), with the 0-10 score in the note so the bar can be tuned
+    from a classify run."""
     if not v.get("safe"):
         return "REJECT-unsafe", ",".join(v.get("flags") or []) or "unsafe"
+    q = int(v.get("quality") or 0)
     if not v.get("interesting"):
-        return "REJECT-boring", v.get("reason") or "not interesting"
-    return "POSTABLE", v.get("caption") or ""
+        return "REJECT-boring", f"q{q} " + (v.get("reason") or "not interesting")
+    if q < min_q:
+        return "REJECT-lowq", f"q{q} below bar {min_q} " + (v.get("reason") or "")
+    return "POSTABLE", f"q{q} " + (v.get("caption") or "")
 
 
 def _safe(text: str, n: int = 45) -> str:
@@ -109,7 +114,7 @@ def classify(count: int = 30, rotate: bool = False) -> None:
     for meta, thumb, v, usage in results:
         agg["input"] += usage.get("input", 0)
         agg["output"] += usage.get("output", 0)
-        label, note = _label(v)
+        label, note = _label(v, getattr(cfg, "quality_min_score", 7))
         shutil.copy(str(thumb), str(out / f"{label}__{_safe(note)}__{meta.id[:8]}.jpg"))
         rows.append((label, note, meta.filename))
         _unlink(thumb)

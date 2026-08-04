@@ -38,32 +38,36 @@ Flag any that apply (include the string in the "flags" array):
 Set "safe": false if any flag applies. Be strict — when in doubt, flag."""
 
 QUALITY_BLOCK = """── QUALITY (only if safe=true) ───────────────────────────────────────────────
-Would this be a reasonable post on a CASUAL personal feed showing daily life? A
-photo is worth posting if it has EITHER visual appeal (a nice scene, food, light)
-OR informational value (it shows a viewer something about the place and how people
-live there). The bar is "nice or telling enough to share," NOT "portfolio-worthy"
-and NOT "unique." An ordinary photo with a clear subject IS interesting.
+This account posts a SMALL SELECTION from a library of tens of thousands of
+photos — be picky. The bar is "a stranger scrolling a feed would stop for this,"
+NOT "acceptable snapshot." Judge the shot in front of you, not the scene's
+potential: a good subject shot poorly is still a weak photo.
 
-POST (interesting=true) — everyday is fine:
-- food and meals: dishes, restaurants, street food, drinks (ordinary meals count)
-- scenery: rivers, lakes, water reflections, sunsets, golden hour, sky, nature, parks
-- places & scenes with something to look at: shops, MALLS, markets, plazas, modern
-  interiors with scale or atmosphere, night/city views, architecture, transit, a
-  sign that is part of a scene, a moment with character or humor. Modern, urban, and
-  commercial scenes count as much as pretty ones — they show how people live.
+Score "quality" 0-10 (subject + framing + light + informational value):
+- 9-10 striking: strong close subject, great light or composition — stops the scroll
+- 7-8  genuinely good: one clear subject, close enough to see well, deliberately
+       framed, decent light; appealing or clearly informative at first glance
+- 5-6  mediocre: a real subject but a weak shot — subject too far away or small,
+       much dead space, flat light, messy framing, or nothing new to see
+- 3-4  weak: mostly empty background (bare sky/road/wall/water/table), subject
+       hard to find, low informational value, or a dull view of an ordinary thing
+- 0-2  bad: near-empty, blurry, dark, accidental
+Typical casual phone snapshots are 4-6. Score honestly — do NOT default to 7.
 
-SKIP (interesting=false) — only when GENUINELY weak:
-- no clear subject: empty, cluttered, or "vibes" frames with nothing to look at
-- a bare logo, plain signboard, or a single storefront/sign CLOSE-UP with no
-  surrounding scene (a WIDE interior or street that merely CONTAINS signs is a scene)
-- a featureless room with nothing to look at (NOT a mall/market/venue interior that
-  shows space, people, or atmosphere)
-- blurry, dark, or accidental shots; plain wall / sky / empty table; unmade bed
-- a selfie where the photographer is the main subject
-- low-information images a stranger would instantly scroll past
+Automatic caps (apply the LOWEST that fits):
+- main subject far away or small in the frame → at most 5
+- empty or featureless areas dominate the frame → at most 4
+- viewer learns nothing about the place AND the photo isn't beautiful → at most 4
+- blurry, badly exposed, or accidental → at most 3
+- a bare logo/sign/storefront close-up with no surrounding scene → at most 3
+- a selfie where the photographer is the main subject → at most 3
 
-When unsure about an ordinary photo that has a clear subject OR shows something about
-the place, POST it. Reserve interesting=false for clearly weak or empty frames."""
+interesting=true ONLY for shots worth a stranger's attention: a clear, close-enough
+subject, deliberately framed, AND (visually appealing OR genuinely informative about
+how people live, eat, build, or gather here). Food, markets, malls, street life,
+scenery, and night views all QUALIFY as subjects — but only WELL-EXECUTED shots of
+them pass. When unsure, set interesting=false and score low: a better photo of the
+same kind of subject will come along; nothing is lost by skipping this one."""
 
 CAPTION_BLOCK = """── CAPTION (only if interesting=true) ────────────────────────────────────────
 Write for an INTERNATIONAL audience — viewers OUTSIDE China who do NOT know
@@ -91,7 +95,8 @@ Schema:
   "safe": bool,
   "flags": [],
   "description": "one factual sentence about what is shown",
-  "shows": "one phrase — what an outsider sees or learns about the place here, and why it is worth posting (or 'little of interest' if empty/generic). Decide interesting AFTER this.",
+  "shows": "one phrase — what an outsider sees or learns about the place here, and why it is worth posting (or 'little of interest' if empty/generic). Decide quality and interesting AFTER this.",
+  "quality": <int 0-10 — see QUALITY scoring>,
   "interesting": bool,
   "caption": "descriptive caption for an international audience — see CAPTION rules; ≤200 chars, no hashtags, ≥1 topic-matching emoji",
   "reason": "brief explanation of the quality decision"
@@ -109,18 +114,29 @@ JSON only."""
 
 def _fail(flag: str) -> dict:
     return {
-        "safe": False, "flags": [flag],
+        "safe": False, "flags": [flag], "quality": 0,
         "interesting": False, "description": "", "caption": "", "reason": "",
     }
+
+
+def coerce_quality(parsed: dict) -> None:
+    """Clamp parsed["quality"] to an int in 0-10, in place. Missing or invalid
+    → 0 (fail-closed: an unscored image never clears the posting bar). Shared by
+    the single-image and burst judges so both validate identically."""
+    try:
+        q = int(parsed.get("quality"))
+    except (TypeError, ValueError):
+        q = 0
+    parsed["quality"] = max(0, min(q, 10))
 
 
 def call_safety_quality(image_path: Path, cfg: Config) -> tuple[dict, float, bool]:
     """Run combined safety + quality check on image_path.
 
     Returns (result_dict, elapsed_seconds, used_network).
-    result_dict always has all 6 keys: safe, flags, interesting,
-    description, caption, reason.
-    Fails closed: any error returns safe=False, interesting=False.
+    result_dict always has all 7 keys: safe, flags, quality (int 0-10),
+    interesting, description, caption, reason.
+    Fails closed: any error returns safe=False, interesting=False, quality=0.
     """
     model, _ = parse_model_effort(cfg.judge_model)
     is_ollama = provider_for_model(model) == "ollama"
@@ -156,6 +172,7 @@ def call_safety_quality(image_path: Path, cfg: Config) -> tuple[dict, float, boo
             len(caption), image_path.name,
         )
     parsed["caption"] = caption[:200]
+    coerce_quality(parsed)
     parsed.setdefault("flags", [])
     parsed.setdefault("description", "")
     parsed.setdefault("reason", "")

@@ -74,6 +74,7 @@ class Config:
     # Limits / dedup
     daily_ai_calls: int             # also bounds walk-back cost per day
     hamming_threshold: int          # cross-library pHash dedup distance
+    quality_min_score: int          # posting bar: judge's 0-10 quality score floor
 
     # Burst assembly
     burst_hamming_threshold: int    # consecutive-shot similarity (tighter than dedup)
@@ -84,7 +85,7 @@ class Config:
     prefetch_concurrency: int       # thumbnails downloaded+hashed in parallel per batch (1 = serial)
 
     # Posting / loop
-    post_interval_hours: int
+    post_interval_hours: float      # fractional hours allowed (e.g. 23000s = 6.388...h)
     daemon_check_interval: int      # loop poll granularity (seconds)
     max_posts_per_day: int          # rolling-24h safety backstop
     post_max_attempts: int          # flush retries before REJECTED(post_failed)
@@ -187,6 +188,18 @@ def _opt_int_env(key: str, default: int | None) -> int | None:
         )
 
 
+def _float_env(key: str, default: float) -> float:
+    raw = os.getenv(key, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        raise ValueError(
+            f"Environment variable {key}={raw!r} is not a valid number"
+        )
+
+
 def load_config() -> Config:
     default_model = os.getenv("AI_DEFAULT_MODEL", "").strip() or _DEFAULT_AI_MODEL
     judge_model    = os.getenv("JUDGE_MODEL",    "").strip() or default_model
@@ -238,6 +251,7 @@ def load_config() -> Config:
         # Limits / dedup
         daily_ai_calls=_int_env("DAILY_AI_CALLS", 200),
         hamming_threshold=_int_env("HAMMING_THRESHOLD", 12),
+        quality_min_score=_int_env("QUALITY_MIN_SCORE", 7),
 
         # Burst assembly
         burst_hamming_threshold=_int_env("BURST_HAMMING_THRESHOLD", 8),
@@ -248,7 +262,7 @@ def load_config() -> Config:
         prefetch_concurrency=_int_env("PREFETCH_CONCURRENCY", 6),
 
         # Posting / loop
-        post_interval_hours=_int_env("POST_INTERVAL_HOURS", 5),
+        post_interval_hours=_float_env("POST_INTERVAL_HOURS", 5.0),
         daemon_check_interval=_int_env("DAEMON_CHECK_INTERVAL", 1800),
         max_posts_per_day=_int_env("MAX_POSTS_PER_DAY", 6),
         post_max_attempts=_int_env("POST_MAX_ATTEMPTS", 3),

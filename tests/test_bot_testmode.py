@@ -81,8 +81,8 @@ class FakeIC:
 
 
 def _postable_judge(thumbs, cfg_, model_string=None):
-    return ({"best_index": 0, "safe": True, "interesting": True, "flags": [],
-             "caption": "a nice test scene 🌅", "reason": "good"}, 0.1, True)
+    return ({"best_index": 0, "safe": True, "interesting": True, "quality": 9,
+             "flags": [], "caption": "a nice test scene 🌅", "reason": "good"}, 0.1, True)
 
 
 def test_bot_test_mode_isolates_state_and_bounds_cycles():

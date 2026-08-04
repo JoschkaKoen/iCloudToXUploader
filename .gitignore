@@ -28,3 +28,5 @@ dist/
 build/
 owner_refs/
 models/
+# Benchmark runs hold real library photos — keep them off this public repo
+data/*_bench_*/

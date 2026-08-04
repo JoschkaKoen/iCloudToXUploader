@@ -567,18 +567,32 @@ def run_one_cycle(db: DB, cfg: Config, ic: ICloudPhotos, clients) -> str:
             if shows:
                 ui.info(f"   ↳ shows: {shows}")
 
-            if not verdict.get("safe") or not verdict.get("interesting"):
+            # Posting bar: the judge scores the chosen shot 0-10; anything under
+            # cfg.quality_min_score walks back even when interesting=true. Missing/
+            # invalid score → 0 (fail-closed), matching judge_burst's validation.
+            try:
+                quality = int(verdict.get("quality", 0))
+            except (TypeError, ValueError):
+                quality = 0
+            min_q = getattr(cfg, "quality_min_score", 7)
+            if not verdict.get("safe") or not verdict.get("interesting") or quality < min_q:
                 db.commit_burst(seen_ids, None)
                 reason = verdict.get("reason") or ",".join(verdict.get("flags") or []) or "rejected"
                 log_decision(cfg.logs_dir, outcome="rejected", asset_id=burst.head,
                              detail={"n": len(burst.members), "reason": verdict.get("reason"),
-                                     "flags": verdict.get("flags")})
-                _keep_reviewed(cfg, "unsafe" if not verdict.get("safe") else "boring",
-                               burst, verdict["best_index"], reason)
+                                     "flags": verdict.get("flags"), "quality": quality})
+                outcome_word = ("unsafe" if not verdict.get("safe")
+                                else "boring" if not verdict.get("interesting")
+                                else f"lowq{quality}")
+                _keep_reviewed(cfg, outcome_word, burst, verdict["best_index"], reason)
                 if not verdict.get("safe"):
                     ui.warn(f"   ↳ skipped — UNSAFE [{','.join(verdict.get('flags') or []) or 'flagged'}]")
+                elif not verdict.get("interesting"):
+                    ui.info(f"   ↳ skipped — not interesting (quality {quality}/10): "
+                            f"{reason} (walking back)")
                 else:
-                    ui.info(f"   ↳ skipped — not interesting: {reason} (walking back)")
+                    ui.info(f"   ↳ skipped — quality {quality}/10 below the bar of {min_q}: "
+                            f"{reason} (walking back)")
                 continue
 
             winner = burst.members[verdict["best_index"]]
@@ -606,7 +620,8 @@ def run_one_cycle(db: DB, cfg: Config, ic: ICloudPhotos, clients) -> str:
                         ui.info("   ↳ skipped — same scene as a recent post (walking back)")
                         continue
 
-            ui.info(f"   ↳ best of {len(burst.members)} is #{verdict['best_index']} — downloading "
+            ui.info(f"   ↳ best of {len(burst.members)} is #{verdict['best_index']} "
+                    f"(quality {quality}/10) — downloading "
                     f"full-res{' + enhancing' if getattr(cfg, 'color_enhance_enabled', False) else ''} …")
             kind, payload = _prepare_winner(db, cfg, ic, winner, verdict.get("caption", ""))
 
@@ -641,7 +656,7 @@ def run_one_cycle(db: DB, cfg: Config, ic: ICloudPhotos, clients) -> str:
             log_decision(cfg.logs_dir, outcome="posted" if posted else "post_failed",
                          asset_id=winner.asset_id,
                          detail={"best_index": verdict["best_index"], "n": len(burst.members),
-                                 "caption": payload.get("caption", "")})
+                                 "quality": quality, "caption": payload.get("caption", "")})
             _keep_reviewed(cfg, "posted" if posted else "postfail", burst,
                            verdict["best_index"], payload.get("caption") or "")
             return "posted" if posted else "post_failed"
@@ -856,7 +871,7 @@ def bot(once: bool = False, test: bool = False, test_cycles: int = 20,
         ui.info(f"🧪 test soak started — {_mode}, cycling fast"
                 f"{f' (max {test_cycles} cycles)' if test_cycles else ''}. Ctrl-C to stop.")
     else:
-        ui.info(f"bot started — posting every {cfg.post_interval_hours}h "
+        ui.info(f"bot started — posting every {cfg.post_interval_hours:.2f}h "
                 f"(dry_run={cfg.x_dry_run}). Ctrl-C to stop.")
 
     _today = db.get_today_stats()
@@ -888,9 +903,9 @@ def bot(once: bool = False, test: bool = False, test_cycles: int = 20,
                         reason = f"{cycles} cycles done"
                         break
                     ui.info(f"⏱  [TEST {cycles}{('/' + str(test_cycles)) if test_cycles else ''}] "
-                            f"~{cfg.post_interval_hours}h wait skipped → next cycle now")
+                            f"~{cfg.post_interval_hours:.2f}h wait skipped → next cycle now")
                 elif outcome == "posted":
-                    ui.ok(f"posted — holding for the next ~{cfg.post_interval_hours}h slot")
+                    ui.ok(f"posted — holding for the next ~{cfg.post_interval_hours:.2f}h slot")
                 elif outcome == "exhausted":
                     ui.info("no new photo to post right now")
                 else:

@@ -63,7 +63,7 @@ def _cfg():
         burst_max_size=5, burst_hamming_threshold=8, burst_max_attempts=3,
         daily_ai_calls=200, hamming_threshold=12, rotation_enabled=False,
         x_dry_run=True, post_max_attempts=3, max_posts_per_day=6, thumb_version="thumb",
-        prefetch_concurrency=4, scene_dedup_enabled=False,
+        prefetch_concurrency=4, scene_dedup_enabled=False, quality_min_score=7,
         keep_reviewed=False, reviewed_dir=_TMP / "reviewed",
         work_dir=_TMP / "work", queue_dir=_TMP / "queue",
         approved_dir=_TMP / "approved", posted_dir=_TMP / "posted", logs_dir=_TMP / "logs",
@@ -89,9 +89,9 @@ def test_walk_back_until_postable_then_post():
     def fake_judge(thumbs, cfg_, model_string=None):
         calls["n"] += 1
         if calls["n"] == 1:
-            return ({"best_index": 0, "safe": True, "interesting": False,
+            return ({"best_index": 0, "safe": True, "interesting": False, "quality": 3,
                      "flags": [], "caption": "", "reason": "boring"}, 0.1, True)
-        return ({"best_index": 0, "safe": True, "interesting": True,
+        return ({"best_index": 0, "safe": True, "interesting": True, "quality": 9,
                  "flags": [], "caption": "nice", "reason": "good"}, 0.1, True)
 
     orig_judge, orig_ss = bot.judge_burst, bot.is_screenshot

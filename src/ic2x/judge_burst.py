@@ -11,7 +11,9 @@ import logging
 from pathlib import Path
 
 from ic2x.config import Config
-from ic2x.judge_safety_quality import CAPTION_BLOCK, QUALITY_BLOCK, SAFETY_BLOCK
+from ic2x.judge_safety_quality import (
+    CAPTION_BLOCK, QUALITY_BLOCK, SAFETY_BLOCK, coerce_quality,
+)
 from ic2x.utils.ai_client import (
     MultiJudgeCall,
     call_vision_judge_multi,
@@ -31,7 +33,8 @@ Schema:
   "best_index": <int 0..N-1 — the single best shot: sharpest, best framed and exposed>,
   "safe": bool,
   "flags": [],
-  "shows": "one phrase — what an outsider sees or learns about China here, and why it is worth posting (or 'little of interest' if empty/generic). Decide interesting AFTER this.",
+  "shows": "one phrase — what an outsider sees or learns about China here, and why it is worth posting (or 'little of interest' if empty/generic). Decide quality and interesting AFTER this.",
+  "quality": <int 0-10 — score the CHOSEN shot per the QUALITY rules>,
   "interesting": bool,
   "caption": "descriptive caption for the chosen shot for an international audience — see CAPTION rules; ≤200 chars, no hashtags, ≥1 topic-matching emoji",
   "reason": "one short sentence: why this index, and the quality/safety call"
@@ -62,7 +65,7 @@ def burst_prompt(cfg: Config) -> str:
 
 def _fail(flag: str) -> dict:
     return {
-        "best_index": 0, "safe": False, "flags": [flag],
+        "best_index": 0, "safe": False, "flags": [flag], "quality": 0,
         "interesting": False, "caption": "", "reason": "",
     }
 
@@ -74,9 +77,10 @@ def judge_burst(
     """Run the burst judge over thumb_paths (index order == list order).
 
     Returns (result_dict, elapsed_seconds, used_network). result_dict always has
-    best_index (validated into range), safe, flags, interesting, caption (≤100),
-    reason. Fails closed. If usage_out is given, the call's {input, output} token
-    counts are written into it (per-call cost attribution for parallel runs).
+    best_index (validated into range), safe, flags, quality (int 0-10, clamped;
+    missing → 0), interesting, caption (≤200), reason. Fails closed. If usage_out
+    is given, the call's {input, output} token counts are written into it
+    (per-call cost attribution for parallel runs).
     """
     if not thumb_paths:
         return _fail("error:empty"), 0.0, False
@@ -116,6 +120,7 @@ def judge_burst(
 
     caption = parsed.get("caption") or ""
     parsed["caption"] = caption[:200]
+    coerce_quality(parsed)
     parsed.setdefault("flags", [])
     parsed.setdefault("reason", "")
     return parsed, elapsed, used_network

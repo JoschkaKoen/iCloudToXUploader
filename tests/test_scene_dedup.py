@@ -91,7 +91,7 @@ def _seed_recent_post(db, cfg, phash="ffffffffffffffff"):
 
 
 def _postable_judge(thumbs, cfg_, model_string=None):
-    return ({"best_index": 0, "safe": True, "interesting": True,
+    return ({"best_index": 0, "safe": True, "interesting": True, "quality": 9,
              "flags": [], "caption": "nice", "reason": "good"}, 0.1, True)
 
 

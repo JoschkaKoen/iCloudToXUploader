@@ -38,7 +38,7 @@ def startup_banner(cfg) -> None:
     judge_str = f"{judge_model} [{judge_effort or 'default'}]"
     rows = [
         ("👤", "iCloud user",   cfg.icloud_username),
-        ("⏱", "Post interval", f"{cfg.post_interval_hours}h"),
+        ("⏱", "Post interval", f"{cfg.post_interval_hours:.2f}h"),
         ("🤖", "Judge model",   judge_str),
         ("✨", "Enhance",       enhance),
         ("🐦", "Dry run",       dry),
@@ -56,7 +56,7 @@ def startup_banner(cfg) -> None:
         box=box.DOUBLE,
     ))
     console.print()
-    _clog.info("IC2X start — user=%s  interval=%sh  judge=%s  dry_run=%s",
+    _clog.info("IC2X start — user=%s  interval=%.2fh  judge=%s  dry_run=%s",
                cfg.icloud_username, cfg.post_interval_hours, judge_str, cfg.x_dry_run)
 
 
