@@ -7,6 +7,11 @@ walk-back past a below-bar burst, fail-closed on a missing score, judge_burst's
 score validation/clamping, the config default + env override, and that the
 prompts actually carry the selective rubric.
 
+They also cover the neighbouring rule that a judge ERROR is not a verdict: a
+failed judge call fails closed (never posts) but must leave the burst unseen for
+a retry instead of burning it — observed 2026-07-17, two bursts permanently lost
+to a transient error:no_client.
+
 Run: .venv/bin/python tests/test_quality_gate.py
 """
 
@@ -135,6 +140,81 @@ def test_missing_quality_fails_closed():
     assert outcome == "exhausted", outcome
     assert db.seen_asset_id("nq")
     assert db.count_posts_rolling_24h() == 0
+    db.close()
+
+
+def _err_verdict(flag: str) -> dict:
+    """Shape of judge_burst's fail-closed value (see judge_burst._fail)."""
+    return {"best_index": 0, "safe": False, "interesting": False, "quality": 0,
+            "flags": [flag], "caption": "", "reason": ""}
+
+
+def test_judge_error_leaves_burst_for_the_next_cycle():
+    """A transient judge failure must NOT burn the photos: the burst stays unseen
+    and posts on the next cycle (the stream is one-pass, so the retry lands there —
+    same contract as a transient download failure). Pre-fix the error committed a
+    rejection and the burst was gone from the library for good."""
+    cfg = _cfg("judgeerr")
+    db = DB(_TMP / "judgeerr.db")
+    p = _FIX / "je.jpg"; _img(p, 1)
+    ic = FakeIC([("je", p)])
+
+    def erroring(thumbs, cfg_, model_string=None):
+        return (_err_verdict("error:no_client"), 0.1, False)
+
+    def good(thumbs, cfg_, model_string=None):
+        return ({"best_index": 0, "safe": True, "interesting": True, "quality": 9,
+                 "flags": [], "caption": "cap", "reason": "q9"}, 0.1, True)
+
+    assert _run_cycle(cfg, db, ic, erroring) == "exhausted"
+    assert not db.seen_asset_id("je"), "a judge error burned the photo — it can never return"
+    assert db._conn.execute(
+        "SELECT COUNT(*) c FROM images WHERE asset_id='je'").fetchone()["c"] == 0
+
+    assert _run_cycle(cfg, db, ic, good) == "posted", "the retry never got to judge it"
+    assert db.get_image_by_sha(
+        db._conn.execute("SELECT sha256 FROM images WHERE asset_id='je'").fetchone()["sha256"]
+    )["status"] == Status.POSTED.value
+    db.close()
+
+
+def test_judge_error_gives_up_after_max_attempts():
+    """The attempts breaker still bounds it — a judge that never recovers marks the
+    burst seen on the cfg.burst_max_attempts'th cycle instead of retrying forever."""
+    cfg = _cfg("judgeerrloop")
+    db = DB(_TMP / "judgeerrloop.db")
+    p = _FIX / "jel.jpg"; _img(p, 0)
+    ic = FakeIC([("jel", p)])
+
+    def erroring(thumbs, cfg_, model_string=None):
+        return (_err_verdict("error:no_client"), 0.1, False)
+
+    for i in range(1, cfg.burst_max_attempts):
+        assert _run_cycle(cfg, db, ic, erroring) == "exhausted"
+        assert not db.seen_asset_id("jel"), f"gave up too early, on attempt {i}"
+    assert _run_cycle(cfg, db, ic, erroring) == "exhausted"
+    assert db.seen_asset_id("jel"), "a permanently failing judge must stop retrying"
+    db.close()
+
+
+def test_model_refusal_is_a_verdict_not_an_error():
+    """`model_refused` is the model declining on content — a real rejection. It must
+    still commit seen on the first call, not get retried as a blip."""
+    cfg = _cfg("refused")
+    db = DB(_TMP / "refused.db")
+    p = _FIX / "rf.jpg"; _img(p, 1)
+    ic = FakeIC([("rf", p)])
+
+    calls = {"n": 0}
+
+    def fake_judge(thumbs, cfg_, model_string=None):
+        calls["n"] += 1
+        return (_err_verdict("model_refused"), 0.1, True)
+
+    outcome = _run_cycle(cfg, db, ic, fake_judge)
+    assert outcome == "exhausted", outcome
+    assert db.seen_asset_id("rf") and calls["n"] == 1, \
+        f"a refusal must reject immediately, got {calls['n']} calls"
     db.close()
 
 

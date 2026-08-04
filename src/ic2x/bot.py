@@ -567,6 +567,30 @@ def run_one_cycle(db: DB, cfg: Config, ic: ICloudPhotos, clients) -> str:
             if shows:
                 ui.info(f"   ↳ shows: {shows}")
 
+            # A judge that ERRORED (no client, bad response shape) has said nothing
+            # about these photos. It fails closed so nothing unsafe can slip through,
+            # but committing that as a rejection would permanently burn the burst on
+            # what is usually a transient blip — observed 2026-07-17, two bursts lost
+            # to error:no_client and never reconsidered. Route it through the same
+            # attempts breaker as a transient download failure instead. A genuine
+            # `model_refused` is NOT an error and still rejects below.
+            _errs = [str(f) for f in (verdict.get("flags") or []) if str(f).startswith("error:")]
+            if _errs:
+                attempts = db.incr_asset_attempts(burst.head)
+                if attempts >= cfg.burst_max_attempts:
+                    db.commit_burst(seen_ids, None)
+                    log_decision(cfg.logs_dir, outcome="error_giveup", asset_id=burst.head,
+                                 detail={"n": len(burst.members), "stage": "judge",
+                                         "flags": _errs})
+                    ui.warn(f"   ↳ judge kept failing [{','.join(_errs)}] after "
+                            f"{attempts} tries — giving up on this burst")
+                    continue
+                log_decision(cfg.logs_dir, outcome="transient_skip", asset_id=burst.head,
+                             detail={"attempt": attempts, "stage": "judge", "flags": _errs})
+                ui.warn(f"   ↳ judge unavailable [{','.join(_errs)}] — leaving this burst "
+                        "unseen for the next cycle")
+                continue
+
             # Posting bar: the judge scores the chosen shot 0-10; anything under
             # cfg.quality_min_score walks back even when interesting=true. Missing/
             # invalid score → 0 (fail-closed), matching judge_burst's validation.
