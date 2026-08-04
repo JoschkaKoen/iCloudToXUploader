@@ -525,6 +525,14 @@ def run_one_cycle(db: DB, cfg: Config, ic: ICloudPhotos, clients) -> str:
 
     try:
         while not _capped():
+            # Honour a stop request between bursts. A cycle can walk back through
+            # hundreds of photos, so without this check SIGTERM/Ctrl-C waited for the
+            # whole cycle: systemd's default 90s stop timeout expired and it SIGKILLed
+            # the bot mid-scan (2026-08-04). Stopping here is always safe — a burst is
+            # committed atomically before its post, and flush_pending finishes any
+            # APPROVED-but-unposted winner on the next start.
+            if _stop:
+                return "interrupted"
             burst = assemble_burst(stream, cfg, ic, screenshot_ids, db)
             if burst is None:
                 db.set_state("backward_exhausted", "1")

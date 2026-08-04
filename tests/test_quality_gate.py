@@ -185,6 +185,35 @@ def test_grouping_calls_do_not_starve_the_judging_budget():
     db.close()
 
 
+def test_stop_request_aborts_the_cycle_between_bursts():
+    """A cycle can walk back through hundreds of photos; it must notice a stop request
+    instead of running to completion. Without this, systemd's 90s stop timeout expired
+    and SIGKILLed the bot mid-scan (2026-08-04)."""
+    cfg = _cfg("stopfast")
+    db = DB(_TMP / "stopfast.db")
+    p = _FIX / "sf.jpg"; _img(p, 0)
+    ic = FakeIC([("sf", p)])
+
+    judged = {"n": 0}
+
+    def judge(thumbs, cfg_, model_string=None):
+        judged["n"] += 1
+        return ({"best_index": 0, "safe": True, "interesting": True, "quality": 9,
+                 "flags": [], "caption": "c", "reason": "ok"}, 0.1, True)
+
+    was = bot._stop
+    bot._stop = True
+    try:
+        outcome = _run_cycle(cfg, db, ic, judge)
+    finally:
+        bot._stop = was
+
+    assert outcome == "interrupted", f"cycle ignored the stop request: {outcome}"
+    assert judged["n"] == 0, "kept judging after a stop request"
+    assert db.count_posts_rolling_24h() == 0, "posted despite a stop request"
+    db.close()
+
+
 def _err_verdict(flag: str) -> dict:
     """Shape of judge_burst's fail-closed value (see judge_burst._fail)."""
     return {"best_index": 0, "safe": False, "interesting": False, "quality": 0,
