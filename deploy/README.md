@@ -67,6 +67,19 @@ fail open, so the bot keeps posting without them:
 
 ## Gotchas
 
+- **GitHub may be unreachable from the host.** On the China-based worker `git fetch`
+  dies with `gnutls_handshake() failed: The TLS connection was non-properly terminated`,
+  even though iCloud, X and Aliyun are all fine. Deploy by pushing files from a machine
+  that *can* reach GitHub:
+
+  ```bash
+  rsync -a src/ tests/ deploy/ pyproject.toml default.env render-worker:/home/y/Programming/iCloudToXUploader/
+  rsync -a --exclude hooks/ .git/ render-worker:/home/y/Programming/iCloudToXUploader/.git/
+  ```
+
+  Do **not** `git reset` against `origin/main` on the host after a failed fetch — the
+  ref is stale, so it silently moves `HEAD` backwards. (`--mixed` leaves the working
+  tree alone, so the running bot is unaffected, but the repo state becomes a lie.)
 - **Build the venv with one interpreter.** Running `python3.X -m venv` over an existing
   venv from a different Python leaves two `lib/pythonX.Y/site-packages` trees, with
   `pip` installing into one and the interpreter reading the other. Delete and recreate.
