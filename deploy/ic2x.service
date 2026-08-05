@@ -1,0 +1,24 @@
+[Unit]
+Description=ic2x — iCloud to X photo bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/y/Programming/iCloudToXUploader
+ExecStart=/home/y/Programming/iCloudToXUploader/.venv/bin/python Xup.py
+# A cycle (iCloud scan -> judge -> post) can run for minutes, and the pre-walk-back
+# steps (Screenshots-album enumeration, catalog refresh) are single blocking pyicloud
+# calls that cannot be interrupted at all. The default 90s stop timeout SIGKILLed the
+# bot mid-scan; 600s lets it finish and exit cleanly.
+TimeoutStopSec=600
+Restart=always
+RestartSec=60
+# Shared box: XBot3 owns the GPU every ~7h and must never be slowed down.
+Nice=19
+IOSchedulingClass=idle
+StandardOutput=append:/home/y/Programming/iCloudToXUploader/logs/xup_console.log
+StandardError=append:/home/y/Programming/iCloudToXUploader/logs/xup_console.log
+
+[Install]
+WantedBy=default.target
