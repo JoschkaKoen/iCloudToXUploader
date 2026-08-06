@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import urllib.request
 from pathlib import Path
 
@@ -27,6 +28,13 @@ logger = logging.getLogger("ic2x.geo")
 
 _GEOCODE_URL = "https://api.bigdatacloud.net/data/reverse-geocode-client"
 _cache: dict[tuple[float, float], str | None] = {}
+
+# Every other network call in a cycle retries (rotation 4×, caption 4×, create_tweet
+# 6×) — this one did not, so a single blip cost the post its location permanently.
+# Seen 2026-08-05 04:40: GPS read fine at 31.5778,120.2983 (Wuxi), the lookup failed
+# once during a flaky window, and the post went out with no 📍 line at all.
+_GEOCODE_ATTEMPTS = 3
+_GEOCODE_RETRY_DELAY = 2.0
 
 
 def _to_decimal(dms, ref) -> float:
@@ -62,22 +70,37 @@ def reverse_geocode(lat: float, lon: float, timeout: float = 10.0) -> str | None
     Only SUCCESSFUL lookups are cached (including a genuine "no city here" → None).
     A transient failure (network/timeout) returns None WITHOUT caching, so the next
     post from that area retries instead of being permanently stuck for the life of
-    the long-running bot process."""
+    the long-running bot process.
+
+    Retried in close succession before giving up: losing the lookup costs the post
+    BOTH its 📍 line and the caption model's location grounding, and the coordinate
+    cache rarely rescues it — keyed at ~100 m, consecutive posts from the same city
+    are usually different cells."""
     key = (round(lat, 3), round(lon, 3))
     if key in _cache:
         return _cache[key]
     url = f"{_GEOCODE_URL}?latitude={lat}&longitude={lon}&localityLanguage=en"
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
-            d = json.load(resp)
-        city = d.get("city") or d.get("locality") or ""
-        country = d.get("countryName") or ""
-        place = ", ".join(p for p in (city, country) if p) or None
-    except Exception as exc:  # noqa: BLE001 — best-effort, never raise (and don't cache)
-        logger.warning("geo: reverse geocode failed for %.4f,%.4f: %s", lat, lon, exc)
-        return None
-    _cache[key] = place
-    return place
+    for attempt in range(1, _GEOCODE_ATTEMPTS + 1):
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as resp:
+                d = json.load(resp)
+            city = d.get("city") or d.get("locality") or ""
+            country = d.get("countryName") or ""
+            place = ", ".join(p for p in (city, country) if p) or None
+        except Exception as exc:  # noqa: BLE001 — best-effort, never raise (and don't cache)
+            if attempt < _GEOCODE_ATTEMPTS:
+                logger.warning("geo: reverse geocode failed for %.4f,%.4f "
+                               "(attempt %d/%d), retrying: %s",
+                               lat, lon, attempt, _GEOCODE_ATTEMPTS, exc)
+                time.sleep(_GEOCODE_RETRY_DELAY)
+                continue
+            logger.warning("geo: reverse geocode failed for %.4f,%.4f after %d "
+                           "attempts — posting without a location: %s",
+                           lat, lon, _GEOCODE_ATTEMPTS, exc)
+            return None
+        _cache[key] = place
+        return place
+    return None
 
 
 def capture_time(image_path: Path) -> str | None:

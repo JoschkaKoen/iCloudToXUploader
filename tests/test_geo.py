@@ -6,6 +6,10 @@ result is also cached, but a TRANSIENT failure is NOT cached so the next call
 retries. Guards the long-running-bot bug where a one-off blip permanently blocked
 a location's geocode.
 
+Also covers the in-call retry added 2026-08-05: a single blip used to cost the post
+its 📍 line AND the caption model's location grounding, with no retry at all while
+every other network call in a cycle retried.
+
 Run: .venv/bin/python tests/test_geo.py
 """
 
@@ -52,6 +56,9 @@ def _mock_urlopen(side_effects):
         geo.urllib.request.urlopen = orig
 
 
+geo._GEOCODE_RETRY_DELAY = 0    # no real sleeps between retries in tests
+
+
 def setup_function():  # pytest hook; also called manually by _main
     geo._cache.clear()
 
@@ -72,13 +79,30 @@ def test_no_city_result_is_cached_as_none():
     assert calls["n"] == 1, "a genuine empty result should still be cached"
 
 
-def test_transient_failure_is_not_cached_then_retries():
+def test_transient_blip_is_retried_within_the_call():
+    """A one-off blip must not cost the post its location. Observed 2026-08-05: GPS
+    read fine at 31.5778,120.2983 (Wuxi), the single lookup failed during a flaky
+    window, and the post went out with no 📍 line and an ungrounded caption."""
     geo._cache.clear()
-    effects = [TimeoutError("blip"), {"city": "Hangzhou", "countryName": "China"}]
+    effects = [TimeoutError("blip"), {"city": "Wuxi", "countryName": "China"}]
     with _mock_urlopen(effects) as calls:
-        assert geo.reverse_geocode(30.25, 120.16) is None     # call 1 fails → None
-        assert geo.reverse_geocode(30.25, 120.16) == "Hangzhou, China"  # call 2 retries
-    assert calls["n"] == 2, "failure must not be cached; the next call must retry"
+        assert geo.reverse_geocode(31.5778, 120.2983) == "Wuxi, China"
+    assert calls["n"] == 2, "the blip should have been retried inside the same call"
+
+
+def test_gives_up_after_all_attempts_without_caching():
+    """A sustained outage still fails open (no location beats a wrong one), and must
+    not poison the cache — the next post from that area retries."""
+    geo._cache.clear()
+    effects = [TimeoutError("down")] * geo._GEOCODE_ATTEMPTS
+    with _mock_urlopen(effects) as calls:
+        assert geo.reverse_geocode(30.25, 120.16) is None
+    assert calls["n"] == geo._GEOCODE_ATTEMPTS, f"expected {geo._GEOCODE_ATTEMPTS} tries"
+    assert not geo._cache, "a failure must never be cached"
+
+    with _mock_urlopen([{"city": "Hangzhou", "countryName": "China"}]) as calls:
+        assert geo.reverse_geocode(30.25, 120.16) == "Hangzhou, China"
+    assert calls["n"] == 1
 
 
 def _main() -> int:
