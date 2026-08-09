@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from pathlib import Path
 
 import requests
@@ -26,6 +27,13 @@ import requests
 logger = logging.getLogger("ic2x.viapi")
 
 ENDPOINT = "imageenhan.cn-shanghai.aliyuncs.com"
+
+# Enhancement fails OPEN (the original posts), so a blip costs a post its colour work
+# silently. Measured 2026-08-04..09: 4 of 18 posts went out unenhanced, on four
+# different transient faults — read timeout, two SSL EOFs, and a truncated result
+# download. Retry in close succession like every other network call in a cycle.
+_ENHANCE_ATTEMPTS = 3
+_ENHANCE_RETRY_DELAY = 3.0
 
 # Input limits that satisfy BOTH super-res (≤1920×1080, ≤5 MB) and color
 # (≤3840×2160 long / ≤2160 short, <3 MB): fit inside 1920×1080 and keep <3 MB.
@@ -59,9 +67,19 @@ def _client():
     return Client(Config(access_key_id=ak, access_key_secret=sk, endpoint=ENDPOINT))
 
 
-def _run(method: str, build_request, url_attr: str, image_path: Path) -> bytes:
+def _run(method: str, build_request, url_attr: str, image_path: Path,
+         _attempt: int = 1) -> bytes:
     """Open the file, call the *_advance method (auto-OSS-upload, synchronous),
-    download the result image. Raises ViapiError with a clean message on any failure."""
+    download the result image. Raises ViapiError with a clean message on any failure.
+
+    Retried in close succession on TRANSIENT failures. Enhancement fails open — the
+    original photo posts — so every blip silently costs a post its colour work, and
+    that was happening to 4 of 18 posts (22%) over 2026-08-04..09. The SDK's own
+    `autoretry` does not cover the result download, which we issue ourselves, and one
+    of the four failures was exactly that: `result download failed: IncompleteRead
+    (23865 bytes read, 622255 more expected)` — the enhancement had already succeeded
+    server-side. A permanent error (capability not activated, bad credentials) is
+    raised immediately; retrying it would just delay every post."""
     from alibabacloud_tea_util.models import RuntimeOptions
 
     # The *_advance call uploads the file to a temp OSS bucket first; multi-MB photos
@@ -76,6 +94,15 @@ def _run(method: str, build_request, url_attr: str, image_path: Path) -> bytes:
     runtime = RuntimeOptions(connect_timeout=60000, read_timeout=90000,
                              autoretry=True, max_attempts=2)
     client = _client()
+
+    def _retry_or_raise(err: "ViapiError") -> bytes:
+        if _attempt >= _ENHANCE_ATTEMPTS:
+            raise err
+        logger.warning("viapi: %s failed (attempt %d/%d), retrying: %s",
+                       method, _attempt, _ENHANCE_ATTEMPTS, str(err)[:160])
+        time.sleep(_ENHANCE_RETRY_DELAY)
+        return _run(method, build_request, url_attr, image_path, _attempt + 1)
+
     try:
         with open(image_path, "rb") as f:
             resp = getattr(client, method)(build_request(f), runtime)
@@ -85,17 +112,19 @@ def _run(method: str, build_request, url_attr: str, image_path: Path) -> bytes:
     except Exception as exc:  # noqa: BLE001 — collapse SDK/network errors to one clean type
         msg = str(exc)
         if "NotPurchase" in msg:
-            msg = ("imageenhan capability not activated for this account — open it at "
-                   "https://common-buy.aliyun.com/?commodityCode=viapi_imageenhan_public_cn "
-                   "(first 100 calls/month free).")
-        raise ViapiError(f"{method}: {msg}") from exc
+            # Permanent: the capability is not switched on. Retrying cannot help.
+            raise ViapiError(
+                f"{method}: imageenhan capability not activated for this account — open "
+                "it at https://common-buy.aliyun.com/?commodityCode=viapi_imageenhan_"
+                "public_cn (first 100 calls/month free).") from exc
+        return _retry_or_raise(ViapiError(f"{method}: {msg}"))
     if not url:
-        raise ViapiError(f"{method}: API returned no result URL")
+        return _retry_or_raise(ViapiError(f"{method}: API returned no result URL"))
     try:
         r = requests.get(url, timeout=120)
         r.raise_for_status()
     except Exception as exc:  # noqa: BLE001
-        raise ViapiError(f"{method}: result download failed: {exc}") from exc
+        return _retry_or_raise(ViapiError(f"{method}: result download failed: {exc}"))
     return r.content
 
 
