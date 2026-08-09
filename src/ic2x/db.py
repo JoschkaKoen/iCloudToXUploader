@@ -387,6 +387,26 @@ class DB:
         ).fetchall()
         return [r["phash"] for r in rows]
 
+    def recent_captions(self, limit: int) -> list[str]:
+        """First lines of the most recently POSTED captions, newest first.
+
+        Fed to the caption pass so it can avoid reusing a construction it has just
+        used. Without this the writer has no memory across posts, and the same shapes
+        pile up: measured over 42 posts, 52% contained "here" and 38% "often", and an
+        opener the prompt explicitly bans ("Westerners often …") still appeared twice.
+        Only the text line is returned — the 📍 line is stripped."""
+        rows = self._conn.execute(
+            "SELECT caption FROM images WHERE status = ? AND caption IS NOT NULL "
+            "AND caption != '' ORDER BY posted_at DESC LIMIT ?",
+            (Status.POSTED.value, limit),
+        ).fetchall()
+        out = []
+        for r in rows:
+            first = (r["caption"] or "").split("\n")[0].strip()
+            if first:
+                out.append(first)
+        return out
+
     # ── X reconciliation ───────────────────────────────────────────────────────
 
     def posted_for_reconcile(self, limit: int) -> list[sqlite3.Row]:

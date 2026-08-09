@@ -23,12 +23,24 @@ from ic2x.utils.ai_client import (
 
 logger = logging.getLogger("ic2x.caption")
 
+_RECENT_MAX = 8     # enough shape history to break a rut; a few hundred input tokens
+
+
+def caption_model(cfg: Config) -> str:
+    """Model that WRITES the caption. Defaults to the judge model, but is its own knob
+    because judging a photo and writing about it are different jobs — benchmarked
+    2026-08-09, every Grok tier was cheaper than qwen3.7-plus (grok-4-1-fast at 0.12x)
+    yet described the photo instead of drawing an insight from it, so qwen stays the
+    default. The knob makes re-testing that a config change, not a code change."""
+    return getattr(cfg, "caption_model", "") or cfg.judge_model
+
 # One prompt; the photo's place and time are interpolated in. {{ }} are literal JSON braces.
 _CAPTION_PROMPT = """You are a long-time expat in China, captioning your own photo on X (twitter) for
 Western viewers who have never visited China.
 The photo you are seeing was taken in {place} at {when}.
 
-Write ONE short sentence, UNDER 120 characters.
+Write ONE short sentence, UNDER 120 characters. Shorter is better — every word
+must earn its place.
 Share a real, specific insight a Western viewer can learn from it.
 ACCURACY: call things what they are; never invent facts, meanings or prices.
 Name or translate text ONLY when it is CLEARLY readable and you are certain —
@@ -40,15 +52,25 @@ messaging — describe such scenes generally instead.
 TONE: plain and matter-of-fact, like a knowledgeable friend texting — never
 promotional or awed. Banned words: vibrant, bustling, stunning, lush,
 incredible, amazing, breathtaking. Never negative either.
-Never open with the "Many assume / Westerners think…" template — state it directly.
+Never frame it around what outsiders believe ("Many assume", "Westerners
+think/often", "Most people expect", any variant) — state the fact directly.
 I LIVE IN CHINA — never critical, political or mocking; no "slogan"/
 "propaganda"-type framing.
-
+{recent_block}
 No hashtags, no emoji inside the text.
 Never restate the photo's location or time (appended automatically).
 
 Return ONLY JSON: {{"caption": "<caption>", "emoji": "<REQUIRED: one emoji for the \
 MAIN subject, not background details>"}}"""
+
+
+_RECENT_BLOCK = """
+My recent captions — do NOT reuse their sentence shape, nor the generalising crutch
+they lean on ("<thing> here often …"):
+{recent}
+Vary the opening, but stay SHORT and still teach something: a fresh shape that only
+describes what is visible is worse than none.
+"""
 
 
 _PICKER_PROMPT_HEAD = """You are choosing the best of {n} candidate tweets for this photo. The tweet is
@@ -81,19 +103,30 @@ Return ONLY valid JSON — no markdown:
 
 
 def generate_caption(image_path: Path, place: str | None, when: str | None,
-                     cfg: Config) -> tuple[str | None, int]:
+                     cfg: Config, recent: list[str] | None = None) -> tuple[str | None, int]:
     """Caption the winner image, grounded in `place` + `when`.
 
     Best-of-N (cfg.caption_candidates, default 1): N independent caption calls run in
     parallel, then one picker call chooses the best tweet (see _pick_best). Returns
     (caption, n_network_calls); caption is None on total failure (caller keeps the
-    judge's caption). Skipped on a local-only/ollama model."""
-    model, _ = parse_model_effort(cfg.judge_model)
+    judge's caption). Skipped on a local-only/ollama model.
+
+    `recent` is the last few posted captions. The writer is otherwise stateless across
+    posts, so it cannot tell it is reusing a shape it just used — over 42 posts 52%
+    contained "here" and 38% "often". Showing it the recent ones costs a few hundred
+    input tokens and is the only thing that can break that, since the picker only ever
+    sees candidates for the current photo."""
+    model, _ = parse_model_effort(caption_model(cfg))
     if provider_for_model(model) == "ollama":
         return None, 0  # the caption pass needs a cloud VLM
 
+    recent_block = ""
+    if recent:
+        listed = "\n".join(f"- {c}" for c in recent[:_RECENT_MAX])
+        recent_block = _RECENT_BLOCK.format(recent=listed)
     prompt = _CAPTION_PROMPT.format(place=place or "an unknown place",
-                                    when=when or "an unknown time")
+                                    when=when or "an unknown time",
+                                    recent_block=recent_block)
     n = max(1, int(getattr(cfg, "caption_candidates", 1) or 1))
     if n == 1:
         cap, used = _generate_one(image_path, prompt, cfg)
@@ -132,7 +165,7 @@ def generate_caption(image_path: Path, place: str | None, when: str | None,
 def _generate_one(image_path: Path, prompt: str, cfg: Config) -> tuple[str | None, bool]:
     """One caption call. Returns (caption|None, used_network)."""
     parsed, _elapsed, ok, used = call_vision_judge(
-        model_string=cfg.judge_model,
+        model_string=caption_model(cfg),
         ollama_base_url=cfg.ollama_base_url,
         call=JudgeCall(
             image_path=image_path,
@@ -158,7 +191,7 @@ def _pick_best(image_path: Path, candidates: list[str], cfg: Config) -> tuple[in
     numbered = "\n".join(f"{i}: {c}" for i, c in enumerate(candidates))
     prompt = (_PICKER_PROMPT_HEAD.format(n=len(candidates)) + numbered
               + _PICKER_PROMPT_TAIL)
-    model_str = getattr(cfg, "caption_picker_model", "") or cfg.judge_model
+    model_str = getattr(cfg, "caption_picker_model", "") or caption_model(cfg)
     parsed, _elapsed, ok, used = call_vision_judge(
         model_string=model_str,
         ollama_base_url=cfg.ollama_base_url,

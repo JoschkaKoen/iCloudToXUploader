@@ -34,12 +34,33 @@ def test_format_location_line():
 
 
 def test_prompt_interpolates_place_time_and_stays_concise():
-    p = cap._CAPTION_PROMPT.format(place="Ningbo, China", when="19:50")
+    p = cap._CAPTION_PROMPT.format(place="Ningbo, China", when="19:50", recent_block="")
     assert "Ningbo, China" in p and "19:50" in p   # place + time reach the model
     # Focused template, not a rule pile — but every rule here maps to a REAL posted
     # caption the owner deleted (politics/tone/length/accuracy steers of 2026-07-12/13),
-    # so the ceiling was consciously raised from 1200 once those were encoded.
-    assert len(cap._CAPTION_PROMPT) < 1400
+    # so the ceiling was consciously raised from 1200 once those were encoded, and
+    # again to 1600 on 2026-08-09: measured over 42 posts, 52% of captions contained
+    # "here", 38% "often", and the banned "Westerners …" opener still slipped through
+    # twice, so that ban was generalised and a length nudge added (avg was 128 chars
+    # against an "UNDER 120" instruction).
+    assert len(cap._CAPTION_PROMPT) < 1600
+
+
+def test_recent_captions_reach_the_writer_and_are_optional():
+    """The writer is stateless across posts; showing it recent captions is the only
+    lever against reusing the same shape. No history → no block, no wasted tokens."""
+    recent = ["Bookstores here often stay open past midnight. 📚",
+              "Malls here often build ice rinks in the atrium. ⛸"]
+    with_recent = cap._CAPTION_PROMPT.format(
+        place="Wuxi, China", when="18:00",
+        recent_block=cap._RECENT_BLOCK.format(recent="\n".join(f"- {c}" for c in recent)))
+    for c in recent:
+        assert c in with_recent
+    assert "Vary the opening" in with_recent
+
+    without = cap._CAPTION_PROMPT.format(place="Wuxi, China", when="18:00", recent_block="")
+    assert "Vary the opening" not in without
+    assert len(without) < len(with_recent)
 
 
 def _patch(result):

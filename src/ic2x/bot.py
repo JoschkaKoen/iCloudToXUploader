@@ -450,7 +450,11 @@ def _prepare_winner(db: DB, cfg: Config, ic: ICloudPhotos, winner: BurstMember, 
         if getattr(cfg, "caption_pass_enabled", True):
             try:
                 from ic2x import caption as caption_mod
-                new_cap, used = caption_mod.generate_caption(prepared, place, when, cfg)
+                # Show the writer its own recent captions — it is otherwise stateless
+                # across posts and cannot tell it is reusing a shape it just used.
+                recent_caps = db.recent_captions(getattr(cfg, "caption_recent_n", 8))
+                new_cap, used = caption_mod.generate_caption(prepared, place, when, cfg,
+                                                             recent=recent_caps)
                 for _ in range(int(used)):   # best-of-N: one increment per network call
                     db.increment_ai_calls()
                 if new_cap:

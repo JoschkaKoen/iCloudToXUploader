@@ -69,7 +69,9 @@ class Config:
     location_timeout: float
     caption_pass_enabled: bool      # location/time-grounded caption pass on the winner
     caption_candidates: int         # best-of-N captions (N parallel calls + AI picker)
-    caption_picker_model: str       # CAPTION_PICKER_MODEL or judge_model
+    caption_picker_model: str       # CAPTION_PICKER_MODEL or the caption model
+    caption_model: str              # CAPTION_MODEL or judge_model (writer != judge)
+    caption_recent_n: int           # recent captions shown to the writer, to vary shape
 
     # Limits / dedup
     daily_ai_calls: int             # DECISION calls/day (judge, owner, rotation, caption)
@@ -248,6 +250,8 @@ def load_config() -> Config:
         caption_pass_enabled=_bool_env("CAPTION_PASS_ENABLED", default=True),
         caption_candidates=_int_env("CAPTION_CANDIDATES", 4),
         caption_picker_model=os.getenv("CAPTION_PICKER_MODEL", "").strip() or judge_model,
+        caption_model=os.getenv("CAPTION_MODEL", "").strip(),
+        caption_recent_n=_int_env("CAPTION_RECENT_N", 8),
 
         # Limits / dedup
         daily_ai_calls=_int_env("DAILY_AI_CALLS", 200),
