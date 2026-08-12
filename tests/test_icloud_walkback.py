@@ -24,6 +24,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
+import ic2x.icloud_photos as icp  # noqa: E402
 from ic2x.icloud_photos import ICloudPhotos  # noqa: E402
 
 NOW = datetime(2026, 7, 14, tzinfo=timezone.utc)
@@ -169,8 +170,10 @@ def _fresh_db():
 
 
 def test_catalog_refresh_indexes_new_photos_at_the_head():
-    """New photos arrive at offset 0 and must be picked up, with every existing
-    rank pushed down by exactly the number added so stored ranks stay true."""
+    """New photos arrive at offset 0 and must be picked up at all — the 2026-08-04 bug
+    was a tail-scan that hit an all-known page and indexed nothing, silently freezing
+    the catalog. Rank semantics belong to
+    test_catalog_refresh_leaves_existing_ranks_untouched."""
     db = _fresh_db()
     old = [_asset(f"old{i}", created_days_ago=10 + i) for i in range(5)]
     db.catalog_upsert_many([(a.id, a.created.isoformat(), i) for i, a in enumerate(old)])
@@ -181,11 +184,63 @@ def test_catalog_refresh_indexes_new_photos_at_the_head():
     _catalog_ic(album).ensure_catalog(db, page=4)
 
     assert db.catalog_count() == 8, f"new head photos were not indexed ({db.catalog_count()})"
+    cataloged = {r["asset_id"] for r in
+                 db._conn.execute("SELECT asset_id FROM asset_catalog")}
+    assert {f"new{i}" for i in range(3)} <= cataloged
+    # They must sort ahead of the existing rows in the walk-back's capture order.
+    order = [r["asset_id"] for r in db.catalog_unseen_desc()]
+    assert order[:3] == ["new0", "new1", "new2"], order
+    db.close()
+
+
+def test_catalog_refresh_leaves_existing_ranks_untouched():
+    """New assets must join the FROZEN baseline (negative ranks), not be given live
+    album offsets with every existing rank shifted to match.
+
+    Rewriting stored ranks broke _fetch_by_rank: it absorbs album movement with one
+    learned `drift`, so with both the rank and the drift moving, probes miss — and a
+    miss is read as "deleted from iCloud". `drift` only refreshes on a hit, so the
+    first miss froze it and 67139 catalog rows were dropped in one run (2026-08-11)."""
+    db = _fresh_db()
+    old = [_asset(f"old{i}", created_days_ago=10 + i) for i in range(5)]
+    db.catalog_upsert_many([(a.id, a.created.isoformat(), i) for i, a in enumerate(old)])
+    db.set_state("catalog_complete", "1")
+
+    new = [_asset(f"new{i}", created_days_ago=i) for i in range(3)]
+    album = _FakeAlbum(new + old)
+    _catalog_ic(album).ensure_catalog(db, page=4)
+
     ranks = {r["asset_id"]: r["rank"] for r in
              db._conn.execute("SELECT asset_id, rank FROM asset_catalog")}
-    assert [ranks[f"new{i}"] for i in range(3)] == [0, 1, 2], ranks
-    assert [ranks[f"old{i}"] for i in range(5)] == [3, 4, 5, 6, 7], \
-        f"existing ranks not shifted by the 3 new assets: {ranks}"
+    assert [ranks[f"old{i}"] for i in range(5)] == [0, 1, 2, 3, 4], \
+        f"existing ranks were rewritten — this is what emptied the catalog: {ranks}"
+    assert [ranks[f"new{i}"] for i in range(3)] == [-3, -2, -1], \
+        f"new assets must sit before the frozen rank 0: {ranks}"
+    assert db.catalog_count() == 8
+    db.close()
+
+
+def test_probe_misses_cannot_empty_the_catalog():
+    """A probe miss is evidence of deletion, not proof. A systematic mismatch makes
+    EVERY probe miss, and drift cannot self-correct because only a hit refreshes it —
+    so the drop path needs a hard cap or it deletes the whole library index."""
+    db = _fresh_db()
+    n = 200
+    rows = [(f"a{i}", NOW.isoformat(), i) for i in range(n)]
+    db.catalog_upsert_many(rows)
+    assert db.catalog_count() == n
+
+    ic = ICloudPhotos.__new__(ICloudPhotos)
+    # An album that never contains the asset being probed, but always returns a window
+    # covering the expected rank — i.e. every probe misses inside a covered window.
+    ic._all_album = lambda: _FakeAlbum([_asset(f"ghost{i}", 1) for i in range(400)])
+    for i in range(n):
+        ic._fetch_by_rank(f"a{i}", i, db)
+
+    remaining = db.catalog_count()
+    assert remaining >= n - (icp._MAX_CONSECUTIVE_DROPS + 1), (
+        f"only {remaining} of {n} rows survived a run of pure probe misses — "
+        "the cap did not hold and the catalog can still be emptied")
     db.close()
 
 

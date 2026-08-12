@@ -33,8 +33,18 @@ _cache: dict[tuple[float, float], str | None] = {}
 # 6×) — this one did not, so a single blip cost the post its location permanently.
 # Seen 2026-08-05 04:40: GPS read fine at 31.5778,120.2983 (Wuxi), the lookup failed
 # once during a flaky window, and the post went out with no 📍 line at all.
-_GEOCODE_ATTEMPTS = 3
-_GEOCODE_RETRY_DELAY = 2.0
+#
+# The retry then has to outlast the failure. A fixed 2s gap did not: on 2026-08-10 all
+# three attempts fell inside FOUR seconds (08:19:41/43/45) and every one hit the same
+# `SSL: UNEXPECTED_EOF_WHILE_READING`, so the post still lost its location. That error
+# is GFW interference against a foreign API from the China host — measured 5/5 reachable
+# moments later, so it is intermittent, not blocked, and it outlasts a 4s window.
+# (nominatim.openstreetmap.org was checked as a fallback provider and is 0/5 from this
+# host, so redundancy is not available — riding the blip out is.)
+# Backoff 3s, 9s, 27s ≈ 40s total, which the 6.39h posting cadence absorbs easily.
+_GEOCODE_ATTEMPTS = 4
+_GEOCODE_RETRY_DELAY = 3.0
+_GEOCODE_RETRY_FACTOR = 3.0
 
 
 def _to_decimal(dms, ref) -> float:
@@ -89,10 +99,11 @@ def reverse_geocode(lat: float, lon: float, timeout: float = 10.0) -> str | None
             place = ", ".join(p for p in (city, country) if p) or None
         except Exception as exc:  # noqa: BLE001 — best-effort, never raise (and don't cache)
             if attempt < _GEOCODE_ATTEMPTS:
+                delay = _GEOCODE_RETRY_DELAY * (_GEOCODE_RETRY_FACTOR ** (attempt - 1))
                 logger.warning("geo: reverse geocode failed for %.4f,%.4f "
-                               "(attempt %d/%d), retrying: %s",
-                               lat, lon, attempt, _GEOCODE_ATTEMPTS, exc)
-                time.sleep(_GEOCODE_RETRY_DELAY)
+                               "(attempt %d/%d), retrying in %.0fs: %s",
+                               lat, lon, attempt, _GEOCODE_ATTEMPTS, delay, exc)
+                time.sleep(delay)
                 continue
             logger.warning("geo: reverse geocode failed for %.4f,%.4f after %d "
                            "attempts — posting without a location: %s",

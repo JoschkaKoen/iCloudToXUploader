@@ -67,6 +67,13 @@ def _classify(exc: Exception) -> Exception:
 
 
 _ICLOUD_RETRY_ATTEMPTS = 3        # one try + two retries before giving up
+# A probe miss is evidence of deletion, not proof — it also happens when the rank
+# baseline and the learned drift disagree, which never self-corrects because drift
+# is only refreshed by a hit. Real deletions come in handfuls; a long unbroken run
+# means the probe is wrong. Cap enforced in _fetch_by_rank._drop (2026-08-11: an
+# uncapped run dropped 67139 rows and emptied the library index).
+_MAX_CONSECUTIVE_DROPS = 25
+
 _ICLOUD_RETRY_DELAY = 2.0         # seconds — close succession, for a transient iCloud blip
 
 
@@ -302,10 +309,17 @@ class ICloudPhotos:
 
         # ── incremental HEAD refresh ──
         # Collect every unknown asset from offset 0 forward, stopping at the first
-        # page that is already fully cataloged. Nothing is written until the whole
-        # run is known, because the rank shift below needs the final count: new
-        # assets take positions 0..n-1 and push every existing asset down by n.
-        # Writing per page would shift repeatedly and corrupt the ranks.
+        # page that is already fully cataloged.
+        #
+        # Stored ranks are a FROZEN baseline from the initial sweep, and _fetch_by_rank
+        # absorbs everything that has moved since with one learned `drift`. So the new
+        # rows must join that same baseline, NOT the live album's offsets: an asset
+        # added after the sweep sits BEFORE the old rank 0, hence a negative rank.
+        # Rewriting existing ranks to match the live album instead (a global shift, as
+        # this did until 2026-08-13) is what broke it — with both the stored rank and
+        # the drift moving, probes missed, and a miss is read as "deleted from iCloud".
+        # `drift` only updates on a HIT, so the first miss froze it at 0 and every
+        # later probe missed too: 67139 catalog rows were dropped in a single run.
         offset = 0
         fresh: list[tuple[str, str | None, int]] = []
         while offset < total:
@@ -319,8 +333,13 @@ class ICloudPhotos:
                 break
             offset += page
         if fresh:
-            db.catalog_shift_ranks(len(fresh))   # BEFORE inserting the new head rows
-            db.catalog_upsert_many(fresh)
+            # Re-base onto the frozen scale: the n new assets occupy -n .. -1, keeping
+            # every existing rank untouched so one global drift still fits them all.
+            n = len(fresh)
+            rebased = [(aid, created, i - n) for i, (aid, created, _off) in enumerate(fresh)]
+            db.catalog_upsert_many(rebased)
+            logger.info("icloud: catalog refreshed — %d new assets indexed at ranks "
+                        "%d..-1 (existing ranks untouched)", n, -n)
             logger.info("icloud: catalog refreshed — %d new assets indexed (ranks "
                         "shifted by %d)", len(fresh), len(fresh))
 
@@ -349,17 +368,41 @@ class ICloudPhotos:
             actual = ranks.get(a_id)
             if actual is not None:
                 self._rank_drift = actual - rank
+            self._drop_streak = 0        # probes are landing again
             return cache[a_id]
+
+        def _drop(a_id: str, why: str) -> None:
+            """Forget a cataloged asset that iCloud no longer returns — with a hard
+            per-run cap.
+
+            A miss is only EVIDENCE of deletion, never proof: it also happens whenever
+            the rank baseline and the learned drift disagree. Since `drift` is refreshed
+            only by a hit, a systematic mismatch never self-corrects, and unbounded
+            trust in that inference cost the whole library index on 2026-08-11 — 67139
+            rows dropped in one run because probing never recovered. Photos genuinely
+            vanish a handful at a time, so a long unbroken run of misses means the
+            PROBE is wrong, not the library. Stop dropping and let the next cycle
+            rebuild its window from scratch."""
+            streak = getattr(self, "_drop_streak", 0) + 1
+            self._drop_streak = streak
+            if streak > _MAX_CONSECUTIVE_DROPS:
+                if streak == _MAX_CONSECUTIVE_DROPS + 1:
+                    logger.error(
+                        "icloud: %d cataloged assets in a row looked deleted — treating "
+                        "this as a PROBE failure, not %d real deletions, and keeping the "
+                        "catalog. Ranks and the live album have diverged; the next cycle "
+                        "re-probes with a fresh window.", streak, streak)
+                return
+            logger.warning("icloud: cataloged asset %s %s — dropping", a_id[:8], why)
+            db.catalog_delete(a_id)
 
         if asset_id in cache:
             return _hit(asset_id)
         expected = rank + drift
         if bounds and bounds[0] <= expected <= bounds[1]:
-            # window covers where it should be, id absent → deleted from iCloud
-            logger.info("icloud: cataloged asset %s absent from covered window "
-                        "(deleted from library) — dropping", asset_id[:8])
+            # window covers where it should be, id absent → looks deleted
             if db is not None:
-                db.catalog_delete(asset_id)
+                _drop(asset_id, "absent from covered window")
             return None
 
         album = self._all_album()
@@ -386,10 +429,7 @@ class ICloudPhotos:
         covered = (self._fetch_bounds[0] <= expected <= self._fetch_bounds[1]
                    and len(window_list) > 0)
         if covered and db is not None:
-            logger.warning("icloud: cataloged asset %s not at rank %d(+%d drift) though "
-                           "window covered it — deleted from library, dropping",
-                           asset_id[:8], rank, drift)
-            db.catalog_delete(asset_id)
+            _drop(asset_id, f"not at rank {rank}(+{drift} drift) though window covered it")
         else:
             logger.warning("icloud: cataloged asset %s not found near rank %d(+%d drift) — "
                            "window did NOT cover it; keeping for retry", asset_id[:8],
