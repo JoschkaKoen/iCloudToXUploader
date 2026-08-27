@@ -89,6 +89,9 @@ class Config:
 
     # Posting / loop
     post_interval_hours: float      # fractional hours allowed (e.g. 23000s = 6.388...h)
+    post_window: str                # "HH:MM-HH:MM" Beijing clock; "" = post around the clock
+    hashtag: str                    # single tag appended to every (or every 2nd) post; "" = none
+    hashtag_ab: bool                # tag alternate posts only, so an A/B control exists
     daemon_check_interval: int      # loop poll granularity (seconds)
     max_posts_per_day: int          # rolling-24h safety backstop
     post_max_attempts: int          # flush retries before REJECTED(post_failed)
@@ -269,6 +272,9 @@ def load_config() -> Config:
 
         # Posting / loop
         post_interval_hours=_float_env("POST_INTERVAL_HOURS", 5.0),
+        post_window=os.getenv("POST_WINDOW", "").strip(),
+        hashtag=os.getenv("HASHTAG", "").strip(),
+        hashtag_ab=_bool_env("HASHTAG_AB", default=True),
         daemon_check_interval=_int_env("DAEMON_CHECK_INTERVAL", 1800),
         max_posts_per_day=_int_env("MAX_POSTS_PER_DAY", 6),
         post_max_attempts=_int_env("POST_MAX_ATTEMPTS", 3),

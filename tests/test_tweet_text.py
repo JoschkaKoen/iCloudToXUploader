@@ -85,3 +85,33 @@ def _main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(_main())
+
+
+# ── build_tweet: caption + 📍 line + at most ONE hashtag ────────────────────────
+
+def test_build_tweet_orders_and_keeps_one_tag():
+    from ic2x.utils.tweet_text import build_tweet
+    loc = "📍 18:04 Shanghai, China"
+    out = build_tweet("Luxury flagships sit by subway entrances. 🛍", loc, "#China")
+    assert out.split("\n") == ["Luxury flagships sit by subway entrances. 🛍", loc, "#China"]
+    # a bare word is normalised, and a multi-word value never becomes two tags
+    assert build_tweet("x", None, "China").endswith("#China")
+    assert build_tweet("x", None, "#China #Travel").count("#") == 1
+
+
+def test_build_tweet_trims_caption_never_location_or_tag():
+    """The 📍 line and the tag are fixed costs reserved up front — a long caption must
+    never push either off the end or blow the 280 weighted budget (a 403 at post time)."""
+    from ic2x.utils.tweet_text import build_tweet, weighted_len
+    loc = "📍 18:04 Shanghai, China"
+    out = build_tweet("word " * 200, loc, "#China")
+    assert weighted_len(out) <= 280
+    assert out.endswith("#China") and loc in out
+
+
+def test_build_tweet_untagged_arm_and_no_location():
+    from ic2x.utils.tweet_text import build_tweet
+    loc = "📍 18:04 Shanghai, China"
+    assert build_tweet("A short one. 🍜", loc, "") == f"A short one. 🍜\n{loc}"   # control arm
+    assert build_tweet("No GPS. 🏙", None, "#China") == "No GPS. 🏙\n#China"
+    assert build_tweet("", loc, "") == loc          # no leading blank line

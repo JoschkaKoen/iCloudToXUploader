@@ -239,3 +239,35 @@ def _main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(_main())
+
+
+# ── Tweet metrics (captured inside reconcile's existing get_tweets call) ────────
+
+def test_metrics_are_recorded_from_the_reconcile_read():
+    """Reach data must ride along on the read reconcile already makes — zero extra API
+    calls — and a metrics problem must never disturb what reconcile exists to do."""
+    db = _db(); cfg = _cfg()
+    _seed(db, asset="A", sha="s1", tid="100", ph=_PH_A, caption="one")
+    _seed(db, asset="B", sha="s2", tid="200", ph=_PH_B, caption="two")
+
+    lookup = _lookup(live={"100": "one", "200": "two"})
+    lookup.last_metrics = [("100", 42, 2, 1, 0, 0, 3), ("200", 7, 0, 0, 0, 0, 0)]
+    reconcile_with_x(db, cfg, lookup)
+
+    rows = {r["tweet_id"]: r for r in db.latest_tweet_metrics()}
+    assert rows["100"]["impressions"] == 42 and rows["100"]["likes"] == 2
+    assert rows["200"]["impressions"] == 7
+    db.close()
+
+
+def test_metrics_failure_never_breaks_reconcile():
+    """A lookup with no metrics support (or a broken one) still reconciles normally."""
+    db = _db(); cfg = _cfg()
+    _seed(db, asset="A_DEL", sha="shaDEL", tid="100", ph=_PH_A, caption="gone")
+
+    lookup = _lookup(live={}, deleted={"100"})
+    lookup.last_metrics = "not-a-list"          # hostile value
+    reconcile_with_x(db, cfg, lookup)
+
+    assert db.get_image_by_sha("shaDEL")["status"] == Status.REJECTED.value  # still retired
+    db.close()

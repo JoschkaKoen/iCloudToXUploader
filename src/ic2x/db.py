@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS images (
     safety_raw      TEXT,
     quality_raw     TEXT,
     caption         TEXT,
+    alt_text        TEXT,          -- image alt text (the judge's `shows` line)
     tweet_id        TEXT,
     post_attempts   INTEGER DEFAULT 0,
     processed_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -58,6 +59,23 @@ CREATE TABLE IF NOT EXISTS run_stats (
     color_calls     INTEGER DEFAULT 0,  -- VIAPI color-enhance calls (for the monthly free quota)
     support_calls   INTEGER DEFAULT 0   -- cheap scene-grouping/dedup calls made while assembling
 );
+
+-- Append-only snapshots of X public metrics, captured by the startup reconcile in
+-- the get_tweets call it already makes (so this costs ZERO extra API calls). One row
+-- per (tweet, fetch) so a tweet's reach curve over time is recoverable, not just its
+-- latest total — that is what makes a posting-time or hashtag experiment measurable.
+CREATE TABLE IF NOT EXISTS tweet_metrics (
+    tweet_id    TEXT NOT NULL,
+    fetched_at  TIMESTAMP NOT NULL,
+    impressions INTEGER,
+    likes       INTEGER,
+    retweets    INTEGER,
+    replies     INTEGER,
+    quotes      INTEGER,
+    bookmarks   INTEGER,
+    PRIMARY KEY (tweet_id, fetched_at)
+);
+CREATE INDEX IF NOT EXISTS idx_metrics_tweet ON tweet_metrics(tweet_id);
 
 CREATE TABLE IF NOT EXISTS run_state (
     key   TEXT PRIMARY KEY,
@@ -102,6 +120,10 @@ class DB:
                 self._conn.execute(f"ALTER TABLE run_stats ADD COLUMN {col} {ddl}")
             except sqlite3.OperationalError:
                 pass  # column already present
+        try:
+            self._conn.execute("ALTER TABLE images ADD COLUMN alt_text TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already present
 
     def close(self) -> None:
         self._conn.close()
@@ -138,7 +160,7 @@ class DB:
         finishes the post.
 
         winner keys: asset_id, sha256, phash, filename, status (Status|str),
-        caption, reject_stage, reject_reason.
+        caption, alt_text, reject_stage, reject_reason.
         """
         try:
             self._conn.execute("BEGIN")
@@ -156,11 +178,11 @@ class DB:
                 self._conn.execute(
                     "INSERT OR IGNORE INTO images "
                     "(asset_id, sha256, phash, source_filename, status, caption, "
-                    " reject_stage, reject_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    " alt_text, reject_stage, reject_reason) VALUES (?,?,?,?,?,?,?,?,?)",
                     (
                         winner.get("asset_id"), winner["sha256"], winner.get("phash"),
                         winner.get("filename"), status_value, winner.get("caption"),
-                        winner.get("reject_stage"), reason,
+                        winner.get("alt_text"), winner.get("reject_stage"), reason,
                     ),
                 )
             self._conn.commit()
@@ -386,6 +408,45 @@ class DB:
             (Status.POSTED.value, limit),
         ).fetchall()
         return [r["phash"] for r in rows]
+
+    def count_posted(self) -> int:
+        """How many images have been posted. Used only to alternate the hashtag A/B arm,
+        so the two arms interleave in time and neither can be biased by a good week."""
+        return self._conn.execute(
+            "SELECT COUNT(*) FROM images WHERE status = ?", (Status.POSTED.value,)
+        ).fetchone()[0]
+
+    # ── Tweet metrics (reach measurement) ──────────────────────────────────────
+
+    def record_tweet_metrics(self, rows: list[tuple]) -> None:
+        """Store one metrics snapshot per tweet. rows = (tweet_id, impressions, likes,
+        retweets, replies, quotes, bookmarks).
+
+        Append-only and keyed by (tweet_id, fetched_at), so repeated reconciles build a
+        reach curve instead of overwriting. INSERT OR IGNORE means two reconciles in the
+        same second are harmless."""
+        if not rows:
+            return
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        self._conn.executemany(
+            "INSERT OR IGNORE INTO tweet_metrics "
+            "(tweet_id, fetched_at, impressions, likes, retweets, replies, quotes, bookmarks) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            [(str(r[0]), now, *r[1:]) for r in rows])
+        self._conn.commit()
+
+    def latest_tweet_metrics(self) -> list[sqlite3.Row]:
+        """Newest snapshot per posted tweet, joined to what was posted. Drives
+        `ic2x stats`; ordered oldest-first so trends read naturally."""
+        return self._conn.execute(
+            "SELECT i.tweet_id, i.posted_at, i.caption, "
+            "       m.impressions, m.likes, m.retweets, m.replies, m.quotes, m.bookmarks, "
+            "       m.fetched_at "
+            "FROM images i JOIN tweet_metrics m ON m.tweet_id = i.tweet_id "
+            "WHERE m.fetched_at = (SELECT MAX(fetched_at) FROM tweet_metrics "
+            "                      WHERE tweet_id = i.tweet_id) "
+            "  AND i.status = ? AND i.tweet_id IS NOT NULL AND i.tweet_id != 'DRYRUN' "
+            "ORDER BY i.posted_at", (Status.POSTED.value,)).fetchall()
 
     def recent_captions(self, limit: int) -> list[str]:
         """First lines of the most recently POSTED captions, newest first.

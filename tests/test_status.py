@@ -112,3 +112,30 @@ def _main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(_main())
+
+
+# ── Posting window (POST_WINDOW) ───────────────────────────────────────────────
+
+def test_post_window_gates_and_fails_open():
+    """The audience is Western but the clock is Beijing's, so the window is a Beijing
+    range. A malformed value must FAIL OPEN — a typo must never silently stop posting."""
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace
+    import ic2x.bot as bot
+
+    BJ = timezone(timedelta(hours=8))
+    cfg = SimpleNamespace(post_window="01:00-12:00")
+    at = lambda h, m=30: datetime(2026, 8, 27, h, m, tzinfo=BJ)  # noqa: E731
+    assert bot._in_post_window(cfg, at(0)) is False     # before the window
+    assert bot._in_post_window(cfg, at(1)) is True      # just inside
+    assert bot._in_post_window(cfg, at(11)) is True
+    assert bot._in_post_window(cfg, at(12, 0)) is False  # end is exclusive
+    assert bot._in_post_window(cfg, at(20)) is False
+
+    wrap = SimpleNamespace(post_window="22:00-06:00")   # spans midnight
+    assert bot._in_post_window(wrap, at(23)) is True
+    assert bot._in_post_window(wrap, at(3)) is True
+    assert bot._in_post_window(wrap, at(12)) is False
+
+    assert bot._in_post_window(SimpleNamespace(post_window=""), at(20)) is True
+    assert bot._in_post_window(SimpleNamespace(post_window="garbage"), at(20)) is True

@@ -94,6 +94,17 @@ def reconcile_with_x(db: DB, cfg: Config, lookup_tweets) -> None:
         except Exception as exc:  # noqa: BLE001
             logger.warning("reconcile: retire failed for image %s: %s", c["id"], exc)
 
+    # Snapshot reach for every live post. Best-effort and last: a metrics problem must
+    # never affect what reconcile actually exists to do (retire deleted posts, fix the
+    # timer). A lookup without metrics support (the test fakes) simply has none.
+    try:
+        metrics = list(getattr(lookup_tweets, "last_metrics", None) or [])
+        if metrics:
+            db.record_tweet_metrics(metrics)
+            logger.info("reconcile: recorded metrics for %d live posts", len(metrics))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("reconcile: metrics snapshot failed: %s", exc)
+
     # Keep the 5h post timer in sync with the most-recent STILL-LIVE post EVERY run — a
     # post deleted on X (whether this run or a previous one) must never keep holding the
     # interval. Normally a no-op (timer already == newest live post); corrects staleness.
@@ -107,7 +118,11 @@ def reconcile_with_x(db: DB, cfg: Config, lookup_tweets) -> None:
 
 def make_x_lookup(cfg: Config):
     """The real id-existence checker: Bearer-token `get_tweets(ids=…)` in batches of
-    100. Returns (live{id->text}, deleted{id}); deleted = ids X reports as not-found."""
+    100. Returns (live{id->text}, deleted{id}); deleted = ids X reports as not-found.
+
+    Also asks for `public_metrics` in the SAME request and hangs the result on
+    `lookup.last_metrics` — reach data for every live post at zero extra API calls,
+    since this read already happens at every startup."""
     import tweepy
 
     reader = tweepy.Client(bearer_token=cfg.twitter_bearer_token)
@@ -115,13 +130,23 @@ def make_x_lookup(cfg: Config):
     def lookup(ids):
         live: dict[str, str] = {}
         deleted: set[str] = set()
+        metrics: list[tuple] = []
         for i in range(0, len(ids), 100):
-            resp = reader.get_tweets(ids=ids[i:i + 100], tweet_fields=["text"])
+            resp = reader.get_tweets(ids=ids[i:i + 100],
+                                     tweet_fields=["text", "public_metrics"])
             for t in (resp.data or []):
                 live[str(t.id)] = t.text or ""
+                m = getattr(t, "public_metrics", None) or {}
+                if m:
+                    metrics.append((str(t.id), m.get("impression_count"),
+                                    m.get("like_count"), m.get("retweet_count"),
+                                    m.get("reply_count"), m.get("quote_count"),
+                                    m.get("bookmark_count")))
             for e in (resp.errors or []):
                 if e.get("resource_type") == "tweet" and "resource-not-found" in str(e.get("type", "")):
                     deleted.add(str(e.get("resource_id")))
+        lookup.last_metrics = metrics
         return live, deleted
 
+    lookup.last_metrics = []
     return lookup

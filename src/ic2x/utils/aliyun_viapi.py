@@ -34,6 +34,10 @@ ENDPOINT = "imageenhan.cn-shanghai.aliyuncs.com"
 # download. Retry in close succession like every other network call in a cycle.
 _ENHANCE_ATTEMPTS = 3
 _ENHANCE_RETRY_DELAY = 3.0
+# The result download is retried on its own INSIDE each attempt: the OSS URL stays
+# valid, so re-fetching costs nothing while re-running the API call costs a quota call.
+_DOWNLOAD_ATTEMPTS = 3
+_DOWNLOAD_RETRY_DELAY = 2.0
 
 # Input limits that satisfy BOTH super-res (≤1920×1080, ≤5 MB) and color
 # (≤3840×2160 long / ≤2160 short, <3 MB): fit inside 1920×1080 and keep <3 MB.
@@ -120,12 +124,26 @@ def _run(method: str, build_request, url_attr: str, image_path: Path,
         return _retry_or_raise(ViapiError(f"{method}: {msg}"))
     if not url:
         return _retry_or_raise(ViapiError(f"{method}: API returned no result URL"))
-    try:
-        r = requests.get(url, timeout=120)
-        r.raise_for_status()
-    except Exception as exc:  # noqa: BLE001
-        return _retry_or_raise(ViapiError(f"{method}: result download failed: {exc}"))
-    return r.content
+    # The OSS result URL comes back as plain http, which the GFW resets routinely —
+    # 2026-08-19 every attempt died on `HTTPConnectionPool(... port=80)` with truncated
+    # reads, so the enhancement succeeded server-side and we threw it away. Force https,
+    # and retry the DOWNLOAD by itself: the URL stays valid, so re-fetching is free
+    # whereas re-running the whole API call is not.
+    if url.startswith("http://"):
+        url = "https://" + url[len("http://"):]
+    last: Exception | None = None
+    for dl_try in range(1, _DOWNLOAD_ATTEMPTS + 1):
+        try:
+            r = requests.get(url, timeout=120)
+            r.raise_for_status()
+            return r.content
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            if dl_try < _DOWNLOAD_ATTEMPTS:
+                logger.warning("viapi: result download failed (%d/%d), retrying: %s",
+                               dl_try, _DOWNLOAD_ATTEMPTS, str(exc)[:120])
+                time.sleep(_DOWNLOAD_RETRY_DELAY)
+    return _retry_or_raise(ViapiError(f"{method}: result download failed: {last}"))
 
 
 def superres(image_path: Path, *, upscale: int = 1, quality: int = 95) -> bytes:

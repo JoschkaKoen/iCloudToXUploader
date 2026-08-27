@@ -71,8 +71,25 @@ def _create_tweet_api(client_v2, text: str, media_ids: list[int]) -> tuple[str, 
     return tweet_id, tweet_url
 
 
-def _post_image(path: Path, caption: str, sha256: str, db: DB, api_v1, client_v2) -> tuple[str, str]:
+def _set_alt_text(api_v1, media_id: int, alt: str) -> None:
+    """Attach alt text to the uploaded image. Free discoverability (X indexes it) and
+    basic accessibility. The judge already produced a one-line description of the photo
+    (`shows`), so this costs no extra AI call. Best-effort: a post must never fail
+    because a metadata call did."""
+    alt = " ".join((alt or "").split())[:1000]     # X caps alt text at 1000 chars
+    if not alt:
+        return
+    try:
+        api_v1.create_media_metadata(media_id, alt)
+        logger.info("post: alt text set (%d chars)", len(alt))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("post: alt text failed (posting anyway): %s", str(exc)[:160])
+
+
+def _post_image(path: Path, caption: str, sha256: str, db: DB, api_v1, client_v2,
+                alt_text: str = "") -> tuple[str, str]:
     media_id = _upload_image(api_v1, path)
+    _set_alt_text(api_v1, media_id, alt_text)
     db.set_status(sha256, Status.POSTING)   # idempotency anchor — BEFORE the tweet
     tweet_id, tweet_url = _create_tweet_api(client_v2, caption, [media_id])
     db.set_status(
@@ -172,7 +189,13 @@ def post_one(row, cfg: Config, db: DB, api_v1, client_v2) -> bool:
             )
             db.set_last_posted_at(datetime.now(timezone.utc))
         else:
-            _, tweet_url = _post_image(img_path, caption, sha256, db, api_v1, client_v2)
+            alt = ""
+            try:
+                alt = row["alt_text"] or ""
+            except (KeyError, IndexError, TypeError):
+                alt = ""      # older rows / lightweight test fakes carry no alt column
+            _, tweet_url = _post_image(img_path, caption, sha256, db, api_v1, client_v2,
+                                       alt_text=alt)
             ui.post_ok(tweet_url)
 
         _save_scene_thumb(img_path, phash, cfg)  # small thumb for same-scene dedup

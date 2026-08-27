@@ -77,3 +77,31 @@ def truncate_weighted(text: str, limit: int) -> str:
         total += w
         out.append(ch)
     return "".join(out)
+
+
+def build_tweet(caption: str, location: str | None, hashtag: str = "",
+                limit: int = 280) -> str:
+    """Assemble the final tweet: caption, then the 📍 line, then at most ONE hashtag.
+
+    Budgeted by WEIGHTED length (emoji/CJK weigh 2), and only the CAPTION is ever
+    trimmed — the location line and the tag are fixed costs reserved up front, so a
+    long caption can never push either off or 403 the post on length.
+
+    Exactly one tag, appended here rather than written by the model: the caption prompt
+    forbids hashtags, so the count cannot drift and the A/B stays clean.
+    """
+    caption = (caption or "").strip()
+    tag = (hashtag or "").strip()
+    if tag and not tag.startswith("#"):
+        tag = "#" + tag
+    tag = tag.split()[0] if tag else ""       # one tag, never a list
+
+    reserved = 0
+    if location:
+        reserved += weighted_len(location) + 1      # +1 for the newline
+    if tag:
+        reserved += weighted_len(tag) + 1
+    body = truncate_weighted(caption, max(0, limit - reserved)).rstrip()
+
+    lines = [ln for ln in (body, location, tag) if ln]
+    return "\n".join(lines)

@@ -339,7 +339,8 @@ def _apply_polish(path: Path, cfg: Config) -> None:
     logger.info("polish: applied %s to %s", getattr(cfg, "polish_intensity", "natural"), path.name)
 
 
-def _prepare_winner(db: DB, cfg: Config, ic: ICloudPhotos, winner: BurstMember, caption: str
+def _prepare_winner(db: DB, cfg: Config, ic: ICloudPhotos, winner: BurstMember, caption: str,
+                    shows: str = ""
                     ) -> tuple[str, dict | None]:
     """Download the winner full-res (from its live asset), run the EXIF screenshot
     net + dedup, prepare, move to approved/. Returns ("transient", info) to retry
@@ -467,20 +468,21 @@ def _prepare_winner(db: DB, cfg: Config, ic: ICloudPhotos, winner: BurstMember, 
         # Cap to X's 280-char limit by WEIGHTED length (emoji/CJK count as 2), trimming
         # the caption — never the 📍 line. Plain len() would let a caption with a couple
         # of emoji + the location line slip over 280 weighted and 403 at post time.
-        from ic2x.utils.tweet_text import truncate_weighted, weighted_len
+        from ic2x.utils.tweet_text import build_tweet
         location = geo.format_location_line(place, when)
-        caption = (caption or "").strip()
-        if location:
-            room = max(0, 280 - weighted_len(location) - 1)  # -1 for the "\n"
-            body = truncate_weighted(caption, room).rstrip()
-            # Don't emit a leading blank line when the caption is empty — post just
-            # the 📍 line in that case.
-            final_caption = f"{body}\n{location}" if body else location
-        else:
-            final_caption = truncate_weighted(caption, 280)
+        # One hashtag, appended by us (never the model). With HASHTAG_AB the tag goes on
+        # alternate posts only, so a same-period untagged control exists and `ic2x stats`
+        # can say whether it actually bought reach instead of us guessing.
+        tag = getattr(cfg, "hashtag", "") or ""
+        if tag and getattr(cfg, "hashtag_ab", False):
+            tag = tag if (db.count_posted() % 2 == 0) else ""
+        final_caption = build_tweet(caption, location, tag)
         return "approved", {
             "asset_id": winner.asset_id, "sha256": sha, "phash": ph,
             "filename": winner.asset_id, "status": Status.APPROVED, "caption": final_caption,
+            # The judge already described the photo in one line — reuse it as alt text
+            # rather than paying for another vision call.
+            "alt_text": " ".join((shows or "").split())[:1000],
         }
     except (ReauthRequired, PyiCloudThrottled):
         raise
@@ -675,7 +677,8 @@ def run_one_cycle(db: DB, cfg: Config, ic: ICloudPhotos, clients) -> str:
             ui.info(f"   ↳ best of {len(burst.members)} is #{verdict['best_index']} "
                     f"(quality {quality}/10) — downloading "
                     f"full-res{' + enhancing' if getattr(cfg, 'color_enhance_enabled', False) else ''} …")
-            kind, payload = _prepare_winner(db, cfg, ic, winner, verdict.get("caption", ""))
+            kind, payload = _prepare_winner(db, cfg, ic, winner, verdict.get("caption", ""),
+                                            shows=verdict.get("shows", "") or "")
 
             if kind == "transient":
                 attempts = db.incr_asset_attempts(burst.head)
@@ -703,7 +706,8 @@ def run_one_cycle(db: DB, cfg: Config, ic: ICloudPhotos, clients) -> str:
                 ui.info(f"      “{_cap}”")
             ui.ok("   ↳ posting to X …")
             row = {"sha256": payload["sha256"], "phash": payload["phash"],
-                   "caption": payload.get("caption", "")}
+                   "caption": payload.get("caption", ""),
+                   "alt_text": payload.get("alt_text", "")}
             posted = post_one(row, cfg, db, *clients)
             log_decision(cfg.logs_dir, outcome="posted" if posted else "post_failed",
                          asset_id=winner.asset_id,
@@ -765,7 +769,43 @@ def _sleep_interruptible(seconds: float, heartbeat=None, heartbeat_every: float 
             next_beat += heartbeat_every
 
 
+_BEIJING = timezone(timedelta(hours=8))
+
+
+def _parse_window(spec: str) -> tuple[int, int] | None:
+    """"HH:MM-HH:MM" → (start_minute, end_minute) on the Beijing clock, or None when
+    unset/unparseable. Fails OPEN (None = post around the clock): a typo must never
+    silently stop the bot posting."""
+    spec = (spec or "").strip()
+    if not spec:
+        return None
+    try:
+        a, b = spec.split("-", 1)
+        ah, am = (int(x) for x in a.strip().split(":"))
+        bh, bm = (int(x) for x in b.strip().split(":"))
+        return ah * 60 + am, bh * 60 + bm
+    except Exception:  # noqa: BLE001
+        logger.warning("POST_WINDOW %r is not \"HH:MM-HH:MM\" — ignoring it", spec)
+        return None
+
+
+def _in_post_window(cfg: Config, now: datetime | None = None) -> bool:
+    """Is NOW inside POST_WINDOW? The audience is Western but the photos (and host) are
+    on Beijing time, so the window is expressed on the Beijing clock: 01:00-12:00 there
+    is roughly the EU and US evening, when this account's readers are actually awake.
+    Windows that wrap past midnight are supported."""
+    win = _parse_window(getattr(cfg, "post_window", ""))
+    if win is None:
+        return True
+    start, end = win
+    mins = (now or datetime.now(timezone.utc)).astimezone(_BEIJING)
+    cur = mins.hour * 60 + mins.minute
+    return start <= cur < end if start <= end else (cur >= start or cur < end)
+
+
 def _due_to_post(db: DB, cfg: Config) -> bool:
+    if not _in_post_window(cfg):
+        return False          # interval may be up, but the audience is asleep
     last = db.get_last_posted_at()
     if last is None:
         return True
@@ -789,6 +829,12 @@ def _waiting_status(db: DB, cfg: Config) -> None:
             ui.info(f"⏳ idle — next post in ~{int(secs // 3600)}h {int(secs % 3600 // 60):02d}m "
                     f"({posted_today}/{cfg.max_posts_per_day} today). Ctrl-C to stop.")
             return
+    if not _in_post_window(cfg):
+        now_bj = datetime.now(timezone.utc).astimezone(_BEIJING)
+        ui.info(f"⏳ idle — outside the {cfg.post_window} posting window "
+                f"(now {now_bj:%H:%M} Beijing); holding for the audience's evening. "
+                "Ctrl-C to stop.")
+        return
     # Due to post, but nothing new turned up this scan — keep polling iCloud.
     ui.info(f"⏳ waiting for a new photo to post — re-checking iCloud every "
             f"{max(1, cfg.daemon_check_interval // 60)} min. Ctrl-C to stop.")

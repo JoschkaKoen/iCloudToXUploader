@@ -6,6 +6,7 @@ Commands:
   ic2x bot        Fetch newest unseen burst → pick the best → post; every N hours
   ic2x login      Interactive iCloud sign-in (2FA) to establish the session
   ic2x status     Offline snapshot of bot state (last/next post, counts, today's spend)
+  ic2x stats      What the posts did on X — reach, best posting hours (read-only)
   ic2x cost       Show estimated AI spend per day
   ic2x compare    Compare judge models on recent bursts (read-only, no posting)
   ic2x clean      Discard non-posted image records
@@ -71,6 +72,10 @@ def main() -> None:
     pol.add_argument("--dir", default="", help="folder of images (default: iCloud newest N)")
     pol.add_argument("--intensities", default="natural,punchy",
                      help="comma list of intensities to compare: natural, punchy")
+    sta = sub.add_parser("stats", help="What the posts did on X (reach/engagement, read-only)")
+    sta.add_argument("--days", type=int, default=0, metavar="N",
+                     help="only posts from the last N days (default: all)")
+    sta.add_argument("--top", type=int, default=8, help="how many top posts to list")
     cst = sub.add_parser("cost", help="Show the bot's estimated AI spend per day")
     cst.add_argument("--days", type=int, default=14, help="how many recent days to show")
     sts = sub.add_parser("status",
@@ -114,6 +119,9 @@ def main() -> None:
         from ic2x.polish_test import polish_test
         its = tuple(i.strip() for i in args.intensities.split(",") if i.strip())
         polish_test(count=args.count, folder=args.dir.strip() or None, intensities=its)
+    elif cmd == "stats":
+        from ic2x.stats import stats
+        stats(days=args.days, top=args.top)
     elif cmd == "cost":
         from ic2x.cost import cost
         cost(days=args.days)
