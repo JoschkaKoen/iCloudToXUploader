@@ -20,6 +20,19 @@ from typing import Any, Sequence
 
 from ic2x.status import Status
 
+# Why an asset was retired. PERMANENT verdicts are about the photo itself and can
+# never change; REVERSIBLE ones are about the CURRENT config, so they are reconsidered
+# when that config moves. Before this existed, `seen` conflated the two and every
+# verdict was final — 682 quality rejections were unrecoverable even if the bar dropped.
+RETIRE_POSTED     = "posted"          # permanent
+RETIRE_UNSAFE     = "unsafe"          # permanent — safety is not a tunable
+RETIRE_SCREENSHOT = "screenshot"      # permanent — never a photo
+RETIRE_DUP_SCENE  = "dup_scene"       # permanent — the scene is already on the timeline
+RETIRE_BORING     = "boring"          # permanent — judge said not interesting at all
+RETIRE_ERROR      = "error"           # permanent — gave up after BURST_MAX_ATTEMPTS
+RETIRE_LOWQ       = "lowq"            # REVERSIBLE — scored below the bar of the day
+_REVERSIBLE = (RETIRE_LOWQ,)
+
 
 _SCHEMA = """
 -- Decided-asset tracker (the seen-set). Rows are created on-demand when a burst
@@ -28,7 +41,15 @@ CREATE TABLE IF NOT EXISTS asset_index (
     asset_id    TEXT PRIMARY KEY,
     seen        INTEGER DEFAULT 0,      -- 1 once the bot has decided on it
     attempts    INTEGER DEFAULT 0,      -- pre-commit failures (poison-burst breaker)
-    decided_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    decided_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    -- WHY it was retired. `seen` alone meant both "judged" and "never look again",
+    -- which made every verdict irreversible: lowering QUALITY_MIN_SCORE could not
+    -- bring back a single photo rejected under the old bar. RETIRE_PERMANENT reasons
+    -- stay retired forever; a "lowq" retirement is reconsidered once the bar drops to
+    -- or below retire_score. NULL = retired before this column existed (treated as
+    -- permanent, since the reason is unknowable).
+    retire_reason TEXT,
+    retire_score  INTEGER              -- judge score at retirement, for lowq only
 );
 
 CREATE TABLE IF NOT EXISTS images (
@@ -120,6 +141,11 @@ class DB:
                 self._conn.execute(f"ALTER TABLE run_stats ADD COLUMN {col} {ddl}")
             except sqlite3.OperationalError:
                 pass  # column already present
+        for col, ddl in (("retire_reason", "TEXT"), ("retire_score", "INTEGER")):
+            try:
+                self._conn.execute(f"ALTER TABLE asset_index ADD COLUMN {col} {ddl}")
+            except sqlite3.OperationalError:
+                pass  # column already present
         try:
             self._conn.execute("ALTER TABLE images ADD COLUMN alt_text TEXT")
         except sqlite3.OperationalError:
@@ -152,7 +178,8 @@ class DB:
     # ── Burst commit (atomic) ──────────────────────────────────────────────────
 
     def commit_burst(
-        self, seen_asset_ids: Sequence[str], winner: dict[str, Any] | None = None
+        self, seen_asset_ids: Sequence[str], winner: dict[str, Any] | None = None,
+        *, reason: str | None = None, score: int | None = None
     ) -> None:
         """Atomically mark every burst member decided (upsert seen=1), and
         optionally insert the winner's images row. A crash before this leaves zero
@@ -166,8 +193,11 @@ class DB:
             self._conn.execute("BEGIN")
             for aid in seen_asset_ids:
                 self._conn.execute(
-                    "INSERT INTO asset_index (asset_id, seen) VALUES (?, 1) "
-                    "ON CONFLICT(asset_id) DO UPDATE SET seen = 1", (aid,)
+                    "INSERT INTO asset_index (asset_id, seen, retire_reason, retire_score) "
+                    "VALUES (?, 1, ?, ?) ON CONFLICT(asset_id) DO UPDATE SET "
+                    "seen = 1, retire_reason = excluded.retire_reason, "
+                    "retire_score = excluded.retire_score",
+                    (aid, reason, score)
                 )
             if winner is not None:
                 status = winner["status"]
@@ -561,16 +591,39 @@ class DB:
         self._conn.execute("DELETE FROM asset_catalog WHERE asset_id = ?", (asset_id,))
         self._conn.commit()
 
-    def catalog_unseen_desc(self) -> list:
-        """(asset_id, created, rank) newest-capture-first, excluding assets the bot
-        has already decided on — the chronological walk-back order. ~4 MB for a
-        67k-photo library; loaded once per cycle. The scanner re-checks seen
-        downstream, so mid-cycle staleness is harmless."""
+    def catalog_unseen_desc(self, min_score: int | None = None) -> list:
+        """(asset_id, created, rank) newest-capture-first — the chronological
+        walk-back order. ~4 MB for a 67k-photo library; loaded once per cycle. The
+        scanner re-checks seen downstream, so mid-cycle staleness is harmless.
+
+        Never-decided assets always qualify. A photo retired as `lowq` also returns
+        once `min_score` (the CURRENT QUALITY_MIN_SCORE) has dropped to or below the
+        score it was given, because that retirement was a statement about the bar of
+        the day, not about the photo. Every other retirement — posted, unsafe,
+        screenshot, dup_scene, boring, error — is permanent, as is a NULL reason
+        (retired before the column existed, so the reason is unknowable).
+        """
+        if min_score is None:
+            return self._conn.execute(
+                "SELECT c.asset_id, c.created, c.rank FROM asset_catalog c "
+                "LEFT JOIN asset_index i ON i.asset_id = c.asset_id AND i.seen = 1 "
+                "WHERE i.asset_id IS NULL AND c.created IS NOT NULL "
+                "ORDER BY c.created DESC, c.asset_id").fetchall()
         return self._conn.execute(
             "SELECT c.asset_id, c.created, c.rank FROM asset_catalog c "
             "LEFT JOIN asset_index i ON i.asset_id = c.asset_id AND i.seen = 1 "
-            "WHERE i.asset_id IS NULL AND c.created IS NOT NULL "
-            "ORDER BY c.created DESC, c.asset_id").fetchall()
+            "WHERE c.created IS NOT NULL AND ("
+            "  i.asset_id IS NULL"
+            "  OR (i.retire_reason = ? AND i.retire_score IS NOT NULL "
+            "      AND i.retire_score >= ?)"
+            ") ORDER BY c.created DESC, c.asset_id", (RETIRE_LOWQ, min_score)).fetchall()
+
+    def revivable_count(self, min_score: int) -> int:
+        """How many lowq-retired photos would return if the bar were `min_score`."""
+        return self._conn.execute(
+            "SELECT COUNT(*) FROM asset_index i JOIN asset_catalog c USING(asset_id) "
+            "WHERE i.seen = 1 AND i.retire_reason = ? AND i.retire_score IS NOT NULL "
+            "AND i.retire_score >= ?", (RETIRE_LOWQ, min_score)).fetchone()[0]
 
     def get_state(self, key: str) -> str | None:
         row = self._conn.execute(

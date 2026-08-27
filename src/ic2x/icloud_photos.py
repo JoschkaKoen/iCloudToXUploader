@@ -436,7 +436,8 @@ class ICloudPhotos:
                            rank, drift)
         return None
 
-    def iter_image_assets_chrono(self, db: Any) -> Iterator[tuple[AssetMeta, Any]]:
+    def iter_image_assets_chrono(self, db: Any, min_score: int | None = None
+                                 ) -> Iterator[tuple[AssetMeta, Any]]:
         """The bot's walk-back order: Recently-Added first (fresh shots; bulk
         imports deferred — the catalog places them at their true position), then
         every not-yet-decided asset in strict capture-date-DESC order from the
@@ -475,7 +476,7 @@ class ICloudPhotos:
                                "through to the catalog walk", str(exc)[:120])
             logger.info("icloud: recent window done (%d yielded) — continuing back "
                         "in time chronologically via the catalog", len(yielded))
-            for row in db.catalog_unseen_desc():
+            for row in db.catalog_unseen_desc(min_score):
                 if row["asset_id"] in yielded:
                     continue
                 asset = self._fetch_by_rank(row["asset_id"], row["rank"], db)

@@ -214,6 +214,45 @@ def test_stop_request_aborts_the_cycle_between_bursts():
     db.close()
 
 
+def test_lowq_rejection_is_reversible_but_unsafe_and_boring_are_not():
+    """`seen` used to mean both "judged" and "never look again", so every verdict was
+    final — lowering QUALITY_MIN_SCORE could not bring back one of the 682 photos
+    rejected under the old bar. Only "below the bar" is a statement about the CONFIG,
+    so only that one returns when the bar moves."""
+    from ic2x.db import RETIRE_BORING, RETIRE_LOWQ, RETIRE_UNSAFE
+
+    db = DB(_TMP / "reversible.db")
+    for aid, created in [("lowq6", "2026-08-01T10:00:00+00:00"),
+                         ("unsafe", "2026-08-01T09:00:00+00:00"),
+                         ("boring", "2026-08-01T08:00:00+00:00"),
+                         ("fresh", "2026-08-01T07:00:00+00:00")]:
+        db.catalog_upsert_many([(aid, created, 0)])
+    db.commit_burst(["lowq6"], None, reason=RETIRE_LOWQ, score=6)
+    db.commit_burst(["unsafe"], None, reason=RETIRE_UNSAFE)
+    db.commit_burst(["boring"], None, reason=RETIRE_BORING)
+
+    at7 = {r["asset_id"] for r in db.catalog_unseen_desc(min_score=7)}
+    assert at7 == {"fresh"}, f"bar 7 should exclude the 6-scorer: {at7}"
+
+    at6 = {r["asset_id"] for r in db.catalog_unseen_desc(min_score=6)}
+    assert at6 == {"fresh", "lowq6"}, f"lowering the bar to 6 must revive it: {at6}"
+    assert "unsafe" not in at6 and "boring" not in at6, \
+        "a safety or interest verdict must never be undone by a config change"
+
+    assert db.revivable_count(6) == 1 and db.revivable_count(7) == 0
+    db.close()
+
+
+def test_legacy_rows_without_a_reason_stay_retired():
+    """Rows retired before the column existed have an unknowable reason, so they must
+    be treated as permanent rather than silently flooding back into the walk-back."""
+    db = DB(_TMP / "legacy.db")
+    db.catalog_upsert_many([("legacy", "2026-08-01T10:00:00+00:00", 0)])
+    db.commit_burst(["legacy"], None)          # no reason → NULL, like pre-migration rows
+    assert {r["asset_id"] for r in db.catalog_unseen_desc(min_score=1)} == set()
+    db.close()
+
+
 def _err_verdict(flag: str) -> dict:
     """Shape of judge_burst's fail-closed value (see judge_burst._fail)."""
     return {"best_index": 0, "safe": False, "interesting": False, "quality": 0,

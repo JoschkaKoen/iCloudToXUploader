@@ -37,7 +37,10 @@ import imagehash
 
 from ic2x import dedup, prepare
 from ic2x.config import Config, _PROJECT_ROOT, ensure_dirs, load_config, require_credentials
-from ic2x.db import DB
+from ic2x.db import (
+    DB, RETIRE_BORING, RETIRE_DUP_SCENE, RETIRE_ERROR, RETIRE_LOWQ,
+    RETIRE_POSTED, RETIRE_SCREENSHOT, RETIRE_UNSAFE,
+)
 from ic2x.filter import is_screenshot
 from ic2x.icloud_photos import ICloudPhotos, PyiCloudThrottled, ReauthRequired
 from ic2x.judge_burst import judge_burst
@@ -302,10 +305,12 @@ def assemble_burst(stream: _Stream, cfg: Config, ic: ICloudPhotos, screenshot_id
         if not same_scene:
             break  # genuinely a new scene → starts the next burst (left peeked)
         if len(members) >= cfg.burst_max_size:
-            aux_seen.append(r.meta.id)   # scene continues past the cap → consume as seen
-            stream.take()
-            _unlink(r.thumb)
-            continue
+            # Cap reached. Leave the rest of the scene PEEKED so it forms the next
+            # burst and gets judged, instead of being swallowed unseen: consuming the
+            # overflow discarded photos that had never been looked at, and 29.5% of
+            # bursts hit this cap, so a 12-shot scene silently lost 7 frames. The
+            # same-scene gate downstream still stops a near-duplicate reaching X.
+            break
         members.append(BurstMember(r.meta.id, r.thumb, ph, r.asset,
                                    getattr(r.meta, "filename", "")))
         prev = ph
@@ -509,7 +514,8 @@ def run_one_cycle(db: DB, cfg: Config, ic: ICloudPhotos, clients) -> str:
     # Chronological catalog walk when the client supports it (real ICloudPhotos);
     # plain iteration for lightweight test fakes.
     _chrono = getattr(ic, "iter_image_assets_chrono", None)
-    stream = _Stream(_chrono(db) if _chrono else ic.iter_image_assets(),
+    stream = _Stream(_chrono(db, min_score=cfg.quality_min_score) if _chrono
+                     else ic.iter_image_assets(),
                      db, cfg, ic, screenshot_ids,
                      concurrency=cfg.prefetch_concurrency)
     thumbs: list[Path] = []
@@ -547,7 +553,7 @@ def run_one_cycle(db: DB, cfg: Config, ic: ICloudPhotos, clients) -> str:
             seen_ids = [m.asset_id for m in burst.members] + burst.aux_seen
 
             if not burst.members:
-                db.commit_burst(seen_ids, None)  # all screenshots/undecodable
+                db.commit_burst(seen_ids, None, reason=RETIRE_SCREENSHOT)  # screenshots/undecodable
                 continue
 
             # Local safety pre-filter (Tier 1 localization): screens the burst
@@ -558,7 +564,7 @@ def run_one_cycle(db: DB, cfg: Config, ic: ICloudPhotos, clients) -> str:
                 lv, ran = judge_local_safety.prefilter_burst(
                     [m.thumb for m in burst.members], cfg)
                 if ran and not lv.get("safe", True):
-                    db.commit_burst(seen_ids, None)
+                    db.commit_burst(seen_ids, None, reason=RETIRE_UNSAFE)
                     lflags = ",".join(lv.get("flags") or []) or "local_unsafe"
                     log_decision(cfg.logs_dir, outcome="rejected_local", asset_id=burst.head,
                                  detail={"n": len(burst.members), "flags": lv.get("flags"),
@@ -608,7 +614,7 @@ def run_one_cycle(db: DB, cfg: Config, ic: ICloudPhotos, clients) -> str:
             if _errs:
                 attempts = db.incr_asset_attempts(burst.head)
                 if attempts >= cfg.burst_max_attempts:
-                    db.commit_burst(seen_ids, None)
+                    db.commit_burst(seen_ids, None, reason=RETIRE_ERROR)
                     log_decision(cfg.logs_dir, outcome="error_giveup", asset_id=burst.head,
                                  detail={"n": len(burst.members), "stage": "judge",
                                          "flags": _errs})
@@ -630,7 +636,17 @@ def run_one_cycle(db: DB, cfg: Config, ic: ICloudPhotos, clients) -> str:
                 quality = 0
             min_q = getattr(cfg, "quality_min_score", 7)
             if not verdict.get("safe") or not verdict.get("interesting") or quality < min_q:
-                db.commit_burst(seen_ids, None)
+                # Only "below the bar" is a statement about the CONFIG rather than the
+                # photo, so only that one is reversible: it comes back if the bar ever
+                # drops to or below this score. Unsafe and boring are verdicts on the
+                # photo itself and stay retired whatever the bar does.
+                if not verdict.get("safe"):
+                    _retire, _score = RETIRE_UNSAFE, None
+                elif not verdict.get("interesting"):
+                    _retire, _score = RETIRE_BORING, None
+                else:
+                    _retire, _score = RETIRE_LOWQ, quality
+                db.commit_burst(seen_ids, None, reason=_retire, score=_score)
                 reason = verdict.get("reason") or ",".join(verdict.get("flags") or []) or "rejected"
                 log_decision(cfg.logs_dir, outcome="rejected", asset_id=burst.head,
                              detail={"n": len(burst.members), "reason": verdict.get("reason"),
@@ -665,7 +681,7 @@ def run_one_cycle(db: DB, cfg: Config, ic: ICloudPhotos, clients) -> str:
                     if used:
                         db.increment_ai_calls()
                     if dup is not None:
-                        db.commit_burst(seen_ids, None)
+                        db.commit_burst(seen_ids, None, reason=RETIRE_DUP_SCENE)
                         log_decision(cfg.logs_dir, outcome="duplicate_scene",
                                      asset_id=winner.asset_id,
                                      detail={"n": len(burst.members), "same_as": recent[dup][0]})
@@ -683,7 +699,7 @@ def run_one_cycle(db: DB, cfg: Config, ic: ICloudPhotos, clients) -> str:
             if kind == "transient":
                 attempts = db.incr_asset_attempts(burst.head)
                 if attempts >= cfg.burst_max_attempts:
-                    db.commit_burst(seen_ids, None)
+                    db.commit_burst(seen_ids, None, reason=RETIRE_ERROR)
                     log_decision(cfg.logs_dir, outcome="error_giveup", asset_id=burst.head,
                                  detail=payload)
                     continue
@@ -692,7 +708,12 @@ def run_one_cycle(db: DB, cfg: Config, ic: ICloudPhotos, clients) -> str:
                 continue  # leave unseen; retried next cycle
 
             if kind == "rejected":
-                db.commit_burst(seen_ids, payload)
+                # A pre-post gate (EXIF screenshot, owner selfie, dedup) — all verdicts
+                # about the photo itself, so permanent. Any reason that is not
+                # RETIRE_LOWQ is permanent by construction, so the stage doubles as a
+                # more informative label.
+                db.commit_burst(seen_ids, payload,
+                                reason=payload.get("reject_stage") or "winner_rejected")
                 log_decision(cfg.logs_dir, outcome="winner_rejected", asset_id=winner.asset_id,
                              detail={"stage": payload.get("reject_stage")})
                 _keep_reviewed(cfg, payload.get("reject_stage") or "rejected", burst,
@@ -700,7 +721,7 @@ def run_one_cycle(db: DB, cfg: Config, ic: ICloudPhotos, clients) -> str:
                 ui.info(f"   ↳ skipped — winner {payload.get('reject_stage') or 'rejected'} (walking back)")
                 continue
 
-            db.commit_burst(seen_ids, payload)  # APPROVED — atomic, then post
+            db.commit_burst(seen_ids, payload, reason=RETIRE_POSTED)  # APPROVED, then post
             _cap = (payload.get("caption") or "").replace("\n", "  ")
             if _cap:
                 ui.info(f"      “{_cap}”")

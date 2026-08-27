@@ -138,12 +138,24 @@ def test_similar_run_groups():
     assert sorted(m.asset_id for m in b.members) == ["a", "b", "c"]
 
 
-def test_cap_consumes_tail():
+def test_cap_spills_the_tail_into_the_next_burst():
+    """A scene longer than BURST_MAX_SIZE must NOT lose its tail. The overflow used
+    to be swallowed into aux_seen — marked decided without ever being judged or even
+    downloaded — and 29.5% of real bursts hit the cap, so a 12-shot scene silently
+    lost 7 frames. The tail now forms the following burst instead."""
     ids = [f"s{i}" for i in range(6)]
     items = [_asset(a, 1, i + 1) for i, a in enumerate(ids)]
-    b = _burst(_fresh_db(), items, _cfg(max_size=3))
-    assert len(b.members) == 3
-    assert {m.asset_id for m in b.members} | set(b.aux_seen) == set(ids)
+    db, cfg = _fresh_db(), _cfg(max_size=3)
+    stream = _stream(db, items, cfg, ())
+
+    first = assemble_burst(stream, cfg, FakeIC(), set())
+    assert len(first.members) == 3
+    assert not first.aux_seen, f"tail was consumed unjudged: {first.aux_seen}"
+
+    second = assemble_burst(stream, cfg, FakeIC(), set())
+    assert second is not None, "the overflow vanished — this is the coverage leak"
+    seen_ids = {m.asset_id for m in first.members} | {m.asset_id for m in second.members}
+    assert seen_ids == set(ids), f"photos lost at the cap: {set(ids) - seen_ids}"
 
 
 def test_screenshot_dropped_to_aux():
