@@ -873,6 +873,30 @@ def _tidy_empty_dirs(cfg: Config) -> None:
             pass
 
 
+def _refresh_metrics(db: DB, cfg: Config, state: dict) -> None:
+    """Re-run the X reconcile at most once every RECONCILE_EVERY_HOURS.
+
+    It was startup-only, so on a bot that runs for weeks the reach numbers behind
+    `ic2x stats` silently froze at whatever the last restart captured — and the
+    posting-hour and hashtag experiments are only as good as those numbers. It is the
+    same get_tweets call either way, so this costs one X read per interval and no AI.
+    Fail-open: reconcile already swallows its own errors, and this must never be a
+    reason the loop stops posting."""
+    hours = getattr(cfg, "reconcile_every_hours", 0) or 0
+    if hours <= 0 or not cfg.twitter_bearer_token:
+        return
+    now = time.monotonic()
+    last = state.get("last")
+    if last is not None and (now - last) < hours * 3600:
+        return
+    state["last"] = now
+    try:
+        from ic2x.reconcile import make_x_lookup, reconcile_with_x
+        reconcile_with_x(db, cfg, make_x_lookup(cfg))
+    except Exception as exc:  # noqa: BLE001 — observability must never stall the loop
+        logger.warning("metrics refresh failed: %s", str(exc)[:160])
+
+
 def bot(once: bool = False, test: bool = False, test_cycles: int = 20,
         post: bool = False) -> None:
     global _stop
@@ -1009,12 +1033,14 @@ def bot(once: bool = False, test: bool = False, test_cycles: int = 20,
 
     throttles = errors = 0
     reauth_notified = reauth_pending   # already told them at startup; don't repeat it
+    metrics_state: dict = {"last": time.monotonic()}   # startup reconcile counts as tick 1
     cycles = posts = 0
     reason = "interrupted"
     while not _stop:
         try:
             db.reset_stuck_posting()
             flush_pending(db, cfg, clients)
+            _refresh_metrics(db, cfg, metrics_state)
             posted_today = db.count_posts_rolling_24h()
             if cfg.test_mode or (_due_to_post(db, cfg) and posted_today < cfg.max_posts_per_day):
                 outcome = run_one_cycle(db, cfg, ic, clients)

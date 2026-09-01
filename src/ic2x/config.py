@@ -146,6 +146,7 @@ class Config:
     # Startup reconciliation (sync DB with X; re-queue posts deleted on X)
     reconcile_on_startup: bool
     reconcile_recent_n: int          # how many recent X posts to fetch
+    reconcile_every_hours: float     # re-run reconcile (and refresh metrics) this often; 0 = startup only
     reconcile_max_requeue_per_run: int  # sanity cap — skip if more look deleted
 
     # AI models / vision
@@ -321,6 +322,7 @@ def load_config() -> Config:
         # Startup reconciliation
         reconcile_on_startup=_bool_env("RECONCILE_ON_STARTUP", default=True),
         reconcile_recent_n=_int_env("RECONCILE_RECENT_N", 50),
+        reconcile_every_hours=_float_env("RECONCILE_EVERY_HOURS", 6.0),
         reconcile_max_requeue_per_run=_int_env("RECONCILE_MAX_REQUEUE_PER_RUN", 20),
 
         # AI models / vision
