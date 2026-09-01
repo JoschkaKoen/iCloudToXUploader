@@ -17,6 +17,8 @@ string to a weighted budget on code-point boundaries.
 
 from __future__ import annotations
 
+import re
+
 # Weight-2 code-point ranges (inclusive). The first block is the twitter-text v3
 # default heavy ranges (CJK / kana / Hangul / fullwidth); the rest cover emoji.
 _HEAVY_RANGES: tuple[tuple[int, int], ...] = (
@@ -79,16 +81,38 @@ def truncate_weighted(text: str, limit: int) -> str:
     return "".join(out)
 
 
+def _hashtag_in_location(location: str, tag: str) -> str | None:
+    """"📍 20:45 Ningbo, China" + "#China" → "📍 20:45 Ningbo, #China", or None when
+    the tag's word is not in the location.
+
+    The location line already NAMES the country, so a separate "#China" line just says
+    it twice. Hashtagging the word in place gets the same discoverability for one extra
+    character instead of a whole line. Skips a word already prefixed with '#'.
+    """
+    word = tag.lstrip("#")
+    if not word:
+        return None
+    if re.search(rf"#{re.escape(word)}(?!\w)", location, re.IGNORECASE):
+        return location          # already tagged upstream — never add a second one
+    m = re.search(rf"(?<![#\w]){re.escape(word)}(?!\w)", location, re.IGNORECASE)
+    if m is None:
+        return None
+    return f"{location[:m.start()]}#{location[m.start():]}"
+
+
 def build_tweet(caption: str, location: str | None, hashtag: str = "",
                 limit: int = 280) -> str:
-    """Assemble the final tweet: caption, then the 📍 line, then at most ONE hashtag.
+    """Assemble the final tweet: caption, then the 📍 line carrying at most ONE hashtag.
 
     Budgeted by WEIGHTED length (emoji/CJK weigh 2), and only the CAPTION is ever
     trimmed — the location line and the tag are fixed costs reserved up front, so a
     long caption can never push either off or 403 the post on length.
 
-    Exactly one tag, appended here rather than written by the model: the caption prompt
-    forbids hashtags, so the count cannot drift and the A/B stays clean.
+    Exactly one tag, added here rather than written by the model: the caption prompt
+    forbids hashtags, so the count cannot drift and the A/B stays clean. It is folded
+    INTO the location line when that line already contains the word ("Ningbo, #China");
+    only when it does not — no GPS, or a country the tag does not name — does it fall
+    back to its own line, so a tagged post always carries exactly one tag.
     """
     caption = (caption or "").strip()
     tag = (hashtag or "").strip()
@@ -96,12 +120,18 @@ def build_tweet(caption: str, location: str | None, hashtag: str = "",
         tag = "#" + tag
     tag = tag.split()[0] if tag else ""       # one tag, never a list
 
+    tag_line = tag
+    if tag and location:
+        inlined = _hashtag_in_location(location, tag)
+        if inlined is not None:
+            location, tag_line = inlined, ""
+
     reserved = 0
     if location:
         reserved += weighted_len(location) + 1      # +1 for the newline
-    if tag:
-        reserved += weighted_len(tag) + 1
+    if tag_line:
+        reserved += weighted_len(tag_line) + 1
     body = truncate_weighted(caption, max(0, limit - reserved)).rstrip()
 
-    lines = [ln for ln in (body, location, tag) if ln]
+    lines = [ln for ln in (body, location, tag_line) if ln]
     return "\n".join(lines)

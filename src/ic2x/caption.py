@@ -52,8 +52,10 @@ messaging — describe such scenes generally instead.
 TONE: plain and matter-of-fact, like a knowledgeable friend texting — never
 promotional or awed. Banned words: vibrant, bustling, stunning, lush,
 incredible, amazing, breathtaking. Never negative either.
-Never frame it around what outsiders believe ("Many assume", "Westerners
-think/often", "Most people expect", any variant) — state the fact directly.
+Two crutches to avoid. Never frame it around what outsiders believe ("Many
+assume", "Westerners think", any variant) — state the fact directly. And never
+hedge a pattern with "often/typically/usually/commonly": present tense is already
+general — "Bakeries top fried dough with cream", not "Bakeries here often top".
 I LIVE IN CHINA — never critical, political or mocking; no "slogan"/
 "propaganda"-type framing.
 {recent_block}

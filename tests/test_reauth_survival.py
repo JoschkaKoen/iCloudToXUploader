@@ -89,6 +89,9 @@ class _Harness:
     def run(self, **kwargs) -> None:
         cfg = bot.load_config()
         cfg.test_mode = False               # a REAL continuous run, not a soak
+        cfg.post_window = ""                # this test is about REAUTH, not the clock:
+                                            # leaving POST_WINDOW set made it pass inside
+                                            # the window and fail outside it
         cfg.x_dry_run = True                # no X creds needed
         cfg.color_enhance_enabled = False
         cfg.reconcile_on_startup = False

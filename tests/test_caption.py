@@ -43,7 +43,11 @@ def test_prompt_interpolates_place_time_and_stays_concise():
     # "here", 38% "often", and the banned "Westerners …" opener still slipped through
     # twice, so that ban was generalised and a length nudge added (avg was 128 chars
     # against an "UNDER 120" instruction).
-    assert len(cap._CAPTION_PROMPT) < 1600
+    # 1750 on 2026-09-01: that fix did NOT hold — "often" was still 29% overall and
+    # 7 of the last 12 posts — so the rule now attacks the mechanism (present tense is
+    # already general) instead of banning a phrase. The two crutch rules were merged
+    # into one paragraph to pay for it rather than piling on.
+    assert len(cap._CAPTION_PROMPT) < 1750
 
 
 def test_recent_captions_reach_the_writer_and_are_optional():
