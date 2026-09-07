@@ -199,7 +199,13 @@ class ICloudPhotos:
     @property
     def _photos(self) -> Any:
         if self._api is None:
-            raise RuntimeError("ensure_session() not called")
+            # No session object means authentication has not succeeded — which IS a
+            # ReauthRequired, and must be typed as one. As a bare RuntimeError it
+            # slipped past the loop's reauth handling into the generic error path,
+            # counting toward the errors>=6 re-exec instead of the notify-and-poll
+            # that recovers when `ic2x login` lands. On 2026-09-06 a failed
+            # ensure_session() left this None and the bot restarted 14 times.
+            raise ReauthRequired("iCloud session not established — run `ic2x login`")
         try:
             return self._api.photos
         except Exception as exc:  # noqa: BLE001

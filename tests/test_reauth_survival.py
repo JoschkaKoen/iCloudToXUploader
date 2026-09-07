@@ -135,6 +135,27 @@ class _Harness:
             shutil.rmtree(self.tmp, ignore_errors=True)
 
 
+def test_no_session_raises_reauth_not_a_bare_runtimeerror():
+    """A failed ensure_session() leaves _api None. The next photo access must report
+    that as ReauthRequired so the loop's notify-and-poll handles it — as a bare
+    RuntimeError it fell through to the generic error path, counted toward the
+    errors>=6 re-exec, and the bot restarted 14 times (2026-09-06)."""
+    from ic2x.icloud_photos import ICloudPhotos
+
+    ic = ICloudPhotos.__new__(ICloudPhotos)   # never authenticated
+    ic._api = None
+    try:
+        _ = ic._photos
+    except ReauthRequired:
+        pass
+    except Exception as exc:                                        # noqa: BLE001
+        raise AssertionError(
+            f"no-session raised {type(exc).__name__}, not ReauthRequired — the loop "
+            "will treat it as a generic error and escalate to the re-exec") from exc
+    else:
+        raise AssertionError("accessing photos without a session should raise")
+
+
 def test_startup_reauth_does_not_kill_a_continuous_run():
     # session dead at startup AND every cycle — the bot must poll, not exit.
     h = _Harness(ReauthIC(), cycle_exc=ReauthRequired(_REAUTH))
