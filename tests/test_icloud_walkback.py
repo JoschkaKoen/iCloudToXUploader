@@ -145,8 +145,9 @@ class _FakeAlbum:
     """Stand-in for the .all album: NEWEST-FIRST, so offset 0 is the most recent
     asset and the tail holds the oldest imports (verified against live iCloud)."""
 
-    def __init__(self, assets):
+    def __init__(self, assets, max_page: int = 10**9):
         self._assets = list(assets)
+        self.max_page = max_page
         self.reads: list[tuple[int, int]] = []
 
     def __len__(self):
@@ -154,7 +155,10 @@ class _FakeAlbum:
 
     def _get_photos_at(self, offset, direction, page):
         self.reads.append((offset, page))
-        return self._assets[offset:offset + page]
+        # iCloud silently CLAMPS a page request (~49-100 observed), so the stub must
+        # too: advancing by the REQUESTED size instead of the returned size is what
+        # punched holes through the live catalog on 2026-09-07.
+        return self._assets[offset:offset + min(page, self.max_page)]
 
 
 def _catalog_ic(album):
@@ -245,6 +249,32 @@ def test_successive_refreshes_extend_one_continuous_rank_scale():
     b2 = [ranks[f"b2_{i}"] for i in range(2)]
     assert max(b2) < min(b1) < 0, (
         f"the newer batch must sit below the older one on the scale: b2={b2} b1={b1}")
+    db.close()
+
+
+def test_short_pages_do_not_punch_holes_in_the_catalog():
+    """iCloud clamps page requests, so the refresh must advance by what it RECEIVED.
+    Advancing by the requested size skipped everything past each short page: the live
+    catalog ended up needing drift 1395 at offset 0 and 2697 at offset 3000, with
+    offset 500 missing entirely — and one global drift cannot span two regimes, so
+    every probe missed and the bot posted nothing for 57 hours."""
+    db = _fresh_db()
+    db.set_state("catalog_complete", "1")
+    known = _asset("known", created_days_ago=99)
+    db.catalog_upsert_many([(known.id, known.created.isoformat(), 0)])
+
+    new_assets = [_asset(f"n{i:03d}", created_days_ago=i) for i in range(40)]
+    album = _FakeAlbum(new_assets + [known], max_page=7)      # clamps to 7 per call
+    _catalog_ic(album).ensure_catalog(db, page=20)            # asks for 20
+
+    cataloged = {r["asset_id"] for r in
+                 db._conn.execute("SELECT asset_id FROM asset_catalog")}
+    missing = [a.id for a in new_assets if a.id not in cataloged]
+    assert not missing, f"short pages left {len(missing)} assets uncataloged: {missing[:6]}"
+
+    ranks = sorted(r["rank"] for r in
+                   db._conn.execute("SELECT rank FROM asset_catalog WHERE rank < 0"))
+    assert ranks == list(range(-len(new_assets), 0)), f"ranks not contiguous: {ranks[:6]}"
     db.close()
 
 

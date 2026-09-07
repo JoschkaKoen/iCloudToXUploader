@@ -337,7 +337,14 @@ class ICloudPhotos:
             fresh.extend(new)
             if len(new) < len(rows):   # reached already-cataloged territory
                 break
-            offset += page
+            # Advance by what iCloud ACTUALLY returned, never by the requested page:
+            # it silently CLAMPS a page request to ~49-100 (the initial sweep has
+            # always advanced by len(rows) for this reason). Stepping by `page`
+            # skipped every asset past the short page, leaving the catalog full of
+            # holes — measured 2026-09-07: offset 0 needed drift 1395 while offset
+            # 3000+ needed 2697, and offset 500 was not cataloged at all. One global
+            # drift cannot span two regimes, so every probe missed.
+            offset += len(rows)
         if fresh:
             # Re-base onto the frozen scale, CONTINUING below whatever the previous
             # refreshes already used. Numbering each batch -n..-1 in isolation was
