@@ -339,15 +339,23 @@ class ICloudPhotos:
                 break
             offset += page
         if fresh:
-            # Re-base onto the frozen scale: the n new assets occupy -n .. -1, keeping
-            # every existing rank untouched so one global drift still fits them all.
+            # Re-base onto the frozen scale, CONTINUING below whatever the previous
+            # refreshes already used. Numbering each batch -n..-1 in isolation was
+            # wrong: every refresh restarted at -1, so batches collided and sat at the
+            # wrong offsets. Observed 2026-09-07 — 1420 assets sharing 391 slots, every
+            # probe missing, and (because drift only updates on a HIT) the walk-back
+            # unable to resolve a single photo for 57 hours.
+            #
+            # One global drift only fits if rank is a position on ONE continuous scale:
+            # an old asset sits at rank + A and a newer one at rank - k, where A is
+            # everything added since the sweep. So each batch extends the run downward.
             n = len(fresh)
-            rebased = [(aid, created, i - n) for i, (aid, created, _off) in enumerate(fresh)]
+            base = min(0, db.catalog_min_rank())
+            rebased = [(aid, created, base - n + i)
+                       for i, (aid, created, _off) in enumerate(fresh)]
             db.catalog_upsert_many(rebased)
             logger.info("icloud: catalog refreshed — %d new assets indexed at ranks "
-                        "%d..-1 (existing ranks untouched)", n, -n)
-            logger.info("icloud: catalog refreshed — %d new assets indexed (ranks "
-                        "shifted by %d)", len(fresh), len(fresh))
+                        "%d..%d (existing ranks untouched)", n, base - n, base - 1)
 
     def _fetch_by_rank(self, asset_id: str, rank: int, db: Any = None) -> Any | None:
         """Live PhotoAsset for a cataloged id: fetch a window around its recorded

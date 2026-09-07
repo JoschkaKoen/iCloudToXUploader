@@ -220,6 +220,34 @@ def test_catalog_refresh_leaves_existing_ranks_untouched():
     db.close()
 
 
+def test_successive_refreshes_extend_one_continuous_rank_scale():
+    """Each refresh must number new assets BELOW everything already there. Numbering
+    every batch -n..-1 in isolation made successive batches collide at the wrong
+    offsets — 1420 assets sharing 391 slots on 2026-09-07 — so every probe missed and,
+    because drift only updates on a hit, the walk-back resolved nothing for 57 hours.
+    One global drift only works if rank is a position on ONE continuous scale."""
+    db = _fresh_db()
+    old = [_asset(f"old{i}", created_days_ago=50 + i) for i in range(4)]
+    db.catalog_upsert_many([(a.id, a.created.isoformat(), i) for i, a in enumerate(old)])
+    db.set_state("catalog_complete", "1")
+
+    batch1 = [_asset(f"b1_{i}", created_days_ago=20 + i) for i in range(3)]
+    _catalog_ic(_FakeAlbum(batch1 + old)).ensure_catalog(db, page=10)
+    # newer batch arrives later, so it sits AHEAD of batch1 in the album
+    batch2 = [_asset(f"b2_{i}", created_days_ago=1 + i) for i in range(2)]
+    _catalog_ic(_FakeAlbum(batch2 + batch1 + old)).ensure_catalog(db, page=10)
+
+    ranks = {r["asset_id"]: r["rank"] for r in
+             db._conn.execute("SELECT asset_id, rank FROM asset_catalog")}
+    assert len(set(ranks.values())) == len(ranks), f"ranks collided: {sorted(ranks.values())}"
+    assert [ranks[f"old{i}"] for i in range(4)] == [0, 1, 2, 3], "baseline ranks moved"
+    b1 = [ranks[f"b1_{i}"] for i in range(3)]
+    b2 = [ranks[f"b2_{i}"] for i in range(2)]
+    assert max(b2) < min(b1) < 0, (
+        f"the newer batch must sit below the older one on the scale: b2={b2} b1={b1}")
+    db.close()
+
+
 def test_probe_misses_cannot_empty_the_catalog():
     """A probe miss is evidence of deletion, not proof. A systematic mismatch makes
     EVERY probe miss, and drift cannot self-correct because only a hit refreshes it —

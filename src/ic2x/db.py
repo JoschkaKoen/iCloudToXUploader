@@ -576,6 +576,12 @@ class DB:
             rows)
         self._conn.commit()
 
+    def catalog_min_rank(self) -> int:
+        """Lowest rank in the catalog, or 0 when empty. New head assets are numbered
+        BELOW this so successive refreshes keep extending one continuous scale."""
+        row = self._conn.execute("SELECT MIN(rank) FROM asset_catalog").fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
+
     def catalog_known(self, asset_ids: list[str]) -> set[str]:
         """Subset of asset_ids already cataloged (for the head refresh)."""
         out: set[str] = set()
